@@ -86,6 +86,20 @@ pub struct DayUse {
     pub sessions: u32,
 }
 
+/// An agent with no plan limits to read (OpenCode, Gemini CLI): what it
+/// used since local midnight, from its own records.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentDay {
+    /// "opencode", "gemini".
+    pub agent: &'static str,
+    pub tokens: u64,
+    /// What the agent itself priced it at; free models count nothing.
+    pub cost_usd: f64,
+    pub replies: u64,
+    /// The model most of the tokens went to.
+    pub model: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Claude plan limits
 
@@ -1749,5 +1763,130 @@ mod tests {
         assert_eq!(claude_plan(Some("pro"), None).as_deref(), Some("Pro"));
         assert!(parse_creds(br#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
         assert_eq!(sha256_hex8("abc"), "ba7816bf");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Other agents' days
+
+/// Every reply OpenCode stored today, from its own database. Read with the
+/// system's `sqlite3`, read-only, so a running OpenCode is never disturbed.
+pub fn opencode_today() -> Option<AgentDay> {
+    let db = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".local/share")))?
+        .join("opencode/opencode.db");
+    if !db.exists() {
+        return None;
+    }
+    let query = format!(
+        "select json_extract(data,'$.modelID'), count(*), \
+         coalesce(sum(json_extract(data,'$.tokens.total')),0), \
+         coalesce(sum(json_extract(data,'$.cost')),0) \
+         from message where time_created >= {} and json_extract(data,'$.role')='assistant' \
+         group by 1 order by 3 desc",
+        local_midnight() * 1000
+    );
+    let out = std::process::Command::new("/usr/bin/sqlite3")
+        .args(["-readonly", "-separator", "\t"])
+        .arg(&db)
+        .arg(query)
+        .output()
+        .ok()?;
+    out.status.success().then(|| opencode_rows(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `model \t replies \t tokens \t cost` rows, the biggest first.
+fn opencode_rows(text: &str) -> AgentDay {
+    let mut day = AgentDay { agent: "opencode", ..Default::default() };
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [model, replies, tokens, cost] = f[..] else { continue };
+        day.replies += replies.parse::<u64>().unwrap_or(0);
+        day.tokens += tokens.parse::<f64>().unwrap_or(0.) as u64;
+        day.cost_usd += cost.parse::<f64>().unwrap_or(0.);
+        if day.model.is_none() && !model.is_empty() {
+            day.model = Some(model.to_string());
+        }
+    }
+    day
+}
+
+/// Gemini CLI's replies today, from the chats it records under
+/// `~/.gemini/tmp/<project>/chats`: each reply carries its `tokens` and a
+/// UTC `timestamp`. Only files written today are opened.
+pub fn gemini_today() -> Option<AgentDay> {
+    let midnight = local_midnight();
+    let since = UNIX_EPOCH + Duration::from_secs(midnight.max(0) as u64);
+    let root = home()?.join(".gemini/tmp");
+    let mut day = AgentDay { agent: "gemini", ..Default::default() };
+    let mut models: HashMap<String, u64> = HashMap::new();
+    for project in std::fs::read_dir(root).ok()?.flatten() {
+        let Ok(chats) = std::fs::read_dir(project.path().join("chats")) else { continue };
+        for chat in chats.flatten() {
+            let fresh = chat.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= since);
+            if !fresh {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(chat.path()) else { continue };
+            gemini_replies(&text, midnight, &mut day, &mut models);
+        }
+    }
+    day.model = models.into_iter().max_by_key(|m| m.1).map(|m| m.0);
+    (day.replies > 0).then_some(day)
+}
+
+/// Count the replies in one chat (JSON lines, or one JSON document with a
+/// `messages` array) stamped at or after `midnight`.
+fn gemini_replies(text: &str, midnight: i64, day: &mut AgentDay, models: &mut HashMap<String, u64>) {
+    let mut count = |m: &Value| {
+        let Some(total) = m.pointer("/tokens/total").and_then(Value::as_u64) else { return };
+        let at = m.get("timestamp").and_then(Value::as_str).and_then(iso_secs);
+        if at.is_none_or(|t| t < midnight) {
+            return;
+        }
+        day.replies += 1;
+        day.tokens += total;
+        if let Some(model) = m.get("model").and_then(Value::as_str) {
+            *models.entry(model.to_string()).or_default() += total;
+        }
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(doc) => doc.get("messages").and_then(Value::as_array).into_iter().flatten().for_each(&mut count),
+        Err(_) => text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).for_each(|m| count(&m)),
+    }
+}
+
+#[cfg(test)]
+mod other_agents {
+    use super::*;
+
+    #[test]
+    fn iso_times_match_the_epoch() {
+        assert_eq!(iso_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_secs("2026-10-16T05:31:52.747Z"), Some(1_792_128_712));
+        assert_eq!(iso_secs("2000-02-29T12:00:00Z"), Some(951_825_600));
+        assert_eq!(iso_secs("nope"), None);
+    }
+
+    #[test]
+    fn opencode_rows_sum_and_name_the_biggest_model() {
+        let d = opencode_rows("deepseek-v4\t3\t15140\t0\nclaude-sonnet\t1\t900\t0.012\n");
+        assert_eq!((d.replies, d.tokens), (4, 16_040));
+        assert!((d.cost_usd - 0.012).abs() < 1e-9);
+        assert_eq!(d.model.as_deref(), Some("deepseek-v4"));
+    }
+
+    #[test]
+    fn gemini_counts_todays_replies_only() {
+        let text = concat!(
+            r#"{"type":"user","timestamp":"2026-10-16T05:31:52Z"}"#, "\n",
+            r#"{"type":"gemini","timestamp":"2026-10-16T05:32:00Z","model":"gemini-3-pro","tokens":{"input":10,"output":5,"total":15}}"#, "\n",
+            r#"{"type":"gemini","timestamp":"2026-10-15T05:32:00Z","tokens":{"total":99}}"#, "\n",
+        );
+        let (mut day, mut models) = (AgentDay::default(), HashMap::new());
+        gemini_replies(text, iso_secs("2026-10-16T00:00:00Z").unwrap(), &mut day, &mut models);
+        assert_eq!((day.replies, day.tokens), (1, 15));
+        assert_eq!(models.get("gemini-3-pro"), Some(&15));
     }
 }
