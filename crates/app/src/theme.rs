@@ -504,13 +504,24 @@ impl<T: gpui::Styled> OneLine for T {}
 /// The rem size at 100% zoom.
 pub const REM_PX: f32 = 16.;
 
+/// `a` moved toward `b` by `t` (0-1), channel by channel.
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| {
+        let (x, y) = ((a >> s & 0xff) as f32, (b >> s & 0xff) as f32);
+        ((x + (y - x) * t).round() as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
 /// The terminal palette that matches the theme: its text on its pane.
 pub fn palette() -> term::Palette {
     let c = current();
     term::Palette {
         fg: c.text,
         bg: c.pane,
-        selection: c.selection,
+        // Half way to the pane: a selection over a whole screen (a drag
+        // that scrolled) reads as marked, not as the pane turning grey.
+        selection: mix(c.pane, c.selection, 0.5),
         search: c.search,
         search_focus: c.accent,
         ansi: c.ansi,

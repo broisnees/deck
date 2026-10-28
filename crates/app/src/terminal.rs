@@ -498,6 +498,17 @@ impl TerminalPane {
         ((y as usize).min(rows - 1), col, x.fract() > 0.5)
     }
 
+    /// The web link at a viewport cell: one a program marked (OSC 8), else
+    /// a URL in the text, followed across soft wraps.
+    fn link_at(&self, row: usize, col: usize) -> Option<String> {
+        let web = |u: &String| u.starts_with("http://") || u.starts_with("https://");
+        if let Some(u) = self.term.hyperlink_at(row, col).filter(web) {
+            return Some(u);
+        }
+        let (line, at) = self.term.wrapped_line_at(row, col);
+        url_at(&line, at)
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Mid-composition the IME owns every key, Enter and Backspace included.
         // Keys the find field passes up are not for the shell either.
@@ -898,14 +909,7 @@ impl TerminalPane {
         self.focus_here(window, cx);
         if ev.modifiers.platform {
             let (row, col, _) = self.cell_at(ev.position);
-            let line = self
-                .term
-                .last()
-                .rows
-                .get(row)
-                .map(row_cols)
-                .unwrap_or_default();
-            if let Some(url) = url_at(&line, col) {
+            if let Some(url) = self.link_at(row, col) {
                 cx.emit(TerminalEvent::OpenUrl(url));
             }
             return;
@@ -964,17 +968,10 @@ impl TerminalPane {
     /// selection.
     fn open_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let (row, col, _) = self.cell_at(at);
-        let line = self
-            .term
-            .last()
-            .rows
-            .get(row)
-            .map(row_cols)
-            .unwrap_or_default();
         let this = cx.entity().downgrade();
         let f = self.focus.clone();
         let mut entries: Vec<Entry> = Vec::new();
-        if let Some(url) = url_at(&line, col) {
+        if let Some(url) = self.link_at(row, col) {
             let open = url.clone();
             let open_in = this.clone();
             entries.push(

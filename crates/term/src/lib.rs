@@ -1343,6 +1343,43 @@ impl Terminal {
         Some(out)
     }
 
+    /// The OSC 8 link a program put on viewport cell `(row, col)`. Deck's
+    /// own prompt marks are links too, and are not one.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+        let term = self.term.lock();
+        let link = term.grid()[viewport_point(&term, row, col)].hyperlink()?;
+        let uri = link.uri();
+        (!uri.starts_with(tap::BLOCK_LINK)).then(|| uri.to_string())
+    }
+
+    /// The line through viewport cell `(row, col)` with its soft wraps
+    /// joined, one char per column (`'\0'` for a wide char's spacer), and
+    /// that cell's index in it: a URL too long for one row is still one URL.
+    pub fn wrapped_line_at(&self, row: usize, col: usize) -> (String, usize) {
+        // A minified file is one line; a link is never this long.
+        const MAX_ROWS: i32 = 32;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let last = term.last_column();
+        let at = viewport_point(&term, row, col);
+        let wraps = |l: i32| grid[Line(l)][last].flags.contains(Flags::WRAPLINE);
+        let mut first = at.line.0;
+        while first > term.topmost_line().0 && at.line.0 - first < MAX_ROWS && wraps(first - 1) {
+            first -= 1;
+        }
+        let mut end = at.line.0;
+        while end < term.bottommost_line().0 && end - at.line.0 < MAX_ROWS && wraps(end) {
+            end += 1;
+        }
+        let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        let text = (first..=end)
+            .flat_map(|l| grid[Line(l)].into_iter())
+            .map(|c| if c.flags.intersects(spacer) { '\0' } else { c.c })
+            .collect();
+        let ix = (at.line.0 - first) as usize * term.columns() + at.column.0;
+        (text, ix)
+    }
+
     /// Scroll so block `n`'s prompt is at the top.
     pub fn scroll_to_block(&mut self, n: u64) -> bool {
         use alacritty_terminal::grid::Scroll;
@@ -2002,6 +2039,39 @@ mod tests {
             text.contains("hello-from-pty"),
             "shell output never reached the grid; got {text:?}"
         );
+    }
+
+    /// A URL longer than the row wraps; clicking its second half still
+    /// finds all of it. A program's OSC 8 link is found under its text.
+    #[test]
+    fn a_wrapped_line_and_a_hyperlink_read_back_from_their_cells() {
+        let url = "https://example.com/a/very/long/path?with=query";
+        let spawn = Spawn {
+            program: Some("/bin/sh".into()),
+            args: vec![
+                "-c".into(),
+                format!("printf '{url}\\n\\033]8;;https://x.dev/\\033\\\\link\\033]8;;\\033\\\\'; sleep 1"),
+            ],
+            cwd: Some(PathBuf::from("/tmp")),
+            env: HashMap::new(),
+        };
+        let Ok(mut term) = Terminal::spawn(spawn, 20, 8) else {
+            return;
+        };
+        let p = palette();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            term.snapshot(&p, true);
+            if term.hyperlink_at(3, 1).is_some() {
+                break;
+            }
+        }
+        let (line, at) = term.wrapped_line_at(1, 4);
+        assert_eq!(at, 24);
+        assert!(line.starts_with(url), "got {line:?}");
+        assert_eq!(term.wrapped_line_at(3, 0).0.trim_end(), "link");
+        assert_eq!(term.hyperlink_at(3, 1).as_deref(), Some("https://x.dev/"));
+        assert_eq!(term.hyperlink_at(0, 1), None);
     }
 
     /// A program that asks to hear of theme switches, through a real PTY: it

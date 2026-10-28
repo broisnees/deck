@@ -384,7 +384,16 @@ fn parse_browser(verb: &str, rest: &[String]) -> Result<(String, Value), String>
 }
 
 fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {
-    // `deck open URL` is what $BROWSER runs, so it has to take the URL bare.
+    // `deck URL` is what $BROWSER runs: cargo, among others, runs $BROWSER
+    // as one program, so it can't be `deck open`.
+    if let [url] = args {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let mut params = Map::new();
+            params.insert("url".into(), url.clone().into());
+            return Ok(Some(("browser.open".into(), Value::Object(params))));
+        }
+    }
+    // `deck open URL` takes the URL bare too.
     if let [open, rest @ ..] = args {
         if open == "open" {
             let mut params = Map::new();
@@ -515,6 +524,13 @@ mod tests {
             Some((
                 "browser.open".into(),
                 json!({"url": "http://localhost:3000"})
+            ))
+        );
+        assert_eq!(
+            p("https://github.com/login/device").unwrap(),
+            Some((
+                "browser.open".into(),
+                json!({"url": "https://github.com/login/device"})
             ))
         );
         assert_eq!(
