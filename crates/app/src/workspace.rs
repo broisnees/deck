@@ -2819,9 +2819,16 @@ impl Workspace {
                         .child(short_limit(&l.label))
                         .child(meter_bar(l.used_pct, 28.))
                         .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
-                        // When it frees up: "· 2h 14m".
+                        // When it frees up, in full colour so it reads at a
+                        // glance: "◷ resets in 2h 14m".
                         .children(l.resets_at.and_then(until).map(|t| {
-                            div().text_color(rgb(theme::dim())).child(format!("· {t}"))
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(u(4.))
+                                .ml(u(4.))
+                                .child(icon(Icon::Clock, 11., theme::text_2()))
+                                .child(div().text_color(rgb(theme::text())).child(format!("resets in {t}")))
                         }))
                 }))
                 .children(tight.map(|l| {
