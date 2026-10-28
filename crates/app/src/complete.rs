@@ -4,6 +4,8 @@
 //! this works out what the word under the cursor could become. It runs off
 //! the main thread: it reads folders, package.json and asks git.
 
+mod learn;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -231,7 +233,11 @@ fn candidates(args: &[String], typed: &str, cwd: &Path) -> (Vec<Item>, bool) {
     let n = args.len();
     if typed.starts_with('-') {
         let sub = args.get(1).map(String::as_str).unwrap_or("");
-        return (flags(cmd, sub), false);
+        let mut out = flags(cmd, sub);
+        if let Some(h) = learn::help(&command_path(args)) {
+            out.extend(h.flags.iter().map(|(f, d)| item(f.as_str(), Kind::Flag, Some(d))));
+        }
+        return (out, false);
     }
     if looks_like_path {
         let filter = if matches!(cmd, "cd" | "pushd" | "rmdir") { PathFilter::Dirs } else { PathFilter::All };
@@ -297,8 +303,66 @@ fn candidates(args: &[String], typed: &str, cwd: &Path) -> (Vec<Item>, bool) {
         }
         "make" if n == 1 => (make_targets(cwd), true),
         "just" if n == 1 => (just_recipes(cwd), true),
-        _ => (paths(typed, cwd, PathFilter::All), false),
+        // Anything else: what its own --help says it takes next, the ones
+        // you use most first, with files after them.
+        _ => {
+            let path = command_path(args);
+            match learn::help(&path).filter(|h| !h.subs.is_empty() && path.len() == n) {
+                Some(h) => {
+                    let used = sub_counts(&path);
+                    let mut out: Vec<Item> = h
+                        .subs
+                        .iter()
+                        .map(|(s, d)| {
+                            let boost = used.get(s).map_or(0, |c| 250 + 10 * (*c).min(20));
+                            Item { boost, ..item(s.as_str(), Kind::Sub, Some(d)) }
+                        })
+                        .collect();
+                    out.extend(paths(typed, cwd, PathFilter::All));
+                    (out, true)
+                }
+                None => (paths(typed, cwd, PathFilter::All), false),
+            }
+        }
     }
+}
+
+/// The command and the subcommands after it that its help lists, up to
+/// the first word that is none: `docker compose up web` → docker compose up.
+fn command_path(args: &[String]) -> Vec<&str> {
+    let mut path = vec![args[0].as_str()];
+    for a in &args[1..] {
+        let known = learn::help(&path).is_some_and(|h| h.subs.iter().any(|s| s.0 == *a));
+        if !known || path.len() >= 3 {
+            break;
+        }
+        path.push(a.as_str());
+    }
+    path
+}
+
+/// How often each word followed `path` in your history.
+fn sub_counts(path: &[&str]) -> HashMap<String, i32> {
+    static LINES: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+    let lines = {
+        let mut cache = LINES.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.as_ref() {
+            Some((at, v)) if at.elapsed() < Duration::from_secs(20) => v.clone(),
+            _ => {
+                let v: Vec<String> = crate::shell::zsh_history(2000).into_iter().map(|(c, _)| c).collect();
+                *cache = Some((Instant::now(), v.clone()));
+                v
+            }
+        }
+    };
+    let prefix = format!("{} ", path.join(" "));
+    let mut out = HashMap::new();
+    for line in &lines {
+        if let Some(next) = line.strip_prefix(&prefix).and_then(|r| r.split_whitespace().next()) {
+            *out.entry(next.to_string()).or_insert(0) += 1;
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq)]
