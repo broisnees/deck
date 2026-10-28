@@ -85,6 +85,9 @@ fn main() {
     // Scripts and terminal links macOS hands deck (when it is the default
     // terminal) open in new tabs; the window picks them up when it exists.
     app.on_open_urls(handler::opened);
+    // Closing the window only hid it: the Dock icon brings it back, with
+    // every shell and agent still where it was.
+    app.on_reopen(|cx| cx.activate(true));
     app.run(move |cx: &mut App| {
         theme::add_fonts(cx);
         let skill = settings::load().agent_skill;
@@ -114,7 +117,15 @@ fn main() {
                 focus: !background,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx)),
+            |window, cx| {
+                // Closing the window hides deck rather than quitting it, so
+                // agents at work and running commands carry on; ⌘Q quits.
+                window.on_window_should_close(cx, |_, cx| {
+                    cx.hide();
+                    false
+                });
+                cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx))
+            },
         )
         .expect("failed to open window");
         if !background {

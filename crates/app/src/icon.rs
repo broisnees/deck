@@ -65,6 +65,7 @@ icons! {
     Search => "search.svg",
     Download => "download.svg",
     Clock => "clock.svg",
+    Pin => "pin.svg",
     Bell => "bell.svg",
     Bolt => "bolt.svg",
     Shield => "shield.svg",

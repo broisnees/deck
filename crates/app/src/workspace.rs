@@ -65,6 +65,7 @@ actions!(
         NewControl,
         RestartControl,
         ToggleSidebar,
+        ToggleSidebarView,
         ToggleInspector,
         Quit,
         Copy,
@@ -194,6 +195,13 @@ pub static SHORTCUTS: &[Shortcut] = &[
         "Window",
         ["cmd-b"],
         ToggleSidebar
+    ),
+    shortcut!(
+        "sidebar-view",
+        "List the sidebar by project or by time",
+        "Window",
+        ["cmd-shift-b"],
+        ToggleSidebarView
     ),
     shortcut!(
         "inspector",
@@ -367,6 +375,7 @@ pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Sidebar by Project or Time", ToggleSidebarView),
                 MenuItem::action("Toggle Inspector", ToggleInspector),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
@@ -652,6 +661,8 @@ struct Tab {
     focused: PaneId,
     /// The control chat: first in the sidebar, never closed by accident.
     pinned: bool,
+    /// Pinned by you to the top of the sidebar, above every project.
+    on_top: bool,
 }
 
 impl Tab {
@@ -713,6 +724,9 @@ struct UsageView {
     /// The focused Claude Code conversation: its title and its numbers.
     session: Option<(SharedString, crate::usage::SessionUse)>,
     today: Option<crate::usage::DayUse>,
+    /// Agents with no plan limits to read (OpenCode, Gemini CLI): their
+    /// day so far.
+    others: Vec<crate::usage::AgentDay>,
     busy: bool,
     at: Option<Instant>,
 }
@@ -734,7 +748,7 @@ struct ProjectGroup {
     name: String,
     root: Option<PathBuf>,
     /// Chats and agents, with when each last did something.
-    threads: Vec<(usize, Instant)>,
+    threads: Vec<(usize, i64)>,
     others: Vec<usize>,
 }
 
@@ -754,6 +768,17 @@ pub struct Workspace {
     /// Project groups folded shut in the sidebar, by name.
     folded: std::collections::HashSet<String>,
     sidebar: bool,
+    /// The sidebar by time (Now, Today, …) instead of by project.
+    recent: bool,
+    /// When each pane last did something the sidebar sorts by, in seconds
+    /// since the epoch: began or stopped work, wanted you, finished a
+    /// command, or was opened. Never mere output, which an idle agent's
+    /// status line makes all the time. Wall-clock, so it holds across
+    /// sleep and restarts.
+    touched: HashMap<PaneId, i64>,
+    /// Each tab's place in the sidebar's Recent view, by its first pane:
+    /// the time it had when the list first showed it (see `settle`).
+    settled: HashMap<PaneId, i64>,
     pub inspector: Inspector,
     refreshing: bool,
     /// Agent runtime for chats; probed in the background at startup.
@@ -908,6 +933,9 @@ impl Workspace {
                 .collect(),
             folded: std::collections::HashSet::new(),
             sidebar: true,
+            recent: false,
+            touched: HashMap::new(),
+            settled: HashMap::new(),
             inspector: Inspector {
                 // A narrow (tiled) window cannot afford a third column.
                 open: f32::from(window.viewport_size().width) >= 1200.,
@@ -1116,6 +1144,7 @@ impl Workspace {
                             // notifies, so a new title has to say so.
                             TerminalEvent::Retitled => cx.notify(),
                             TerminalEvent::Alert(said) => {
+                                ws.touched.insert(id, crate::local::now());
                                 let said = said.clone();
                                 ws.alert(id, said, window, cx);
                             }
@@ -1125,6 +1154,7 @@ impl Workspace {
                                 ws.open_url_near(id, &url, window, cx);
                             }
                             TerminalEvent::CommandDone { command, exit, took } => {
+                                ws.touched.insert(id, crate::local::now());
                                 ws.command_done(id, command.clone(), *exit, *took, window, cx);
                             }
                             TerminalEvent::History => ws.open_history(id, window, cx),
@@ -1303,6 +1333,7 @@ impl Workspace {
                         root: Node::Leaf(id),
                         focused: id,
                         pinned: true,
+                        on_top: false,
                     },
                 );
                 // Don't yank focus from something the user already opened.
@@ -1335,6 +1366,7 @@ impl Workspace {
                     root: Node::Leaf(id),
                     focused: id,
                     pinned: false,
+                    on_top: false,
                 }),
                 Err(e) => tracing::warn!("could not restore a thread: {e}"),
             }
@@ -1380,6 +1412,11 @@ impl Workspace {
                 .or(leaves.first())
                 .copied()
                 .unwrap_or(0);
+            if let Some(at) = tab.touched {
+                for &id in &leaves {
+                    self.touched.insert(id, at);
+                }
+            }
             if ix <= last.active {
                 active = Some(focused);
             }
@@ -1387,6 +1424,7 @@ impl Workspace {
                 focused,
                 root,
                 pinned,
+                on_top: tab.on_top,
             });
         }
         // Tabs opened before the restore finished (`deck open`) stay, after.
@@ -1395,6 +1433,7 @@ impl Workspace {
         self.tabs = back;
         self.tabs.extend(opened);
         self.sidebar = last.sidebar;
+        self.recent = last.recent;
         self.inspector.open = last.inspector;
         self.sidebar_px = last.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         self.inspector_px = last.inspector_width.clamp(INSPECTOR_MIN, INSPECTOR_MAX);
@@ -1505,9 +1544,12 @@ impl Workspace {
         // Several Claude Code tabs in one folder: the one that printed last
         // is the conversation written last.
         let mut claude: HashMap<PathBuf, Vec<(Instant, PaneId)>> = HashMap::new();
+        let mut conversation: HashMap<PaneId, String> = HashMap::new();
         for (&id, pane) in &self.panes {
             if let (PaneKind::Terminal(t), Some(place)) = (&pane.kind, self.places.get(&id)) {
-                if matches!(place.agent, Some(("claude", _))) {
+                if let Some(s) = &place.session {
+                    conversation.insert(id, s.clone());
+                } else if matches!(place.agent, Some(("claude", _))) {
                     claude
                         .entry(place.cwd.clone())
                         .or_default()
@@ -1525,12 +1567,12 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        let mut conversation: HashMap<PaneId, String> = HashMap::new();
+        let known: std::collections::HashSet<String> = conversation.values().cloned().collect();
         for (cwd, mut panes) in claude {
             panes.sort_by_key(|p| std::cmp::Reverse(p.0));
             let sessions = crate::session::claude_sessions(&cwd)
                 .into_iter()
-                .filter(|s| !chats.contains(s));
+                .filter(|s| !chats.contains(s) && !known.contains(s));
             for ((_, id), session) in panes.into_iter().zip(sessions) {
                 conversation.insert(id, session);
             }
@@ -1625,6 +1667,8 @@ impl Workspace {
                 pinned: tab.pinned,
                 focused: kept.iter().position(|&p| p == tab.focused).unwrap_or(0),
                 root,
+                on_top: tab.on_top,
+                touched: kept.iter().filter_map(|id| self.touched.get(id)).max().copied(),
             });
         }
         Session {
@@ -1634,6 +1678,7 @@ impl Workspace {
             inspector: self.inspector.open,
             sidebar_width: self.sidebar_px,
             inspector_width: self.inspector_px,
+            recent: self.recent,
         }
     }
 
@@ -1785,6 +1830,7 @@ impl Workspace {
             root: Node::Leaf(id),
             focused: id,
             pinned: false,
+            on_top: false,
         });
         self.focus_pane(id, window, cx);
         Ok(id)
@@ -1913,8 +1959,9 @@ impl Workspace {
         }
         if let Ok(exe) = std::env::current_exe() {
             // So `deck …` resolves to this very binary inside its own panes,
-            // and tools that honour $BROWSER (gh, python, cargo doc --open)
-            // open links in a pane here instead of another app.
+            // and tools that honour $BROWSER (gh, python) open links in a
+            // pane here instead of another app. Just the path: many run
+            // $BROWSER as one program, and `deck URL` opens it.
             if let Some(dir) = exe.parent() {
                 let path = std::env::var("PATH").unwrap_or_default();
                 env.insert(
@@ -1922,7 +1969,7 @@ impl Workspace {
                     crate::tidy_path(&format!("{}:{path}", dir.display())),
                 );
             }
-            env.insert("BROWSER".into(), format!("{} open", exe.display()));
+            env.insert("BROWSER".into(), exe.display().to_string());
         }
         env
     }
@@ -1946,6 +1993,7 @@ impl Workspace {
         for p in self.tabs[ix].leaves() {
             self.unseen.remove(&p);
         }
+        self.touched.insert(id, crate::local::now());
         self.active = ix;
         self.tabs[ix].focused = id;
         match self.panes.get(&id).map(|p| &p.kind) {
@@ -1992,6 +2040,8 @@ impl Workspace {
     /// Drop a pane for good. A closed chat thread is archived, not lost.
     fn discard(&mut self, id: PaneId, cx: &mut Context<Self>) {
         self.working_since.remove(&id);
+        self.touched.remove(&id);
+        self.settled.remove(&id);
         self.restored_as.remove(&id);
         if let Some(Pane {
             kind: PaneKind::Chat(c),
@@ -2086,8 +2136,27 @@ impl Workspace {
             }
             _ => None,
         };
+        // Control, Settings and a task's work have places of their own.
+        let pinnable = !tab.pinned && Some(ix) != self.settings_tab() && !self.is_task_tab(tab, cx);
+        let on_top = tab.on_top;
         let ws = cx.entity().downgrade();
         let mut entries: Vec<Entry> = Vec::new();
+        if pinnable {
+            let pin = ws.clone();
+            entries.push(
+                Item::new(if on_top { "Unpin" } else { "Pin to Top" }, move |_, cx| {
+                    let _ = pin.update(cx, |ws, cx| {
+                        if let Some(ix) = ws.tab_of(pane) {
+                            ws.tabs[ix].on_top = !on_top;
+                            cx.notify();
+                        }
+                    });
+                })
+                .icon(Icon::Pin)
+                .into(),
+            );
+            entries.push(Entry::Separator);
+        }
         if let Some(url) = url {
             entries.push(
                 Item::new("Copy URL", move |_, cx| {
@@ -2289,10 +2358,15 @@ impl Workspace {
         let focused = self.focused();
         let looking = window.is_window_active();
         let mut ask: Vec<(PaneId, String)> = Vec::new();
+        let stamp = crate::local::now();
         for (id, now) in &sorted {
             let was = self.statuses.iter().find(|(p, _)| p == id).map(|(_, s)| *s);
             if was == Some(Status::Working) && *now != Status::Working && focused != Some(*id) {
                 self.unseen.insert(*id);
+            }
+            // Began or stopped work, or started wanting you.
+            if was.is_some_and(|w| w != *now) {
+                self.touched.insert(*id, stamp);
             }
             // A chat that started waiting on you, while you look elsewhere.
             if *now == Status::Attention
@@ -2354,6 +2428,17 @@ impl Workspace {
         let working = sorted.iter().any(|(_, s)| *s == Status::Working);
         if sorted != self.statuses || working {
             self.statuses = sorted;
+            cx.notify();
+        }
+        // A pane is first touched when it opens; a chat keeps its own time.
+        for (id, pane) in &self.panes {
+            if !matches!(pane.kind, PaneKind::Chat(_)) {
+                self.touched.entry(*id).or_insert(stamp);
+            }
+        }
+        self.settle(cx);
+        // The sidebar's "5m"s move on.
+        if self.sidebar && self.ticks.is_multiple_of(30) {
             cx.notify();
         }
         if window.is_window_active() && self.ticks.is_multiple_of(2) {
@@ -2635,18 +2720,27 @@ impl Workspace {
         let conv = self.focused_agent(cx).and_then(|(_, conv)| conv);
         let title = self.focused().map(|id| self.pane_title(id, cx)).unwrap_or_default();
         let today = self.usage_open;
+        // Their records are read only when someone is looking at them.
+        let agent = self.focused_agent(cx).map(|(cmd, _)| cmd);
+        let others = today || matches!(agent, Some("opencode" | "gemini"));
         let work = cx.background_executor().spawn(async move {
             let claude = crate::usage::claude_limits();
             let codex = crate::usage::codex_limits();
+            let others: Option<Vec<_>> = others.then(|| {
+                [crate::usage::opencode_today(), crate::usage::gemini_today()]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            });
             let session = conv.and_then(|(cwd, id)| {
                 let id = id.or_else(|| crate::usage::claude_latest_session(&cwd))?;
                 crate::usage::claude_session(&cwd, &id)
             });
             let today = today.then(crate::usage::claude_today);
-            (claude, codex, session, today)
+            (claude, codex, session, today, others)
         });
         cx.spawn(async move |this, cx| {
-            let (claude, codex, session, today) = work.await;
+            let (claude, codex, session, today, others) = work.await;
             let _ = this.update(cx, |ws, cx| {
                 let u = &mut ws.usage;
                 u.busy = false;
@@ -2656,6 +2750,9 @@ impl Workspace {
                 u.session = session.map(|s| (title, s));
                 if today.is_some() {
                     u.today = today;
+                }
+                if let Some(o) = others {
+                    u.others = o;
                 }
                 cx.notify();
             });
@@ -2688,10 +2785,17 @@ impl Workspace {
             .as_ref()
             .filter(|_| agent == Some("claude"))
             .map(|(_, s)| s.context_used as f32 / s.context_window.max(1) as f32 * 100.);
-        if top.is_none() && ctx.is_none() {
+        // OpenCode and Gemini CLI have no plan limits to show: their day.
+        let day = agent
+            .and_then(|a| self.usage.others.iter().find(|d| d.agent == a))
+            .filter(|_| top.is_none());
+        if top.is_none() && ctx.is_none() && day.is_none() {
             return None;
         }
-        let glyph = Icon::agent(if agent == Some("codex") { "codex" } else { "claude" });
+        let glyph = Icon::agent(match agent {
+            Some(a @ ("codex" | "opencode" | "gemini")) => a,
+            _ => "claude",
+        });
         let on = self.usage_open;
         Some(
             div()
@@ -2715,6 +2819,10 @@ impl Workspace {
                         .child(short_limit(&l.label))
                         .child(meter_bar(l.used_pct, 28.))
                         .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
+                        // When it frees up: "· 2h 14m".
+                        .children(l.resets_at.and_then(until).map(|t| {
+                            div().text_color(rgb(theme::dim())).child(format!("· {t}"))
+                        }))
                 }))
                 .children(tight.map(|l| {
                     div()
@@ -2723,6 +2831,17 @@ impl Workspace {
                         .gap(u(4.))
                         .child(short_limit(&l.label))
                         .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
+                }))
+                .children(day.map(|d| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(4.))
+                        .child(div().text_color(rgb(theme::dim())).child("today"))
+                        .child(tokens(d.tokens))
+                        .when(d.cost_usd >= 0.01, |e| {
+                            e.child(div().text_color(rgb(theme::dim())).child(format!("· ${:.2}", d.cost_usd)))
+                        })
                 }))
                 .children(ctx.map(|pct| {
                     div()
@@ -3049,6 +3168,34 @@ impl Workspace {
         }
         if let Some(l) = &us.codex {
             body = body.child(div().pt(u(10.)).child(limits_block(l, "Codex")));
+        }
+        // Agents with no plan limits: what they used today, as they priced it.
+        for d in &us.others {
+            let name = AGENTS.iter().find(|a| a.cmd == d.agent).map_or(d.agent, |a| a.name);
+            let mut note = format!("{} replies · {} tokens", d.replies, tokens(d.tokens));
+            if d.cost_usd >= 0.01 {
+                note.push_str(&format!(" · ${:.2}", d.cost_usd));
+            }
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(3.))
+                    .pt(u(14.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(u(8.))
+                            .child(icon(Icon::agent(d.agent), 14., theme::text()))
+                            .child(div().flex_1().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(name))
+                            .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child("Today")),
+                    )
+                    .child(div().text_color(rgb(theme::text_2())).child(note))
+                    .children(d.model.clone().map(|m| {
+                        div().text_size(u(11.)).text_color(rgb(theme::dim())).child(format!("Mostly {}", crate::usage::model_name(&m)))
+                    })),
+            );
         }
         let updated = us.at.map(|t| match t.elapsed().as_secs() {
             0..=9 => "Updated just now".to_string(),
@@ -3702,6 +3849,13 @@ impl Workspace {
                 Icon::Sidebar,
                 key("sidebar"),
                 Box::new(ToggleSidebar),
+            ),
+            action(
+                "Sidebar by Project or Time",
+                "Projects, or Now, Today, Yesterday…",
+                Icon::Clock,
+                key("sidebar-view"),
+                Box::new(ToggleSidebarView),
             ),
             action(
                 "Toggle Inspector",
@@ -6143,7 +6297,7 @@ impl Workspace {
         for (ix, tab) in self.tabs.iter().enumerate() {
             // The control chat has its own row; a task's work, its task's;
             // Settings, the footer.
-            if tab.pinned || self.is_task_tab(tab, cx) || Some(ix) == settings {
+            if tab.pinned || tab.on_top || self.is_task_tab(tab, cx) || Some(ix) == settings {
                 continue;
             }
             let (name, root) = self.tab_project(tab, cx);
@@ -6159,7 +6313,7 @@ impl Workspace {
                 }
             };
             match self.group(tab) {
-                Group::Threads => group.threads.push((ix, self.last_active(tab.leaves()[0], cx))),
+                Group::Threads => group.threads.push((ix, self.settled_at(tab, cx))),
                 Group::Workspace => group.others.push(ix),
             }
         }
@@ -6189,7 +6343,7 @@ impl Workspace {
         };
         let ix = g
             .tabs()
-            .max_by_key(|&ix| self.tabs.get(ix).map(|t| self.last_active(t.focused, cx)))
+            .max_by_key(|&ix| self.tabs.get(ix).map(|t| self.tab_touched(t, cx)))
             .or_else(|| g.tabs().next());
         if let Some(ix) = ix {
             self.folded.remove(&g.name);
@@ -6199,21 +6353,7 @@ impl Workspace {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let groups = self.project_groups(cx);
-
-        let header = |label: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap(u(2.))
-                .h(u(28.))
-                .mt(u(14.))
-                .pl(u(theme::ROW_PAD))
-                .pr(u(ROW_END))
-                .text_size(u(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::dim()))
-                .child(div().flex_1().child(label))
-        };
+        let header = sidebar_header;
 
         let mut list = div()
             .id("tabs")
@@ -6236,7 +6376,6 @@ impl Workspace {
                     .h(u(32.))
                     .pl(u(theme::ROW_PAD))
                     .pr(u(ROW_END + 6.))
-                    .mb(u(4.))
                     .rounded(u(theme::ROW_RADIUS))
                     .bg(rgba(theme::tint()))
                     .text_size(u(13.))
@@ -6263,6 +6402,30 @@ impl Workspace {
                         }
                     })),
             )
+            .child(
+                // Everything open, and everything you can do, by name: ⌘K.
+                div()
+                    .id("search")
+                    .group("search")
+                    .flex()
+                    .items_center()
+                    .gap(u(ROW_GAP))
+                    .h(u(32.))
+                    .pl(u(theme::ROW_PAD))
+                    .pr(u(ROW_END + 6.))
+                    .mb(u(4.))
+                    .rounded(u(theme::ROW_RADIUS))
+                    .text_size(u(13.))
+                    .text_color(rgb(theme::text_2()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                    .child(lead(icon(Icon::Search, 14., theme::text_2())))
+                    .child(div().flex_1().child("Search"))
+                    .children(keycap(hint("palette", &self.settings.keys)).map(|k| {
+                        k.invisible().group_hover("search", |s| s.visible())
+                    }))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.toggle_palette(false, window, cx))),
+            )
             .child(self.render_control_row(cx));
 
         let open: Vec<crate::tasks::Task> = self
@@ -6278,25 +6441,31 @@ impl Workspace {
             }
         }
 
+        list = list.children(self.render_pinned(cx));
         // New agents: the picker, under its own small header.
         if !groups.is_empty() {
             list = list.child(
-                header("Projects").child(
-                    icon_button("agents-plus", Icon::Plus)
-                        .size(u(22.))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            ws.open_agent_menu(ev.position, window, cx);
-                        })),
-                ),
+                header(if self.recent { "Recent" } else { "Projects" })
+                    .child(self.render_view_switch(cx))
+                    .child(
+                        icon_button("agents-plus", Icon::Plus)
+                            .size(u(22.))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                ws.open_agent_menu(ev.position, window, cx);
+                            })),
+                    ),
             );
         } else {
             list = list.child(self.render_sidebar_empty(cx));
         }
+        if self.recent {
+            list = list.children(self.render_recent(&groups, cx));
+        }
         // Folded projects stack close as one list; an open one gets room
         // after its rows, so groups read by space rather than lines.
         let mut prev_open = false;
-        for (gi, g) in groups.iter().enumerate() {
+        for (gi, g) in groups.iter().enumerate().filter(|_| !self.recent) {
             let gap = if gi == 0 { 2. } else if prev_open { 12. } else { 0. };
             list = list.child(self.render_project_header(g, gi, gap, cx));
             prev_open = !self.folded.contains(&g.name);
@@ -6309,9 +6478,9 @@ impl Workspace {
             ixs.sort_unstable();
             for ix in ixs {
                 list = list.child(if g.threads.iter().any(|t| t.0 == ix) {
-                    self.render_thread_row(ix, cx)
+                    self.render_thread_row(ix, None, cx)
                 } else {
-                    self.render_tab_row(ix, &self.tabs[ix], cx)
+                    self.render_tab_row(ix, &self.tabs[ix], None, cx)
                 });
             }
         }
@@ -6502,6 +6671,104 @@ impl Workspace {
     /// on the same edge as every row's title, so the list keeps two edges.
     /// Folded it says how many tabs it holds; hovered, it offers a new chat
     /// or terminal there.
+    /// Projects or Recent: two marks in one small track, the one in use
+    /// lifted like an open row.
+    fn render_view_switch(&self, cx: &mut Context<Self>) -> AnyElement {
+        let seg = |id: &'static str, glyph: Icon, recent: bool| {
+            let on = self.recent == recent;
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(u(20.))
+                .rounded(u(5.))
+                .border_1()
+                .cursor_pointer()
+                .when(on, |d| d.bg(rgb(theme::row_active())).border_color(rgba(theme::hairline())))
+                .when(!on, |d| {
+                    d.border_color(gpui::transparent_black())
+                        .hover(|s| s.bg(rgb(theme::row_hover())))
+                })
+                .child(icon(glyph, 12., if on { theme::text() } else { theme::dim() }))
+                .on_click(cx.listener(move |ws, _, _, cx| {
+                    if recent && !ws.recent {
+                        ws.settled.clear();
+                        ws.settle(cx);
+                    }
+                    ws.recent = recent;
+                    cx.notify();
+                }))
+        };
+        let projects = seg("view-projects", Icon::Folder, false);
+        let recent = seg("view-recent", Icon::Clock, true);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(1.))
+            .p(u(1.))
+            .mr(u(2.))
+            .rounded(u(6.))
+            .bg(rgba(theme::tint()))
+            .child(projects)
+            .child(recent)
+            .into_any_element()
+    }
+
+    /// The sidebar by time: each row under the day it last did something,
+    /// newest first. Its place is fixed once shown (see `settle`), so an
+    /// agent starting or finishing changes its row, never where it is.
+    fn render_recent(&self, groups: &[ProjectGroup], cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (_, (h, m, sec)) = crate::retry::now();
+        let since_midnight = u64::from(h * 3600 + m * 60 + sec);
+        let now = crate::local::now();
+        let mut rows: Vec<(Bucket, i64, usize, bool, &str)> = Vec::new();
+        for g in groups {
+            for ix in g.tabs() {
+                let Some(tab) = self.tabs.get(ix) else { continue };
+                let at = self.settled_at(tab, cx);
+                let bucket = Bucket::of((now - at).max(0) as u64, since_midnight);
+                let thread = g.threads.iter().any(|t| t.0 == ix);
+                rows.push((bucket, at, ix, thread, g.name.as_str()));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        let mut out = Vec::new();
+        let mut last = None;
+        for &(bucket, _, ix, thread, project) in &rows {
+            if last != Some(bucket) {
+                last = Some(bucket);
+                out.push(sidebar_header(bucket.label()).into_any_element());
+            }
+            out.push(if thread {
+                self.render_thread_row(ix, Some(project), cx)
+            } else {
+                self.render_tab_row(ix, &self.tabs[ix], Some(project), cx)
+            });
+        }
+        out
+    }
+
+    /// The rows you pinned, above every project, in the order they opened.
+    fn render_pinned(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let pins: Vec<usize> = (0..self.tabs.len()).filter(|&ix| self.tabs[ix].on_top).collect();
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![sidebar_header("Pinned").into_any_element()];
+        for ix in pins {
+            let tab = &self.tabs[ix];
+            let project = self.tab_project(tab, cx).0;
+            out.push(if self.group(tab) == Group::Threads {
+                self.render_thread_row(ix, Some(&project), cx)
+            } else {
+                self.render_tab_row(ix, tab, Some(&project), cx)
+            });
+        }
+        out
+    }
+
     fn render_project_header(&self, g: &ProjectGroup, gi: usize, gap: f32, cx: &mut Context<Self>) -> AnyElement {
         let name = g.name.clone();
         let loose = name.is_empty();
@@ -6682,11 +6949,48 @@ impl Workspace {
         Some((title.into(), sub.into()))
     }
 
-    fn last_active(&self, id: PaneId, cx: &App) -> Instant {
+    /// When a pane last did something, in seconds since the epoch.
+    fn last_active(&self, id: PaneId, cx: &App) -> i64 {
+        let touched = self.touched.get(&id).copied();
         match self.panes.get(&id).map(|p| &p.kind) {
-            Some(PaneKind::Chat(c)) => c.read(cx).last_activity,
-            Some(PaneKind::Terminal(t)) => t.read(cx).last_output,
-            _ => Instant::now(),
+            Some(PaneKind::Chat(c)) => touched.unwrap_or(0).max(c.read(cx).updated / 1000),
+            _ => touched.unwrap_or_else(crate::local::now),
+        }
+    }
+
+    /// When a tab last did something: the latest of its panes.
+    fn tab_touched(&self, tab: &Tab, cx: &App) -> i64 {
+        tab.leaves()
+            .into_iter()
+            .map(|id| self.last_active(id, cx))
+            .max()
+            .unwrap_or_else(crate::local::now)
+    }
+
+    /// Where a tab sits in the sidebar's Recent view: the time it had when
+    /// the list first showed it, or its own while it is that new.
+    fn settled_at(&self, tab: &Tab, cx: &App) -> i64 {
+        self.settled
+            .get(&tab.leaves()[0])
+            .copied()
+            .unwrap_or_else(|| self.tab_touched(tab, cx))
+    }
+
+    /// Fix each new tab's place in the Recent view, and forget closed ones.
+    /// A row never moves on its own: an agent starting or finishing, or
+    /// you looking at it, leaves it where it is. Choosing Recent again
+    /// sorts afresh.
+    fn settle(&mut self, cx: &mut Context<Self>) {
+        let firsts: Vec<(PaneId, i64)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.leaves()[0], self.settled_at(tab, cx)))
+            .collect();
+        let changed = firsts.len() != self.settled.len()
+            || firsts.iter().any(|(id, _)| !self.settled.contains_key(id));
+        if changed {
+            self.settled = firsts.into_iter().collect();
+            cx.notify();
         }
     }
 
@@ -6826,8 +7130,10 @@ impl Workspace {
     }
 
     /// A thread: its title, then who is doing it and what it needs from you.
-    fn render_thread_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let indent = ROW_INDENT;
+    /// A chat or agent's row. `place` is its project, for the Recent view,
+    /// where rows stand flush and say which project they are in.
+    fn render_thread_row(&self, ix: usize, place: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        let indent = if place.is_some() { 0. } else { ROW_INDENT };
         let Some(tab) = self.tabs.get(ix) else {
             return div().into_any_element();
         };
@@ -6904,14 +7210,7 @@ impl Workspace {
                             }))
                             .child(self.pane_title(tab.focused, cx)),
                     )
-                    .child(
-                        div()
-                            .w_full()
-                            .one_line()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(who),
-                    ),
+                    .child(second_line(place, who)),
             )
             .child(
                 // The state, swapped for the close button while hovered.
@@ -7037,8 +7336,8 @@ impl Workspace {
         gpui::point(px(theme::GUTTER * z), px(theme::TITLEBAR_PX * z + 44. * z))
     }
 
-    fn render_tab_row(&self, ix: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
-        let indent = ROW_INDENT;
+    fn render_tab_row(&self, ix: usize, tab: &Tab, place: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        let indent = if place.is_some() { 0. } else { ROW_INDENT };
         let active = ix == self.active;
         let first = tab.leaves()[0];
         let (glyph, tint) = self.tab_icon(first, cx);
@@ -7074,6 +7373,24 @@ impl Workspace {
             .get(&first)
             .and_then(|p| p.agent.as_ref())
             .map(|(cmd, _)| Icon::agent(cmd));
+        // An agent you have not looked at since it finished says so; any
+        // row in the Recent view, and an agent's anywhere, says how long
+        // ago it last did something.
+        let when = if busy || wants {
+            None
+        } else if self.unseen.contains(&first) {
+            Some(pill("Done".into()))
+        } else if place.is_some() || agent.is_some() {
+            Some(
+                div()
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child(ago(self.tab_touched(tab, cx))),
+            )
+        } else {
+            None
+        };
+        let timed = when.is_some();
         // Activity always shows in the icon's place: the agent's mark turns,
         // a busy command or a loading page spins.
         let mark = match (loading, busy, agent, self.tab_favicon(first, cx)) {
@@ -7121,14 +7438,7 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .child(div().w_full().one_line().child(row_title))
-                    .children(subtitle.map(|sub| {
-                        div()
-                            .w_full()
-                            .one_line()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(sub)
-                    })),
+                    .children(subtitle.map(|sub| second_line(place, sub))),
             )
             .when(count > 1, |d| {
                 d.child(
@@ -7145,17 +7455,30 @@ impl Workspace {
             // Something wants you: the bell. Idle needs no mark.
             .when(wants, |d| d.child(alert_pill()))
             .child(
-                icon_button(
-                    ElementId::NamedInteger("close".into(), ix as u64),
-                    Icon::Close,
-                )
-                .size(u(22.))
-                .opacity(0.)
-                .group_hover(group, |s| s.opacity(1.))
-                .on_click(cx.listener(move |ws, _, window, cx| {
-                    cx.stop_propagation();
-                    ws.close_tab(ix, window, cx);
-                })),
+                // Done or how long ago, swapped for the close button while
+                // hovered.
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .relative()
+                    .when_some(when, |d, when| {
+                        d.child(div().group_hover(group.clone(), |s| s.opacity(0.)).child(when))
+                    })
+                    .child(
+                        icon_button(
+                            ElementId::NamedInteger("close".into(), ix as u64),
+                            Icon::Close,
+                        )
+                        .when(timed, |b| b.absolute().right_0())
+                        .size(u(22.))
+                        .opacity(0.)
+                        .group_hover(group, |s| s.opacity(1.))
+                        .on_click(cx.listener(move |ws, _, window, cx| {
+                            cx.stop_propagation();
+                            ws.close_tab(ix, window, cx);
+                        })),
+                    ),
             )
             .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
             .on_mouse_down(
@@ -7562,6 +7885,17 @@ fn short_limit(label: &str) -> SharedString {
     }
 }
 
+/// How long until `at`, compactly: "42m", "2h 14m", "3d 4h"; `None` once
+/// it has passed.
+fn until(at: std::time::SystemTime) -> Option<String> {
+    let s = at.duration_since(std::time::SystemTime::now()).ok()?.as_secs();
+    Some(match s {
+        0..=3599 => format!("{}m", s.div_ceil(60).max(1)),
+        3600..=86_399 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d {}h", s / 86_400, (s % 86_400) / 3600),
+    })
+}
+
 /// "resets in 2h 14m", or in days past a day.
 fn resets_in(at: std::time::SystemTime) -> String {
     let secs = at.duration_since(std::time::SystemTime::now()).map(|d| d.as_secs()).unwrap_or(0);
@@ -7672,6 +8006,75 @@ fn git_head(root: &std::path::Path) -> Option<String> {
 /// too, only transparent, so picking a row moves nothing by a pixel. An
 /// idle row (`faded`) steps back until the pointer is on it. `indent` moves
 /// a project's rows in under its header.
+/// A small heading in the sidebar's list, with room after the label for
+/// its own controls.
+fn sidebar_header(label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(u(2.))
+        .h(u(28.))
+        .mt(u(14.))
+        .pl(u(theme::ROW_PAD))
+        .pr(u(ROW_END))
+        .text_size(u(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(theme::dim()))
+        .child(div().flex_1().child(label))
+}
+
+/// A row's second line. In the Recent view no header says the project, so
+/// the line leads with it.
+fn second_line(place: Option<&str>, text: SharedString) -> gpui::Div {
+    let line = div().w_full().text_size(u(11.)).text_color(rgb(theme::dim()));
+    let Some(project) = place.filter(|p| !p.is_empty()) else {
+        return line.one_line().child(text);
+    };
+    let text: SharedString = if text.is_empty() {
+        project.to_string().into()
+    } else if text.starts_with(project) {
+        text
+    } else {
+        format!("{project} · {text}").into()
+    };
+    line.flex()
+        .items_center()
+        .gap(u(4.))
+        .child(div().flex_none().child(icon(Icon::Folder, 10., theme::dim())))
+        .child(div().flex_1().min_w_0().one_line().child(text))
+}
+
+/// Where a row sits in the sidebar's Recent view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Bucket {
+    Today,
+    Yesterday,
+    Week,
+    Earlier,
+}
+
+impl Bucket {
+    /// By how long ago it was against how far into today it is, both in
+    /// seconds: Yesterday is the calendar day, not the last 24 hours.
+    fn of(age: u64, since_midnight: u64) -> Bucket {
+        match age.saturating_sub(since_midnight) {
+            0 => Bucket::Today,
+            1..=86_400 => Bucket::Yesterday,
+            86_401..=518_400 => Bucket::Week,
+            _ => Bucket::Earlier,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Bucket::Today => "Today",
+            Bucket::Yesterday => "Yesterday",
+            Bucket::Week => "This week",
+            Bucket::Earlier => "Earlier",
+        }
+    }
+}
+
 fn sidebar_row(
     row: gpui::Stateful<gpui::Div>,
     indent: f32,
@@ -7800,7 +8203,12 @@ impl PlaceJob {
                     }
                 }
                 let cwd = inspect::cwd(front.0).or_else(|| inspect::cwd(shell)).or(said)?;
+                let session = agent
+                    .as_ref()
+                    .filter(|(a, _)| a.cmd == "claude")
+                    .and_then(|(_, argv)| crate::session::claude_live_session(front.0, argv));
                 Some(Place {
+                    session,
                     agent: agent.map(|(a, argv)| (a.cmd, argv)),
                     front: Some(front.1),
                     ..place_of(&cwd)
@@ -7822,6 +8230,9 @@ struct Place {
     front: Option<String>,
     /// An agent CLI in front, and the arguments it was started with.
     agent: Option<(&'static str, Vec<String>)>,
+    /// The Claude Code conversation that process holds, as Claude Code
+    /// itself records it: exact, where guessing from transcripts is not.
+    session: Option<String>,
 }
 
 impl Place {
@@ -8245,6 +8656,11 @@ impl Render for Workspace {
                 ws.sidebar = !ws.sidebar;
                 cx.notify();
             }))
+            .on_action(cx.listener(|ws, _: &ToggleSidebarView, _, cx| {
+                ws.recent = !ws.recent;
+                ws.sidebar = true;
+                cx.notify();
+            }))
             .on_action(cx.listener(|ws, _: &ToggleInspector, w, cx| ws.toggle_inspector(w, cx)))
             .on_action(cx.listener(|ws, _: &ZoomIn, w, cx| ws.zoom(1, w, cx)))
             .on_action(cx.listener(|ws, _: &ZoomOut, w, cx| ws.zoom(-1, w, cx)))
@@ -8408,9 +8824,10 @@ fn short_secs(s: u64) -> String {
     }
 }
 
-/// "now", "5m", "2h", "3d": how long since something happened.
-fn ago(t: Instant) -> String {
-    let s = t.elapsed().as_secs();
+/// "now", "5m", "2h", "3d": how long since something happened, given
+/// in seconds since the epoch.
+fn ago(at: i64) -> String {
+    let s = (crate::local::now() - at).max(0);
     match s {
         0..=59 => "now".into(),
         60..=3599 => format!("{}m", s / 60),
@@ -9210,6 +9627,21 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_buckets_follow_the_calendar_not_rolling_days() {
+        let ten_am = 10 * 3600;
+        assert_eq!(Bucket::of(60, ten_am), Bucket::Today);
+        assert_eq!(Bucket::of(ten_am, ten_am), Bucket::Today);
+        // A minute before midnight, seen at 10:00, is yesterday.
+        assert_eq!(Bucket::of(ten_am + 60, ten_am), Bucket::Yesterday);
+        assert_eq!(Bucket::of(ten_am + 86_400, ten_am), Bucket::Yesterday);
+        assert_eq!(Bucket::of(ten_am + 86_401, ten_am), Bucket::Week);
+        assert_eq!(Bucket::of(ten_am + 6 * 86_400, ten_am), Bucket::Week);
+        assert_eq!(Bucket::of(ten_am + 6 * 86_400 + 1, ten_am), Bucket::Earlier);
+        // Just after midnight, an hour ago is already yesterday.
+        assert_eq!(Bucket::of(3600, 60), Bucket::Yesterday);
+    }
 
     #[test]
     fn only_ports_that_answer_http_are_web_servers() {

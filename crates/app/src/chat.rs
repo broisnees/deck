@@ -266,6 +266,9 @@ pub struct ChatPane {
     agent_env: Vec<(String, String)>,
     pub title: SharedString,
     pub last_activity: Instant,
+    /// When it last did something, in milliseconds since the epoch: what
+    /// the sidebar shows and sorts by, kept across restarts.
+    pub updated: i64,
     /// Messages sent while a turn runs, for agents that cannot take input
     /// mid-turn: deck holds them and sends each when the turn ends.
     queued: std::collections::VecDeque<Outgoing>,
@@ -480,6 +483,7 @@ impl ChatPane {
             agent_env,
             title: SharedString::default(),
             last_activity: Instant::now(),
+            updated: now(),
             queued: Default::default(),
             inflight: Vec::new(),
             interrupting: false,
@@ -549,6 +553,7 @@ impl ChatPane {
         c.thread_id = saved.id;
         c.control = saved.control;
         c.title = saved.title.into();
+        c.updated = saved.updated;
         c.mode = if saved.full_access {
             PermissionMode::Yolo
         } else if saved.ask_first {
@@ -615,7 +620,9 @@ impl ChatPane {
                 .iter()
                 .map(|(ix, c)| (*ix, c.clone()))
                 .collect(),
-            updated: now(),
+            // When it last did something, not when it was written: a
+            // restored thread keeps its age.
+            updated: self.updated,
         }
     }
 
@@ -1234,6 +1241,7 @@ impl ChatPane {
             Some(conn) if conn.send(turn) => {
                 self.status = ChatStatus::Working;
                 self.last_activity = Instant::now();
+                self.updated = now();
                 self.turn_started = Some(Instant::now());
             }
             _ => self.fail("the session is no longer accepting input".into(), cx),
@@ -2221,6 +2229,7 @@ impl ChatPane {
         }
         self.sync_popup(cx);
         self.last_activity = Instant::now();
+        self.updated = now();
         self.sync_list(before, &touched, cx);
         // The turn is over: the next queued message goes now.
         if self.status == ChatStatus::Idle {
