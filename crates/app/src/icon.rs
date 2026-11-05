@@ -76,7 +76,6 @@ icons! {
     Lock => "lock.svg",
     Theme => "theme.svg",
     Gauge => "gauge.svg",
-    Home => "home.svg",
     Cursor => "agent-cursor.svg",
     Amp => "agent-amp.svg",
     Aider => "agent-aider.svg",

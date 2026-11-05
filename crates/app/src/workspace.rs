@@ -496,12 +496,22 @@ pub const AGENTS: &[Agent] = &[
         cmd: "codex",
     },
     Agent {
-        name: "Gemini CLI",
-        cmd: "gemini",
-    },
-    Agent {
         name: "OpenCode",
         cmd: "opencode",
+    },
+    Agent {
+        name: "Copilot",
+        cmd: "copilot",
+    },
+    // Interactive only (no headless prompt mode), so a terminal agent and
+    // not a chat one.
+    Agent {
+        name: "Freebuff",
+        cmd: "freebuff",
+    },
+    Agent {
+        name: "Qwen Code",
+        cmd: "qwen",
     },
     Agent {
         name: "Cursor Agent",

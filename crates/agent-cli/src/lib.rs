@@ -723,7 +723,7 @@ mod tests {
         let all = CliAdapter::all();
         assert_eq!(all.len(), spec::ALL.len());
         let ids: Vec<String> = all.iter().map(|a| a.id().to_string()).collect();
-        for want in ["opencode", "vibe", "grok", "crush", "gemini", "codex"] {
+        for want in ["opencode", "vibe", "grok", "crush", "copilot", "codex"] {
             assert!(ids.contains(&want.to_string()), "{want} not registered");
         }
     }

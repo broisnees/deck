@@ -2318,17 +2318,30 @@ impl ChatPane {
             .left_0()
             .bottom(relative(1.))
             .mb(u(6.))
-            .w(u(300.))
+            // Wide enough that every line of it stays one line.
+            .w(u(340.))
             .p(u(4.))
             .flex()
             .flex_col()
-            .gap(u(2.))
+            .gap(u(1.))
             .rounded(u(10.))
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_lg()
             .occlude()
-            .cursor_pointer();
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(24.))
+                    .px(u(10.))
+                    .text_size(u(theme::TEXT_META))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child("Access"),
+            );
         for (i, a) in Access::ALL.iter().copied().enumerate() {
             let on = a == current;
             menu = menu.child(
@@ -2345,7 +2358,7 @@ impl ChatPane {
                     .child(icon(
                         access_icon(a),
                         14.,
-                        if on { theme::text() } else { theme::text_2() },
+                        if on { theme::accent() } else { theme::text_2() },
                     ))
                     .child(
                         div()
@@ -2355,15 +2368,16 @@ impl ChatPane {
                             .min_w_0()
                             .child(
                                 div()
-                                    .text_size(u(13.))
+                                    .text_size(u(theme::TEXT_UI))
                                     .line_height(u(18.))
                                     .text_color(rgb(theme::text()))
                                     .child(a.name()),
                             )
                             .child(
                                 div()
-                                    .text_size(u(11.))
+                                    .text_size(u(theme::TEXT_META))
                                     .line_height(u(15.))
+                                    .one_line()
                                     .text_color(rgb(theme::dim()))
                                     .child(a.detail()),
                             ),
@@ -4483,9 +4497,9 @@ impl ChatPane {
                 // The console: the agent's commands and their output.
                 chip("console")
                     .px(u(0.))
-                    .w(u(30.))
+                    .w(u(28.))
                     .justify_center()
-                    .tooltip(|_, cx| crate::workspace::Tip::view("Console: commands and their output", cx))
+                    .tooltip(|_, cx| crate::workspace::Tip::view("Console", cx))
                     .when(self.console, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::surface())))
                     .child(icon(Icon::Terminal, 15., if self.console { theme::text() } else { theme::text_2() }))
@@ -4498,9 +4512,9 @@ impl ChatPane {
                 // The outline: every message you sent, to jump back to.
                 chip("outline")
                     .px(u(0.))
-                    .w(u(30.))
+                    .w(u(28.))
                     .justify_center()
-                    .tooltip(|_, cx| crate::workspace::Tip::view("Outline: jump to a message", cx))
+                    .tooltip(|_, cx| crate::workspace::Tip::view("Outline", cx))
                     .when(self.outline_open, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::surface())))
                     .child(icon(Icon::List, 15., if self.outline_open { theme::text() } else { theme::text_2() }))
@@ -4516,6 +4530,7 @@ impl ChatPane {
                     .flex_none()
                     .items_center()
                     .justify_center()
+                    .ml(u(4.))
                     .size(u(28.))
                     .rounded(u(14.))
                     .when(can_send, |d| {
@@ -4819,35 +4834,9 @@ impl ChatPane {
     /// pointer moves between agents.
     fn render_model_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         const ROW: f32 = 30.;
-        const HEAD: f32 = 24.;
-        const GAP: f32 = 1.;
-        const PAD: f32 = 4.;
+        // The agent whose models are open, inline under its row.
         let lit = self.model_menu.clone()?;
-        let panel = || {
-            div()
-                .flex()
-                .flex_col()
-                .gap(u(GAP))
-                .p(u(PAD))
-                .rounded(u(10.))
-                .bg(rgb(theme::menu()))
-                .border_1()
-                .border_color(rgba(theme::alpha(theme::text(), 0x14)))
-                .shadow_lg()
-                .occlude()
-        };
-        // A panel's small title: what its rows choose.
-        let head = |label: String| {
-            div()
-                .flex()
-                .items_center()
-                .h(u(HEAD))
-                .px(u(8.))
-                .text_size(u(11.))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(theme::dim()))
-                .child(label)
-        };
+        let default_agent = crate::settings::load().default_agent;
         let row = |id: ElementId| {
             div()
                 .id(id)
@@ -4857,72 +4846,120 @@ impl ChatPane {
                 .h(u(ROW))
                 .px(u(8.))
                 .rounded(u(6.))
-                .text_size(u(13.))
+                .text_size(u(theme::TEXT_UI))
         };
-        let entries = self.env.registry.all();
-        let n = entries.len();
-        let mut lit_ix = 0usize;
-        let default_agent = crate::settings::load().default_agent;
-        let mut agents = panel().w(u(196.)).child(head("Agent".into()));
-        for (ix, entry) in entries.into_iter().enumerate() {
+        let mut panel = div()
+            .id("model-menu")
+            .flex()
+            .flex_col()
+            .gap(u(1.))
+            .w(u(280.))
+            .max_h(u(440.))
+            .overflow_y_scroll()
+            .p(u(4.))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(24.))
+                    .px(u(8.))
+                    .text_size(u(theme::TEXT_META))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child("Agent and model"),
+            );
+        for entry in self.env.registry.all() {
             let id = entry.id();
             let ready = entry.is_ready();
-            let on = id == lit;
-            if on {
-                lit_ix = ix;
-            }
             let current = id == self.agent;
-            let hover_to = id.clone();
-            let has_models = !entry.adapter.models().is_empty();
-            let pick_to = id.clone();
-            agents = agents.child(
+            let open = id == lit && ready;
+            let models = if ready { entry.adapter.models() } else { &[] };
+            let has_models = !models.is_empty();
+            let name = entry.display_name().to_string();
+            let (to_open, to_pick) = (id.clone(), id.clone());
+            panel = panel.child(
                 row(ElementId::Name(format!("menu-agent-{}", id.as_str()).into()))
-                    .when(on && ready, |d| d.bg(rgb(theme::surface())))
-                    .text_color(rgb(if !ready { theme::dim() } else if on { theme::text() } else { theme::text_2() }))
-                    .when(ready, |d| d.cursor_pointer())
-                    .on_hover(cx.listener(move |c, hovered: &bool, _, cx| {
-                        if *hovered && c.model_menu.as_ref() != Some(&hover_to) {
-                            c.model_menu = Some(hover_to.clone());
-                            cx.notify();
-                        }
-                    }))
+                    .when(ready, |d| d.cursor_pointer().hover(|s| s.bg(rgb(theme::surface()))))
+                    .when(open || (current && !has_models), |d| d.bg(rgb(theme::surface())))
+                    .text_color(rgb(if !ready { theme::dim() } else if current { theme::text() } else { theme::text_2() }))
                     .child(crate::icon::agent_mark(
                         id.as_str(),
-                        entry.display_name(),
+                        &name,
                         14.,
-                        match (ready, current) {
-                            (false, _) => theme::dim(),
-                            (true, true) => Icon::agent(id.as_str()).brand().unwrap_or(theme::text()),
-                            (true, false) => theme::text_2(),
+                        if !ready {
+                            theme::dim()
+                        } else if current {
+                            Icon::agent(id.as_str()).brand().unwrap_or(theme::text())
+                        } else {
+                            theme::text_2()
                         },
                     ))
-                    .child(div().flex_1().min_w_0().one_line().child(entry.display_name().to_string()))
-                    // The one new chats start with.
+                    .child(div().flex_1().min_w_0().one_line().child(name.clone()))
+                    .when(!ready, |d| d.child(div().flex_none().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child("not set up")))
                     .when(ready && Some(id.as_str()) == default_agent.as_deref(), |d| {
                         d.child(div().flex_none().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child("default"))
                     })
-                    .when(!ready, |d| d.child(div().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child("Not set up")))
-                    .when(ready && current, |d| d.child(icon(Icon::Check, 11., theme::text())))
-                    .when(ready && has_models, |d| d.child(icon(Icon::ChevronRight, 10., theme::dim())))
-                    .when(ready && !has_models, |d| {
+                    .when(ready && current && !has_models, |d| d.child(icon(Icon::Check, 11., theme::text())))
+                    .when(has_models, |d| {
+                        d.child(icon(if open { Icon::ChevronDown } else { Icon::ChevronRight }, 10., theme::dim()))
+                    })
+                    // An agent with models opens them; one without is picked.
+                    .when(ready, |d| {
                         d.on_mouse_down(
                             gpui::MouseButton::Left,
-                            cx.listener(move |c, _, _, cx| c.pick_model(pick_to.clone(), None, cx)),
+                            cx.listener(move |c, _, _, cx| {
+                                if has_models {
+                                    c.model_menu = Some(to_open.clone());
+                                    cx.notify();
+                                } else {
+                                    c.pick_model(to_pick.clone(), None, cx);
+                                }
+                            }),
                         )
                     }),
             );
+            if open {
+                let agent_label = id.as_str().to_lowercase();
+                let choices = std::iter::once((None, "Default".to_string(), "what the CLI picks"))
+                    .chain(models.iter().map(|m| (Some(smol_str::SmolStr::new(m.id)), m.label.to_string(), m.note)));
+                for (i, (mid, label, note)) in choices.enumerate() {
+                    let note = if note.to_lowercase() == agent_label { "" } else { note };
+                    let on = current && mid == self.model;
+                    let to = id.clone();
+                    panel = panel.child(
+                        row(ElementId::NamedInteger("menu-model".into(), i as u64))
+                            .ml(u(22.))
+                            .h(u(28.))
+                            .cursor_pointer()
+                            .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
+                            .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                            .child(div().flex_1().min_w_0().one_line().child(label))
+                            .child(div().flex_none().one_line().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child(note))
+                            .child(div().flex_none().w(u(12.)).when(on, |d| d.child(icon(Icon::Check, 11., theme::text()))))
+                            // On press: the menu hangs outside the chip, so by
+                            // release the press outside has shut it.
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |c, _, _, cx| c.pick_model(to.clone(), mid.clone(), cx)),
+                            ),
+                    );
+                }
+            }
         }
-        // Make the agent under the pointer the one new chats start with.
-        let mut below = 0.;
+        // Make the open agent the one new chats start with.
         if let Some(entry) = self.env.registry.get(&lit).filter(|e| e.is_ready()) {
             if default_agent.as_deref() != Some(lit.as_str()) {
-                // The divider (1 + 4 margin) and the row, under the agents.
-                below = 5. + GAP + ROW + GAP;
                 let to = lit.as_str().to_string();
-                agents = agents.child(div().h(u(1.)).mx(u(6.)).my(u(2.)).bg(rgba(theme::hairline()))).child(
+                panel = panel.child(div().h(u(1.)).mx(u(6.)).my(u(3.)).bg(rgba(theme::hairline()))).child(
                     row(ElementId::Name("menu-make-default".into()))
                         .cursor_pointer()
-                        .text_size(u(12.))
+                        .text_size(u(theme::TEXT_SMALL))
                         .text_color(rgb(theme::text_2()))
                         .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
                         .child(format!("Make {} the default", entry.display_name()))
@@ -4933,69 +4970,7 @@ impl ChatPane {
                 );
             }
         }
-        let models = self
-            .env
-            .registry
-            .get(&lit)
-            .filter(|e| e.is_ready())
-            .map(|e| e.adapter.models())
-            .unwrap_or(&[]);
-        let mut menu = div()
-            .absolute()
-            .left_0()
-            .bottom(relative(1.))
-            .mb(u(6.))
-            .flex()
-            .items_end()
-            .gap(u(4.))
-            .child(agents);
-        if !models.is_empty() {
-            // At most nine rows tall; longer lists scroll inside it.
-            const MAX_ROWS: usize = 9;
-            let count = models.len() + 1;
-            let visible = count.min(MAX_ROWS);
-            // Its top on the hovered agent's row, unless it is taller than
-            // the room above; then it sits on the menu's floor. Both panels
-            // open with a title row.
-            let height = PAD * 2. + HEAD + GAP + visible as f32 * ROW + (visible - 1) as f32 * GAP + 2.;
-            let row_top = (n - lit_ix) as f32 * (ROW + GAP) - GAP + PAD + 1. + HEAD + GAP + below;
-            let lift = (row_top - height).max(0.);
-            let agent_label = lit.as_str().to_lowercase();
-            let agent_name = self.env.registry.get(&lit).map(|e| e.display_name().to_string()).unwrap_or_default();
-            let mut col = panel()
-                .id("menu-models")
-                .w(u(280.))
-                .mb(u(lift))
-                .max_h(u(height))
-                .overflow_y_scroll()
-                .child(head(format!("{agent_name} models")));
-            let choices = std::iter::once((None, "Default".to_string(), "what the CLI picks"))
-                .chain(models.iter().map(|m| (Some(smol_str::SmolStr::new(m.id)), m.label.to_string(), m.note)));
-            for (i, (id, label, note)) in choices.enumerate() {
-                // A note that only repeats the agent's name says nothing.
-                let note = if note.to_lowercase() == agent_label { "" } else { note };
-                let current = lit == self.agent && id == self.model;
-                let to = lit.clone();
-                col = col.child(
-                    row(ElementId::NamedInteger("menu-model".into(), i as u64))
-                        .cursor_pointer()
-                        .text_color(rgb(if current { theme::text() } else { theme::text_2() }))
-                        .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
-                        .child(div().flex_1().min_w_0().one_line().child(label))
-                        // Notes in one column on the right, the check after.
-                        .child(div().flex_none().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(note))
-                        .child(div().flex_none().w(u(12.)).when(current, |d| d.child(icon(Icon::Check, 11., theme::text()))))
-                        // On press: the menu hangs outside the chip, so by
-                        // release the press outside has shut it.
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(move |c, _, _, cx| c.pick_model(to.clone(), id.clone(), cx)),
-                        ),
-                );
-            }
-            // Swapped at once as the pointer moves between agents.
-            menu = menu.child(col);
-        }
+        let menu = div().absolute().left_0().bottom(relative(1.)).mb(u(6.)).child(panel);
         // Drawn after everything else, so nothing under it (the composer's
         // edge, its placeholder) shows through.
         Some(

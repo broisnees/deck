@@ -349,6 +349,12 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [x] Routing when a limit is reached: Settings › Agents › When an agent reaches its limit takes agents in order (numbered as picked); the thread moves to the first ready one with the whole conversation, on down the chain if that one is out too, and back to its own agent with the first message after the reset
 - [x] Before the limit: a chat on an agent at 90% or more of a plan limit says so under its composer, with the reset time
 
+- [x] Model picker as one panel: agents as rows, an agent's models open inline under it, "default" on the default one
+- [x] Agents: Gemini out of the picker; GitHub Copilot as a chat agent (plain text, flags from its `--help`); Freebuff and Qwen Code as terminal agents (Freebuff has no headless mode; Qwen lists no approval flag)
+- [ ] OmniRoute as a model route (it is a router with fallbacks, not a coding agent): agents' requests through it
+- [ ] Kimi CLI and Kiro: add once installed, from their own `--help`
+- [ ] Copilot's JSON lines (`--output-format json`): read tool calls and the session id once its schema is observed
+
 ### One setup for every agent (asked 2026-11-05)
 
 - [ ] See each agent's MCP servers, skills, slash commands, hooks and plugins side by side (Claude Code, Codex, Gemini CLI, OpenCode, Grok, Crush, Vibe), read from their own config files
