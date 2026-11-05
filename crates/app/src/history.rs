@@ -125,6 +125,32 @@ pub fn set_title(url: &str, title: &str) {
     save_later(generation);
 }
 
+/// Pages another browser knew, merged in: more visits and the later visit
+/// win; the best kept when the list overflows.
+pub fn import(visits: Vec<Visit>) {
+    let generation = {
+        let mut s = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        for v in visits.into_iter().filter(|v| worth_keeping(&v.url)) {
+            match s.entries.iter_mut().find(|e| e.url == v.url) {
+                Some(e) => {
+                    e.visits = e.visits.max(v.visits);
+                    e.last = e.last.max(v.last);
+                    if e.title.is_empty() {
+                        e.title = v.title;
+                    }
+                }
+                None => s.entries.push(v),
+            }
+        }
+        let t = now();
+        s.entries.sort_by(|a, b| score(b, t).total_cmp(&score(a, t)));
+        s.entries.truncate(MAX_ENTRIES);
+        s.generation += 1;
+        s.generation
+    };
+    save_later(generation);
+}
+
 fn save_later(generation: u64) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(2));
