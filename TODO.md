@@ -338,6 +338,14 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [ ] Memory page of its own: search, edit in place, move between a project and everywhere (today: Settings › Agents › Deck memory lists and forgets)
 - [ ] Notes from a finished chat: offer the decisions and gotchas it found as memories, one click to keep
 
+### One setup for every agent (asked 2026-11-05)
+
+- [ ] See each agent's MCP servers, skills, slash commands, hooks and plugins side by side (Claude Code, Codex, Gemini CLI, OpenCode, Grok, Crush, Vibe), read from their own config files
+- [ ] Sync: add an MCP server or skill once and have Deck write it into every agent that supports it, in each one's own format; show what each agent can't take
+- [ ] Health: which MCP servers fail to connect (stroke and ewiz-share do today) and slow every session start, with the error and a fix or a switch to turn it off
+- [ ] Compare agents: models, context size, tools, approval modes, MCP and skill support, cost and plan limits, in one table, plus the same prompt run in two agents side by side
+- [ ] Keep it in step: Deck notices when an agent's config changes outside Deck and offers to sync it to the rest
+
 ### Integrations (asked 2026-11-05)
 
 - [ ] Integrations page in Settings: switch each one on, sign in (OAuth or a token kept in the keychain / Secret Service), see what it can reach
