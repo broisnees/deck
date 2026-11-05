@@ -62,6 +62,13 @@ const BLOCKED: &[(&str, &str)] = &[
     ("not_found_error", "model not found"),
     ("invalid_request", "the API rejected the request"),
     ("permission_error", "the API refused: permission"),
+    // An agent missing on a remote host: a retry finds it missing again.
+    (
+        "is not installed on",
+        "the agent is not installed on that host; Claude, Codex and OpenCode work there without installing anything",
+    ),
+    ("no such file or directory", "a program it needs is missing"),
+    ("command not found", "a program it needs is missing"),
 ];
 
 /// Errors that pass: overloads, server errors, dropped connections.
