@@ -28,6 +28,8 @@
 //! own theme instead of shipping a second one.
 
 mod tap;
+#[cfg(feature = "ghostty")]
+mod ghostty;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
@@ -44,6 +46,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub type Rgb = u32;
 
@@ -293,6 +296,8 @@ pub enum TermEvent {
     Progress(Option<u8>, Option<u8>),
     /// "# …" at the prompt: a command wanted for this.
     Ask(String),
+    /// `deck report STATE MESSAGE` from a program in the pane.
+    Report(String, String),
     /// The line being edited at the prompt and the cursor in it (characters),
     /// or `None` when it was entered or abandoned.
     Line(Option<(usize, String)>),
@@ -320,7 +325,7 @@ struct Shared {
     /// Needed because a terminal is a *dialogue*, not a one-way pipe: the
     /// emulator answers the program's queries, and those answers have to reach
     /// the PTY. See the `PtyWrite` arm below.
-    writer: Mutex<Option<alacritty_terminal::event_loop::EventLoopSender>>,
+    writer: Mutex<Option<Box<dyn Fn(Vec<u8>) + Send>>>,
     /// Last known geometry and palette, for the queries that ask about them.
     window: Mutex<WindowSize>,
     palette: Mutex<Option<Palette>>,
@@ -357,9 +362,9 @@ impl Shared {
 
     /// Bytes to the program, as if typed: the emulator's answers to its queries.
     fn send(&self, bytes: Vec<u8>) {
-        if let Ok(mut w) = self.writer.lock() {
-            if let Some(sender) = w.as_mut() {
-                let _ = sender.send(Msg::Input(Cow::Owned(bytes)));
+        if let Ok(w) = self.writer.lock() {
+            if let Some(write) = w.as_ref() {
+                write(bytes);
             }
         }
     }
@@ -381,6 +386,7 @@ impl Shared {
                 match signal {
                     Signal::Notify { title, body } => events.push(TermEvent::Notify { title, body }),
                     Signal::Progress(p, pct) => events.push(TermEvent::Progress(p, pct)),
+                    Signal::Report(state, msg) => events.push(TermEvent::Report(state, msg)),
                     Signal::Prompt(n) => {
                         // The shell has the terminal back: whatever asked for
                         // theme updates has gone, and a report now would land
@@ -833,6 +839,8 @@ pub struct Spawn {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
+    /// The emulator to run it on.
+    pub engine: Engine,
 }
 
 /// What we tell programs they are running inside.
@@ -916,6 +924,7 @@ impl Spawn {
             args: Vec::new(),
             cwd: Some(cwd.to_path_buf()),
             env: base_env(),
+            engine: Engine::default(),
         }
     }
 
@@ -931,11 +940,12 @@ impl Spawn {
             args: vec!["-c".into(), format!("{cmd}; exec {shell}")],
             cwd: Some(cwd.to_path_buf()),
             env: base_env(),
+            engine: Engine::default(),
         }
     }
 }
 
-pub struct Terminal {
+struct AlacTerminal {
     term: Arc<FairMutex<Term<Proxy>>>,
     pid: u32,
     notifier: Notifier,
@@ -946,7 +956,47 @@ pub struct Terminal {
     scratch: Snapshot,
     search: Option<Search>,
     /// The text of the selection as the user made it; see `prune_selection`.
-    selected: Mutex<Option<String>>,
+    selected: Mutex<Held>,
+}
+
+/// What the user selected, and since when the screen has shown something
+/// else under it. A program redraws in pieces: between two reads the lines
+/// under a selection are erased and not yet rewritten, and judging the
+/// selection then would drop it for nothing (Claude Code redraws its whole
+/// frame on every spinner tick, so no selection in it ever lived). The text
+/// has to stay different for [`GRACE`] before the selection goes; a scroll
+/// region stretching it, or new output under it, differs on every read and
+/// is still dropped, just a few frames later.
+#[derive(Default)]
+struct Held {
+    text: Option<String>,
+    differs_since: Option<Instant>,
+}
+
+/// How long the text under a selection may differ before it is dropped:
+/// longer than a frame's redraw arrives in, shorter than a hand can notice.
+const GRACE: Duration = Duration::from_millis(120);
+
+impl Held {
+    fn hold(&mut self, text: Option<String>) {
+        self.text = text;
+        self.differs_since = None;
+    }
+
+    /// Whether the selection, now reading `current`, should be dropped.
+    fn gone(&mut self, current: Option<&str>, now: Instant) -> bool {
+        if current == self.text.as_deref() {
+            self.differs_since = None;
+            return false;
+        }
+        match self.differs_since {
+            None => {
+                self.differs_since = Some(now);
+                false
+            }
+            Some(since) => now.duration_since(since) >= GRACE,
+        }
+    }
 }
 
 /// The block a cell's prompt belongs to: its hyperlink, when the scanner
@@ -1061,12 +1111,8 @@ fn cursor_config(shape: CursorShape, blinking: bool) -> Config {
 }
 
 /// Whether the live selection no longer covers the text that was selected.
-fn selection_changed(term: &Term<Proxy>, held: Option<&str>) -> bool {
-    term.selection_to_string().as_deref() != held
-}
-
-impl Terminal {
-    pub fn spawn(spawn: Spawn, columns: u16, rows: u16) -> anyhow::Result<Terminal> {
+impl AlacTerminal {
+    fn spawn(spawn: Spawn, columns: u16, rows: u16) -> anyhow::Result<AlacTerminal> {
         let columns = columns.max(2);
         let rows = rows.max(2);
         let size = Size {
@@ -1113,14 +1159,17 @@ impl Terminal {
         // Installed before the loop starts, so the very first query the shell
         // sends already has somewhere to send its answer.
         if let Ok(mut w) = shared.writer.lock() {
-            *w = Some(event_loop.channel());
+            let sender = event_loop.channel();
+            *w = Some(Box::new(move |bytes| {
+                let _ = sender.send(Msg::Input(Cow::Owned(bytes)));
+            }));
         }
         // The join handle is dropped deliberately: the loop shuts itself down on
         // `Msg::Shutdown` or when the child exits, and keeping the handle would
         // only tempt someone into blocking the UI thread on it.
         let _ = event_loop.spawn();
 
-        Ok(Terminal {
+        Ok(AlacTerminal {
             term,
             pid,
             notifier,
@@ -1128,45 +1177,48 @@ impl Terminal {
             size,
             scratch: Snapshot::default(),
             search: None,
-            selected: Mutex::new(None),
+            selected: Mutex::new(Held::default()),
         })
     }
 
+
+    /// Remember what the user selected, so [`Terminal::prune_selection`] can
+    /// tell when the program has changed it.
+    fn hold_selection(&self, term: &Term<Proxy>) {
+        if let Ok(mut held) = self.selected.lock() {
+            held.hold(term.selection_to_string());
+        }
+    }
+}
+
+impl Backend for AlacTerminal {
+    fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
+    fn columns(&self) -> usize {
+        self.size.columns
+    }
+
+    fn rows(&self) -> usize {
+        self.size.screen_lines
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+
     /// The cursor a program gets until it asks for another with DECSCUSR,
     /// and goes back to when it resets (`ESC [ 0 SP q`).
-    pub fn set_cursor_default(&self, shape: CursorShape, blinking: bool) {
+    fn set_cursor_default(&self, shape: CursorShape, blinking: bool) {
         self.term.lock().set_options(cursor_config(shape, blinking));
         self.shared.dirty.store(true, Ordering::Release);
     }
 
-    /// True when content has changed since the last snapshot. One atomic load —
-    /// cheap enough to call every frame.
-    pub fn is_dirty(&self) -> bool {
-        self.shared.dirty.load(Ordering::Acquire)
-    }
-
-    pub fn has_exited(&self) -> bool {
-        self.shared.exited.load(Ordering::Acquire)
-    }
-
-    pub fn drain_events(&self) -> Vec<TermEvent> {
-        self.shared
-            .events
-            .lock()
-            .map(|mut q| std::mem::take(&mut *q))
-            .unwrap_or_default()
-    }
-
-    pub fn columns(&self) -> usize {
-        self.size.columns
-    }
-
-    pub fn rows(&self) -> usize {
-        self.size.screen_lines
-    }
 
     /// Send bytes to the shell, exactly as a keystroke would.
-    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+    fn write(&self, bytes: Cow<'static, [u8]>) {
         use alacritty_terminal::event::Notify;
         self.notifier.notify(bytes);
         // Typing jumps back to the prompt, which is what every terminal does.
@@ -1176,47 +1228,27 @@ impl Terminal {
         self.shared.dirty.store(true, Ordering::Release);
     }
 
+
     /// Positive scrolls towards history, negative towards the live tail.
-    pub fn scroll(&self, lines: i32) {
+    fn scroll(&self, lines: i32) {
         self.term
             .lock()
             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
         self.shared.dirty.store(true, Ordering::Release);
     }
 
-    pub fn scroll_to_bottom(&self) {
+
+    fn scroll_to_bottom(&self) {
         self.term
             .lock()
             .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         self.shared.dirty.store(true, Ordering::Release);
     }
 
-    /// The process the PTY started (on macOS, `login`, whose child is the shell).
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// What deck knows about block `n`.
-    pub fn block(&self, n: u64) -> Option<Block> {
-        self.shared.blocks.lock().ok()?.get(&n).cloned()
-    }
-
-    /// The newest block, the one the prompt at the bottom belongs to.
-    pub fn last_block(&self) -> Option<(u64, Block)> {
-        let blocks = self.shared.blocks.lock().ok()?;
-        blocks.last_key_value().map(|(n, b)| (*n, b.clone()))
-    }
-
-    /// The newest block that ran a command: the one running now, or the
-    /// last one to finish.
-    pub fn last_command(&self) -> Option<Block> {
-        let blocks = self.shared.blocks.lock().ok()?;
-        blocks.values().rev().find(|b| b.command.is_some()).cloned()
-    }
 
     /// The last `lines` lines of scrollback and screen, as text, without
     /// the blank rows under the prompt.
-    pub fn tail_text(&self, lines: usize) -> String {
+    fn tail_text(&self, lines: usize) -> String {
         let term = self.term.lock();
         let top = term.topmost_line();
         let mut bottom = term.bottommost_line();
@@ -1231,27 +1263,10 @@ impl Terminal {
             .join("\n")
     }
 
-    /// The command lines run at this shell, newest first.
-    pub fn commands(&self) -> Vec<String> {
-        let Ok(blocks) = self.shared.blocks.lock() else {
-            return Vec::new();
-        };
-        blocks.values().rev().filter_map(|b| b.command.clone()).collect()
-    }
-
-    /// Whether the shell marks its prompts (deck's integration is loaded).
-    pub fn has_blocks(&self) -> bool {
-        self.shared.blocks.lock().is_ok_and(|b| !b.is_empty())
-    }
-
-    /// The shell's folder, as it last said (OSC 7).
-    pub fn shell_cwd(&self) -> Option<String> {
-        self.shared.cwd.lock().ok()?.clone()
-    }
 
     /// Scroll so the previous (`up`) or next prompt is at the top. Past
     /// the last one, back to the live tail. Whether anything moved.
-    pub fn jump_block(&mut self, up: bool) -> bool {
+    fn jump_block(&mut self, up: bool) -> bool {
         use alacritty_terminal::grid::Scroll;
         let mut term = self.term.lock();
         let marks = prompt_lines(&term);
@@ -1276,12 +1291,13 @@ impl Terminal {
         true
     }
 
+
     /// The scrollback and screen above the cursor's line, as text with its
     /// colours (SGR), at most `max_lines` of it, to show again under a new
     /// shell after a relaunch. Palette colours stay palette colours, so a
     /// theme change still applies; soft-wrapped lines stay joined, so they
     /// reflow at a new width. `None` while a full-screen program runs.
-    pub fn history_ansi(&self, max_lines: usize) -> Option<String> {
+    fn history_ansi(&self, max_lines: usize) -> Option<String> {
         let term = self.term.lock();
         if term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
             return None;
@@ -1343,19 +1359,21 @@ impl Terminal {
         Some(out)
     }
 
+
     /// The OSC 8 link a program put on viewport cell `(row, col)`. Deck's
     /// own prompt marks are links too, and are not one.
-    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+    fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
         let term = self.term.lock();
         let link = term.grid()[viewport_point(&term, row, col)].hyperlink()?;
         let uri = link.uri();
         (!uri.starts_with(tap::BLOCK_LINK)).then(|| uri.to_string())
     }
 
+
     /// The line through viewport cell `(row, col)` with its soft wraps
     /// joined, one char per column (`'\0'` for a wide char's spacer), and
     /// that cell's index in it: a URL too long for one row is still one URL.
-    pub fn wrapped_line_at(&self, row: usize, col: usize) -> (String, usize) {
+    fn wrapped_line_at(&self, row: usize, col: usize) -> (String, usize) {
         // A minified file is one line; a link is never this long.
         const MAX_ROWS: i32 = 32;
         let term = self.term.lock();
@@ -1380,8 +1398,9 @@ impl Terminal {
         (text, ix)
     }
 
+
     /// Scroll so block `n`'s prompt is at the top.
-    pub fn scroll_to_block(&mut self, n: u64) -> bool {
+    fn scroll_to_block(&mut self, n: u64) -> bool {
         use alacritty_terminal::grid::Scroll;
         let mut term = self.term.lock();
         let Some(&(line, _)) = prompt_lines(&term).iter().find(|(_, m)| *m == n) else {
@@ -1395,10 +1414,11 @@ impl Terminal {
         true
     }
 
+
     /// Block `n`'s output, as text: the lines between its command line and
     /// the next prompt, without the blank ones at the end. `None` once it
     /// has left the scrollback.
-    pub fn block_output(&self, n: u64) -> Option<String> {
+    fn block_output(&self, n: u64) -> Option<String> {
         let term = self.term.lock();
         let marks = prompt_lines(&term);
         let at = marks.iter().position(|(_, m)| *m == n)?;
@@ -1419,24 +1439,10 @@ impl Terminal {
         Some(text.trim_end().to_string())
     }
 
-    /// A stream that yields whenever the screen changed or an event arrived.
-    /// Call [`Terminal::take_wake`] on each one to re-arm it.
-    pub fn wakeups(&self) -> futures::channel::mpsc::UnboundedReceiver<()> {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        if let Ok(mut w) = self.shared.wake.lock() {
-            *w = Some(tx);
-        }
-        self.shared.wake_pending.store(false, Ordering::Release);
-        rx
-    }
-
-    pub fn take_wake(&self) {
-        self.shared.wake_pending.store(false, Ordering::Release);
-    }
 
     /// Start a selection at a viewport cell. `right` is which half of the cell
     /// was hit, so dragging back over the start cell deselects it.
-    pub fn select_start(&self, row: usize, col: usize, right: bool, mode: SelectMode) {
+    fn select_start(&self, row: usize, col: usize, right: bool, mode: SelectMode) {
         use alacritty_terminal::selection::{Selection, SelectionType};
         let mut term = self.term.lock();
         let point = viewport_point(&term, row, col);
@@ -1450,7 +1456,8 @@ impl Terminal {
         self.shared.dirty.store(true, Ordering::Release);
     }
 
-    pub fn select_to(&self, row: usize, col: usize, right: bool) {
+
+    fn select_to(&self, row: usize, col: usize, right: bool) {
         let mut term = self.term.lock();
         let point = viewport_point(&term, row, col);
         if let Some(sel) = term.selection.as_mut() {
@@ -1460,31 +1467,26 @@ impl Terminal {
         self.shared.dirty.store(true, Ordering::Release);
     }
 
+
     /// Scrollback and screen, down to the last line with anything on it.
-    pub fn select_all(&self) {
+    fn select_all(&self) {
         let mut term = self.term.lock();
         select_everything(&mut term);
         self.hold_selection(&term);
         self.shared.dirty.store(true, Ordering::Release);
     }
 
-    pub fn select_clear(&self) {
+
+    fn select_clear(&self) {
         let mut term = self.term.lock();
         if let Ok(mut held) = self.selected.lock() {
-            *held = None;
+            held.hold(None);
         }
         if term.selection.take().is_some() {
             self.shared.dirty.store(true, Ordering::Release);
         }
     }
 
-    /// Remember what the user selected, so [`Terminal::prune_selection`] can
-    /// tell when the program has changed it.
-    fn hold_selection(&self, term: &Term<Proxy>) {
-        if let Ok(mut held) = self.selected.lock() {
-            *held = term.selection_to_string();
-        }
-    }
 
     /// Drop the selection once the program's output has changed what it
     /// covers. Call after output arrives; returns whether it was dropped.
@@ -1495,8 +1497,9 @@ impl Terminal {
     /// stretches the selection further with every step, until the whole
     /// screen is highlighted. Checking the text is still what was selected
     /// catches that and any overwrite, while a selection that simply scrolls
-    /// with its text survives, as in iTerm.
-    pub fn prune_selection(&self) -> bool {
+    /// with its text survives, as in iTerm. The text has to differ for a
+    /// moment first (see [`Held`]): a redraw caught half way is not a change.
+    fn prune_selection(&self) -> bool {
         let mut term = self.term.lock();
         if term.selection.is_none() {
             return false;
@@ -1504,40 +1507,45 @@ impl Terminal {
         let Ok(mut held) = self.selected.lock() else {
             return false;
         };
-        if !selection_changed(&term, held.as_deref()) {
+        let current = term.selection_to_string();
+        if !held.gone(current.as_deref(), Instant::now()) {
             return false;
         }
         term.selection = None;
-        *held = None;
+        held.hold(None);
         self.shared.dirty.store(true, Ordering::Release);
         true
     }
 
-    pub fn selection_text(&self) -> Option<String> {
+
+    fn selection_text(&self) -> Option<String> {
         self.term
             .lock()
             .selection_to_string()
             .filter(|s| !s.is_empty())
     }
 
+
     /// DECCKM: the program (vim, less, fzf) wants `ESC O A` for arrows rather
     /// than `ESC [ A`. Sending the wrong form makes arrows type letters.
-    pub fn app_cursor(&self) -> bool {
+    fn app_cursor(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
     }
 
+
     /// The program asked for pastes to be fenced, so pasted text containing a
     /// newline is not executed line by line.
-    pub fn bracketed_paste(&self) -> bool {
+    fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+
     /// Drop all scrollback, as ⌘K does in Terminal.app and iTerm (and as
     /// `ESC [ 3 J` does): the visible screen stays, history and any selection
     /// inside it go, and the view returns to the live tail.
-    pub fn clear_scrollback(&self) {
+    fn clear_scrollback(&self) {
         use alacritty_terminal::vte::ansi::{ClearMode, Handler};
         let mut term = self.term.lock();
         term.clear_screen(ClearMode::Saved);
@@ -1546,11 +1554,12 @@ impl Terminal {
         self.shared.mark_dirty();
     }
 
+
     /// Search scrollback for `query` as typed, scrolling to the match. Typing
     /// refines in place: the search starts where the focused match starts,
     /// else at the bottom, newest first. An empty query ends the search.
     /// Returns whether anything matched.
-    pub fn search(&mut self, query: &str) -> bool {
+    fn search(&mut self, query: &str) -> bool {
         let mut term = self.term.lock();
         let from = self.search.take().and_then(|mut s| {
             s.rebase(&term);
@@ -1569,8 +1578,9 @@ impl Terminal {
         found
     }
 
+
     /// The next match up (towards older output) or down, wrapping.
-    pub fn search_step(&mut self, up: bool) -> bool {
+    fn search_step(&mut self, up: bool) -> bool {
         let Some(search) = self.search.as_mut() else {
             return false;
         };
@@ -1579,55 +1589,22 @@ impl Terminal {
         found
     }
 
-    pub fn search_clear(&mut self) {
+
+    fn search_clear(&mut self) {
         if self.search.take().is_some() {
             self.shared.dirty.store(true, Ordering::Release);
         }
     }
 
-    pub fn mouse_modes(&self) -> MouseModes {
+
+    fn mouse_modes(&self) -> MouseModes {
         modes_of(*self.term.lock().mode())
     }
 
-    /// Bytes to send for a click, drag or move at a viewport cell, or `None`
-    /// when the program did not ask for this kind of event (the caller then
-    /// handles it itself, e.g. as a selection).
-    ///
-    /// `Motion` with a button is a drag (needs 1002 or 1003); without one it is
-    /// plain movement (needs 1003). Press and release need any reporting mode.
-    pub fn mouse_report(
-        &self,
-        button: Option<MouseButton>,
-        action: MouseAction,
-        row: usize,
-        col: usize,
-        mods: Mods,
-    ) -> Option<Vec<u8>> {
-        report_bytes(self.mouse_modes(), button, action, row, col, mods)
-    }
-
-    /// What the wheel should send. `lines > 0` scrolls up, toward history.
-    ///
-    /// A program that reports the mouse gets wheel buttons (64 up, 65 down);
-    /// one in the alternate screen with alternate scroll gets arrow keys,
-    /// honouring application cursor mode. `None` means nobody asked: scroll our
-    /// own scrollback. Repeats are capped at ten per event.
-    pub fn scroll_report(&self, lines: i32, row: usize, col: usize, mods: Mods) -> Option<Vec<u8>> {
-        use alacritty_terminal::term::TermMode;
-        let mode = *self.term.lock().mode();
-        scroll_bytes(
-            modes_of(mode),
-            mode.contains(TermMode::APP_CURSOR),
-            lines,
-            row,
-            col,
-            mods,
-        )
-    }
 
     /// Resize the grid. A no-op when the dimensions are unchanged, because this
     /// is driven from layout and layout runs constantly.
-    pub fn resize(&mut self, columns: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool {
+    fn resize(&mut self, columns: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool {
         let columns = columns.max(2) as usize;
         let rows = rows.max(2) as usize;
         if columns == self.size.columns && rows == self.size.screen_lines {
@@ -1652,12 +1629,13 @@ impl Terminal {
         true
     }
 
+
     /// Build a frame, coalescing runs of identically styled cells.
     ///
     /// Returns `false` when nothing has changed and `force` is not set, which is
     /// the case on the overwhelming majority of frames. Read the result with
     /// [`Terminal::last`].
-    pub fn snapshot(&mut self, palette: &Palette, force: bool) -> bool {
+    fn snapshot(&mut self, palette: &Palette, force: bool) -> bool {
         if let Ok(mut p) = self.shared.palette.lock() {
             *p = Some(*palette);
         }
@@ -1833,19 +1811,397 @@ impl Terminal {
         true
     }
 
+
     /// The most recent frame, without rebuilding.
-    pub fn last(&self) -> &Snapshot {
+    fn last(&self) -> &Snapshot {
         &self.scratch
     }
 
-    pub fn shutdown(&self) {
+
+    fn shutdown(&self) {
         let _ = self.notifier.0.send(Msg::Shutdown);
     }
 }
 
-impl Drop for Terminal {
+impl Drop for AlacTerminal {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Engines
+// ---------------------------------------------------------------------------
+
+/// Which emulator runs a terminal: the escape-sequence parser, the grid, the
+/// scrollback and the modes. The renderer, deck's shell marks (`tap.rs`) and
+/// everything in [`Shared`] are the same for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// `alacritty_terminal`, the emulator factored out of Alacritty.
+    #[default]
+    Alacritty,
+    /// `libghostty-vt`, the emulator factored out of Ghostty. Only in builds
+    /// with the `ghostty` feature; see [`Engine::available`].
+    Ghostty,
+}
+
+impl Engine {
+    /// The settings value: `"alacritty"` or `"ghostty"`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Engine::Alacritty => "alacritty",
+            Engine::Ghostty => "ghostty",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Engine {
+        match id {
+            "ghostty" => Engine::Ghostty,
+            _ => Engine::Alacritty,
+        }
+    }
+
+    /// Whether this build has the engine.
+    pub fn available(self) -> bool {
+        match self {
+            Engine::Alacritty => true,
+            Engine::Ghostty => cfg!(feature = "ghostty"),
+        }
+    }
+}
+
+/// What an engine provides: everything that reads or changes the grid.
+/// The rest of [`Terminal`] works from [`Shared`], which both fill the same
+/// way.
+trait Backend: Send {
+    fn shared(&self) -> &Arc<Shared>;
+    fn columns(&self) -> usize;
+    fn rows(&self) -> usize;
+    fn pid(&self) -> u32;
+    fn set_cursor_default(&self, shape: CursorShape, blinking: bool);
+    fn write(&self, bytes: Cow<'static, [u8]>);
+    fn scroll(&self, lines: i32);
+    fn scroll_to_bottom(&self);
+    fn tail_text(&self, lines: usize) -> String;
+    fn jump_block(&mut self, up: bool) -> bool;
+    fn history_ansi(&self, max_lines: usize) -> Option<String>;
+    fn hyperlink_at(&self, row: usize, col: usize) -> Option<String>;
+    fn wrapped_line_at(&self, row: usize, col: usize) -> (String, usize);
+    fn scroll_to_block(&mut self, n: u64) -> bool;
+    fn block_output(&self, n: u64) -> Option<String>;
+    fn select_start(&self, row: usize, col: usize, right: bool, mode: SelectMode);
+    fn select_to(&self, row: usize, col: usize, right: bool);
+    fn select_all(&self);
+    fn select_clear(&self);
+    fn prune_selection(&self) -> bool;
+    fn selection_text(&self) -> Option<String>;
+    fn app_cursor(&self) -> bool;
+    fn bracketed_paste(&self) -> bool;
+    fn clear_scrollback(&self);
+    fn search(&mut self, query: &str) -> bool;
+    fn search_step(&mut self, up: bool) -> bool;
+    fn search_clear(&mut self);
+    fn mouse_modes(&self) -> MouseModes;
+    fn resize(&mut self, columns: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool;
+    fn snapshot(&mut self, palette: &Palette, force: bool) -> bool;
+    fn last(&self) -> &Snapshot;
+    fn shutdown(&self);
+}
+
+/// A shell in a PTY, run by one of the [`Engine`]s.
+pub struct Terminal {
+    backend: Box<dyn Backend>,
+    engine: Engine,
+}
+
+impl Terminal {
+    /// Start `spawn` on its engine. One not in this build falls back to
+    /// Alacritty rather than failing: the pane still opens.
+    pub fn spawn(spawn: Spawn, columns: u16, rows: u16) -> anyhow::Result<Terminal> {
+        #[cfg(feature = "ghostty")]
+        if spawn.engine == Engine::Ghostty {
+            return Ok(Terminal {
+                backend: Box::new(ghostty::GhosttyTerminal::spawn(spawn, columns, rows)?),
+                engine: Engine::Ghostty,
+            });
+        }
+        Ok(Terminal {
+            backend: Box::new(AlacTerminal::spawn(spawn, columns, rows)?),
+            engine: Engine::Alacritty,
+        })
+    }
+
+    /// The engine this terminal runs on.
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// The cursor a program gets until it asks for another with DECSCUSR,
+    /// and goes back to when it resets (`ESC [ 0 SP q`).
+    pub fn set_cursor_default(&self, shape: CursorShape, blinking: bool) {
+        self.backend.set_cursor_default(shape, blinking)
+    }
+
+    /// True when content has changed since the last snapshot. One atomic load —
+    /// cheap enough to call every frame.
+    pub fn is_dirty(&self) -> bool {
+        self.backend.shared().dirty.load(Ordering::Acquire)
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.backend.shared().exited.load(Ordering::Acquire)
+    }
+
+    pub fn drain_events(&self) -> Vec<TermEvent> {
+        self.backend
+            .shared()
+            .events
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+
+    pub fn columns(&self) -> usize {
+        self.backend.columns()
+    }
+
+    pub fn rows(&self) -> usize {
+        self.backend.rows()
+    }
+
+    /// Send bytes to the shell, exactly as a keystroke would.
+    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        self.backend.write(bytes.into())
+    }
+
+    /// Positive scrolls towards history, negative towards the live tail.
+    pub fn scroll(&self, lines: i32) {
+        self.backend.scroll(lines)
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        self.backend.scroll_to_bottom()
+    }
+
+    /// The process the PTY started (on macOS, `login`, whose child is the shell).
+    pub fn pid(&self) -> u32 {
+        self.backend.pid()
+    }
+
+    /// What deck knows about block `n`.
+    pub fn block(&self, n: u64) -> Option<Block> {
+        self.backend.shared().blocks.lock().ok()?.get(&n).cloned()
+    }
+
+    /// The newest block, the one the prompt at the bottom belongs to.
+    pub fn last_block(&self) -> Option<(u64, Block)> {
+        let blocks = self.backend.shared().blocks.lock().ok()?;
+        blocks.last_key_value().map(|(n, b)| (*n, b.clone()))
+    }
+
+    /// The newest block that ran a command: the one running now, or the
+    /// last one to finish.
+    pub fn last_command(&self) -> Option<Block> {
+        let blocks = self.backend.shared().blocks.lock().ok()?;
+        blocks.values().rev().find(|b| b.command.is_some()).cloned()
+    }
+
+    /// The last `lines` lines of scrollback and screen, as text, without
+    /// the blank rows under the prompt.
+    pub fn tail_text(&self, lines: usize) -> String {
+        self.backend.tail_text(lines)
+    }
+
+    /// The command lines run at this shell, newest first.
+    pub fn commands(&self) -> Vec<String> {
+        let Ok(blocks) = self.backend.shared().blocks.lock() else {
+            return Vec::new();
+        };
+        blocks.values().rev().filter_map(|b| b.command.clone()).collect()
+    }
+
+    /// Whether the shell marks its prompts (deck's integration is loaded).
+    pub fn has_blocks(&self) -> bool {
+        self.backend.shared().blocks.lock().is_ok_and(|b| !b.is_empty())
+    }
+
+    /// The shell's folder, as it last said (OSC 7).
+    pub fn shell_cwd(&self) -> Option<String> {
+        self.backend.shared().cwd.lock().ok()?.clone()
+    }
+
+    /// Scroll so the previous (`up`) or next prompt is at the top. Past
+    /// the last one, back to the live tail. Whether anything moved.
+    pub fn jump_block(&mut self, up: bool) -> bool {
+        self.backend.jump_block(up)
+    }
+
+    /// The scrollback and screen above the cursor's line, as text with its
+    /// colours (SGR), at most `max_lines` of it, to show again under a new
+    /// shell after a relaunch. `None` while a full-screen program runs.
+    pub fn history_ansi(&self, max_lines: usize) -> Option<String> {
+        self.backend.history_ansi(max_lines)
+    }
+
+    /// The OSC 8 link a program put on viewport cell `(row, col)`. Deck's
+    /// own prompt marks are links too, and are not one.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+        self.backend.hyperlink_at(row, col)
+    }
+
+    /// The line through viewport cell `(row, col)` with its soft wraps
+    /// joined, one char per column (`'\0'` for a wide char's spacer), and
+    /// that cell's index in it: a URL too long for one row is still one URL.
+    pub fn wrapped_line_at(&self, row: usize, col: usize) -> (String, usize) {
+        self.backend.wrapped_line_at(row, col)
+    }
+
+    /// Scroll so block `n`'s prompt is at the top.
+    pub fn scroll_to_block(&mut self, n: u64) -> bool {
+        self.backend.scroll_to_block(n)
+    }
+
+    /// Block `n`'s output, as text: the lines between its command line and
+    /// the next prompt, without the blank ones at the end. `None` once it
+    /// has left the scrollback.
+    pub fn block_output(&self, n: u64) -> Option<String> {
+        self.backend.block_output(n)
+    }
+
+    /// A stream that yields whenever the screen changed or an event arrived.
+    /// Call [`Terminal::take_wake`] on each one to re-arm it.
+    pub fn wakeups(&self) -> futures::channel::mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let shared = self.backend.shared();
+        if let Ok(mut w) = shared.wake.lock() {
+            *w = Some(tx);
+        }
+        shared.wake_pending.store(false, Ordering::Release);
+        rx
+    }
+
+    pub fn take_wake(&self) {
+        self.backend.shared().wake_pending.store(false, Ordering::Release);
+    }
+
+    /// Start a selection at a viewport cell. `right` is which half of the cell
+    /// was hit, so dragging back over the start cell deselects it.
+    pub fn select_start(&self, row: usize, col: usize, right: bool, mode: SelectMode) {
+        self.backend.select_start(row, col, right, mode)
+    }
+
+    pub fn select_to(&self, row: usize, col: usize, right: bool) {
+        self.backend.select_to(row, col, right)
+    }
+
+    /// Scrollback and screen, down to the last line with anything on it.
+    pub fn select_all(&self) {
+        self.backend.select_all()
+    }
+
+    pub fn select_clear(&self) {
+        self.backend.select_clear()
+    }
+
+    /// Drop the selection once the program's output has changed what it
+    /// covers. Call after output arrives; returns whether it was dropped.
+    pub fn prune_selection(&self) -> bool {
+        self.backend.prune_selection()
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.backend.selection_text()
+    }
+
+    /// DECCKM: the program (vim, less, fzf) wants `ESC O A` for arrows rather
+    /// than `ESC [ A`. Sending the wrong form makes arrows type letters.
+    pub fn app_cursor(&self) -> bool {
+        self.backend.app_cursor()
+    }
+
+    /// The program asked for pastes to be fenced, so pasted text containing a
+    /// newline is not executed line by line.
+    pub fn bracketed_paste(&self) -> bool {
+        self.backend.bracketed_paste()
+    }
+
+    /// Drop all scrollback, as ⌘K does in Terminal.app and iTerm (and as
+    /// `ESC [ 3 J` does): the visible screen stays, history and any selection
+    /// inside it go, and the view returns to the live tail.
+    pub fn clear_scrollback(&self) {
+        self.backend.clear_scrollback()
+    }
+
+    /// Search scrollback for `query` as typed, scrolling to the match. An
+    /// empty query ends the search. Returns whether anything matched.
+    pub fn search(&mut self, query: &str) -> bool {
+        self.backend.search(query)
+    }
+
+    /// The next match up (towards older output) or down, wrapping.
+    pub fn search_step(&mut self, up: bool) -> bool {
+        self.backend.search_step(up)
+    }
+
+    pub fn search_clear(&mut self) {
+        self.backend.search_clear()
+    }
+
+    pub fn mouse_modes(&self) -> MouseModes {
+        self.backend.mouse_modes()
+    }
+
+    /// Bytes to send for a click, drag or move at a viewport cell, or `None`
+    /// when the program did not ask for this kind of event (the caller then
+    /// handles it itself, e.g. as a selection).
+    ///
+    /// `Motion` with a button is a drag (needs 1002 or 1003); without one it is
+    /// plain movement (needs 1003). Press and release need any reporting mode.
+    pub fn mouse_report(
+        &self,
+        button: Option<MouseButton>,
+        action: MouseAction,
+        row: usize,
+        col: usize,
+        mods: Mods,
+    ) -> Option<Vec<u8>> {
+        report_bytes(self.mouse_modes(), button, action, row, col, mods)
+    }
+
+    /// What the wheel should send. `lines > 0` scrolls up, toward history.
+    ///
+    /// A program that reports the mouse gets wheel buttons (64 up, 65 down);
+    /// one in the alternate screen with alternate scroll gets arrow keys,
+    /// honouring application cursor mode. `None` means nobody asked: scroll our
+    /// own scrollback. Repeats are capped at ten per event.
+    pub fn scroll_report(&self, lines: i32, row: usize, col: usize, mods: Mods) -> Option<Vec<u8>> {
+        scroll_bytes(self.mouse_modes(), self.app_cursor(), lines, row, col, mods)
+    }
+
+    /// Resize the grid. A no-op when the dimensions are unchanged, because this
+    /// is driven from layout and layout runs constantly.
+    pub fn resize(&mut self, columns: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool {
+        self.backend.resize(columns, rows, cell_width, cell_height)
+    }
+
+    /// Build a frame, coalescing runs of identically styled cells.
+    ///
+    /// Returns `false` when nothing has changed and `force` is not set, which is
+    /// the case on the overwhelming majority of frames. Read the result with
+    /// [`Terminal::last`].
+    pub fn snapshot(&mut self, palette: &Palette, force: bool) -> bool {
+        self.backend.snapshot(palette, force)
+    }
+
+    /// The most recent frame, without rebuilding.
+    pub fn last(&self) -> &Snapshot {
+        self.backend.last()
+    }
+
+    pub fn shutdown(&self) {
+        self.backend.shutdown()
     }
 }
 
@@ -1900,6 +2256,22 @@ pub fn open_external(id: &str, cwd: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_selection_survives_a_redraw_caught_half_way_but_not_a_real_change() {
+        let t0 = Instant::now();
+        let mut held = Held::default();
+        held.hold(Some("fn main".into()));
+        // The frame's erase arrived; its rewrite is still in the pipe.
+        assert!(!held.gone(Some(""), t0));
+        // The rewrite landed: the same text, so nothing was lost.
+        assert!(!held.gone(Some("fn main"), t0 + Duration::from_millis(30)));
+        assert!(held.differs_since.is_none());
+        // The spinner under it keeps changing: gone, but only after the grace.
+        assert!(!held.gone(Some("✢ Thinking"), t0 + Duration::from_millis(100)));
+        assert!(!held.gone(Some("✳ Thinking"), t0 + Duration::from_millis(150)));
+        assert!(held.gone(Some("✶ Thinking"), t0 + Duration::from_millis(100) + GRACE));
+    }
 
     fn palette() -> Palette {
         Palette {
@@ -2013,6 +2385,7 @@ mod tests {
             args: vec!["-c".into(), "printf 'hello-from-pty'; sleep 1".into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         // No PTY available in some sandboxes; the pure tests still cover the
         // rest of the crate.
@@ -2054,6 +2427,7 @@ mod tests {
             ],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 20, 8) else {
             return;
@@ -2092,6 +2466,7 @@ mod tests {
             args: vec!["-c".into(), script],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 80, 8) else {
             return;
@@ -2137,6 +2512,7 @@ mod tests {
             args: vec!["-c".into(), script.into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 40, 10) else {
             return;
@@ -2171,6 +2547,7 @@ mod tests {
             args: vec!["-c".into(), r"printf 'plain\r\n\033[1;31mred\033[0m and \033[38;2;1;2;3mrgb\033[0m\r\n'; sleep 2".into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 30, 6) else {
             return;
@@ -2196,6 +2573,7 @@ mod tests {
             args: vec!["-c".into(), "printf 'aaaaaaaaaa'; sleep 1".into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 40, 8) else {
             return;
@@ -2236,6 +2614,7 @@ mod tests {
             args: vec!["-c".into(), "printf 'AAA\\nBBB\\nCCC\\n'; sleep 1".into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 40, 8) else {
             return;
@@ -2279,6 +2658,7 @@ mod tests {
             args: vec!["-c".into(), "printf 'a\u{4e2d}b\u{1f600}c'; sleep 1".into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 40, 8) else {
             return;
@@ -2473,6 +2853,7 @@ mod tests {
             args: vec!["-c".into(), "seq 1 200; printf done; sleep 2".into()],
             cwd: Some(PathBuf::from("/tmp")),
             env: HashMap::new(),
+            engine: Engine::default(),
         };
         let Ok(mut term) = Terminal::spawn(spawn, 40, 8) else {
             return;
@@ -2493,8 +2874,6 @@ mod tests {
             }
         }
         assert!(visible(&term).contains("done"), "output never arrived");
-        assert!(term.term.lock().grid().history_size() > 100);
-
         term.scroll(10);
         term.snapshot(&p, true);
         assert_eq!(term.last().scrolled_back, 10);
@@ -2502,7 +2881,10 @@ mod tests {
         term.clear_scrollback();
         assert!(term.is_dirty());
         term.snapshot(&p, true);
-        assert_eq!(term.term.lock().grid().history_size(), 0);
+        assert_eq!(term.last().scrolled_back, 0);
+        // Nothing left to scroll back into.
+        term.scroll(10);
+        term.snapshot(&p, true);
         assert_eq!(term.last().scrolled_back, 0);
         assert!(
             visible(&term).contains("done"),
@@ -2801,11 +3183,15 @@ mod tests {
         let mut parser: alacritty_terminal::vte::ansi::Processor =
             alacritty_terminal::vte::ansi::Processor::new();
         parser.advance(&mut term, screen);
-        let held = select(&mut term, (3, 0), (4, 8));
-        assert!(!selection_changed(&term, held.as_deref()));
+        let mut held = Held::default();
+        held.hold(select(&mut term, (3, 0), (4, 8)));
+        let t0 = Instant::now();
+        assert!(!held.gone(term.selection_to_string().as_deref(), t0));
         parser.advance(&mut term, scroll);
+        // Noticed at once, dropped once it has stayed wrong past the grace.
+        assert!(!held.gone(term.selection_to_string().as_deref(), t0));
         assert!(
-            selection_changed(&term, held.as_deref()),
+            held.gone(term.selection_to_string().as_deref(), t0 + GRACE),
             "stretched selection went unnoticed: {:?}",
             term.selection_to_string()
         );
@@ -2820,11 +3206,12 @@ mod tests {
         let mut parser: alacritty_terminal::vte::ansi::Processor =
             alacritty_terminal::vte::ansi::Processor::new();
         parser.advance(&mut term, screen);
-        let held = select(&mut term, (3, 0), (3, 8));
-        assert_eq!(held.as_deref(), Some("msg three"));
+        let mut held = Held::default();
+        held.hold(select(&mut term, (3, 0), (3, 8)));
+        assert_eq!(held.text.as_deref(), Some("msg three"));
         parser.advance(&mut term, b"\x1b[2;4r\x1b[4;1H\n");
         assert!(
-            !selection_changed(&term, held.as_deref()),
+            !held.gone(term.selection_to_string().as_deref(), Instant::now() + GRACE),
             "{:?}",
             term.selection_to_string()
         );
