@@ -993,6 +993,10 @@ pub struct Workspace {
     bar_chats_open: bool,
     bar_chats_over_item: bool,
     bar_chats_over_list: bool,
+    /// The same for the status bar's "+N" list of background jobs and pages.
+    bar_more_open: bool,
+    bar_more_over_item: bool,
+    bar_more_over_list: bool,
     /// Dev servers under our terminals, for the status bar: (port, process).
     bar_ports: Vec<(u16, String)>,
     /// Whether each listening (port, process) answers HTTP: only web
@@ -1153,6 +1157,9 @@ impl Workspace {
             bar_chats_open: false,
             bar_chats_over_item: false,
             bar_chats_over_list: false,
+            bar_more_open: false,
+            bar_more_over_item: false,
+            bar_more_over_list: false,
             bar_ports: Vec::new(),
             port_web: HashMap::new(),
             bar_git: None,
@@ -10040,51 +10047,43 @@ impl Workspace {
         // they spent. Hovering opens the list, busiest first, a click from
         // each.
         let chats: Option<AnyElement> = self.render_bar_chats(cx);
-        // Background jobs: a tab each, opening the drawer above the bar.
-        let bg: Vec<AnyElement> = self
-            .jobs
+        // Background jobs and pages: a tab each, opening the drawer above the
+        // bar. A few show inline, in their order (the open one always among
+        // them); the rest fold into "+N", whose list holds every one.
+        let rows: Vec<BgRow> = self.jobs.iter().filter_map(|&id| self.bg_row(id, &names, cx)).collect();
+        let shown: Vec<usize> = if rows.len() <= BG_INLINE + 1 {
+            (0..rows.len()).collect()
+        } else {
+            let mut v: Vec<usize> = (0..BG_INLINE).collect();
+            if let Some(i) = rows.iter().position(|r| r.open).filter(|&i| i >= BG_INLINE) {
+                v[BG_INLINE - 1] = i;
+            }
+            v
+        };
+        let hidden: Vec<usize> = (0..rows.len()).filter(|i| !shown.contains(i)).collect();
+        let mut bg: Vec<AnyElement> = shown
             .iter()
-            .filter_map(|&id| {
-                let label = names.get(&id).map_or_else(|| format!("job {id}"), |n| n.to_string());
-                let open = self.job_open == Some(id);
-                let (mark, state) = match &self.panes.get(&id)?.kind {
-                    PaneKind::Terminal(_) => {
-                        let j = self.daemon_job(id);
-                        let running = j.is_some_and(|j| j.running);
-                        let failed = j.is_some_and(|j| !j.running && j.exit.is_some_and(|c| c != 0));
-                        let mark = match j.and_then(|j| j.agent.as_deref()) {
-                            Some(a) => icon(Icon::agent(a), 12., theme::text_2()),
-                            None => icon(Icon::Terminal, 12., theme::dim()),
-                        };
-                        (mark, if running { green } else if failed { red } else { theme::dim() })
-                    }
-                    PaneKind::Browser(b) => {
-                        let b = b.read(cx);
-                        let mark = match b.favicon() {
-                            Some(img) => crate::browser::site_image(img, 12.),
-                            None => icon(Icon::Globe, 12., theme::dim()),
-                        };
-                        (mark, if b.loading { theme::accent() } else { theme::dim() })
-                    }
-                    _ => return None,
-                };
-                Some(
-                    item(ElementId::NamedInteger("bar-job".into(), id), open)
-                        .child(mark)
-                        .child(div().max_w(u(140.)).one_line().child(label))
-                        .child(dot(state))
-                        .on_click(cx.listener(move |ws, _, w, cx| {
-                            if ws.job_open == Some(id) {
-                                ws.job_open = None;
-                                cx.notify();
-                            } else {
-                                ws.show_job(id, w, cx);
-                            }
-                        }))
-                        .into_any_element(),
-                )
+            .map(|&i| {
+                let r = &rows[i];
+                let id = r.id;
+                item(ElementId::NamedInteger("bar-job".into(), id), r.open)
+                    .child(self.bg_mark(id, 12., cx))
+                    .child(div().max_w(u(120.)).one_line().child(r.label.clone()))
+                    .child(dot(r.state))
+                    .on_click(cx.listener(move |ws, _, w, cx| {
+                        if ws.job_open == Some(id) {
+                            ws.job_open = None;
+                            cx.notify();
+                        } else {
+                            ws.show_job(id, w, cx);
+                        }
+                    }))
+                    .into_any_element()
             })
             .collect();
+        if !hidden.is_empty() {
+            bg.push(self.render_bar_more(&rows, &hidden, cx));
+        }
         let meter = self.render_usage_meter(cx);
         div()
             .flex()
@@ -10339,6 +10338,202 @@ impl Workspace {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// A background job or page as the status bar shows it.
+    fn bg_row(&self, id: PaneId, names: &HashMap<PaneId, &str>, cx: &App) -> Option<BgRow> {
+        let label = names.get(&id).map_or_else(|| format!("job {id}"), |n| n.to_string());
+        let open = self.job_open == Some(id);
+        let (detail, state, failed) = match &self.panes.get(&id)?.kind {
+            PaneKind::Terminal(_) => {
+                let j = self.daemon_job(id);
+                let running = j.is_some_and(|j| j.running);
+                let failed = j.is_some_and(|j| !j.running && j.exit.is_some_and(|c| c != 0));
+                let state = if running { theme::palette().ansi[2] } else if failed { theme::DANGER } else { theme::dim() };
+                (j.map(|j| j.cmd.lines().next().unwrap_or("").to_string()).unwrap_or_default(), state, failed)
+            }
+            PaneKind::Browser(b) => {
+                let b = b.read(cx);
+                let state = if b.loading { theme::accent() } else { theme::dim() };
+                (crate::history::host(&b.url).to_string(), state, false)
+            }
+            _ => return None,
+        };
+        Some(BgRow { id, label, detail, state, failed, open })
+    }
+
+    /// A background job's mark (its agent's, or a terminal) or a page's
+    /// favicon.
+    fn bg_mark(&self, id: PaneId, size: f32, cx: &App) -> AnyElement {
+        match self.panes.get(&id).map(|p| &p.kind) {
+            Some(PaneKind::Browser(b)) => match b.read(cx).favicon() {
+                Some(img) => crate::browser::site_image(img, size),
+                None => icon(Icon::Globe, size, theme::dim()),
+            },
+            _ => match self.daemon_job(id).and_then(|j| j.agent.as_deref()) {
+                Some(a) => icon(Icon::agent(a), size, theme::text_2()),
+                None => icon(Icon::Terminal, size, theme::dim()),
+            },
+        }
+    }
+
+    /// "+N": the background items past the inline ones, as stacked marks
+    /// and a count (red when one of them failed). Hovering opens the list
+    /// of every job and page, a click on a row opens it in the drawer.
+    fn render_bar_more(&self, rows: &[BgRow], hidden: &[usize], cx: &mut Context<Self>) -> AnyElement {
+        let open = self.bar_more_open;
+        let failed = hidden.iter().any(|&i| rows[i].failed);
+        let mut marks = div().flex().items_center();
+        for (n, &i) in hidden.iter().take(3).enumerate() {
+            marks = marks.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(u(16.))
+                    .when(n > 0, |d| d.ml(u(-5.)))
+                    .rounded_full()
+                    .bg(theme::ground())
+                    .child(self.bg_mark(rows[i].id, 11., cx)),
+            );
+        }
+        let mut list = div()
+            .id("bar-more-scroll")
+            .flex()
+            .flex_col()
+            .gap(u(1.))
+            .max_h(u(360.))
+            .overflow_y_scroll();
+        for r in rows {
+            let id = r.id;
+            list = list.child(
+                div()
+                    .id(ElementId::NamedInteger("bar-more-row".into(), id))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(u(10.))
+                    .h(u(34.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .text_size(u(12.5))
+                    .when(r.open, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(div().flex_none().flex().justify_center().w(u(14.)).child(self.bg_mark(id, 13., cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().w_full().one_line().line_height(u(15.)).text_color(rgb(theme::text())).child(r.label.clone()))
+                            .when(!r.detail.is_empty() && r.detail != r.label, |d| {
+                                d.child(
+                                    div()
+                                        .w_full()
+                                        .one_line()
+                                        .line_height(u(13.))
+                                        .text_size(u(11.))
+                                        .text_color(rgb(theme::dim()))
+                                        .child(r.detail.clone()),
+                                )
+                            }),
+                    )
+                    .child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(r.state)))
+                    .on_click(cx.listener(move |ws, _, w, cx| {
+                        ws.bar_more_open = false;
+                        ws.show_job(id, w, cx);
+                    })),
+            );
+        }
+        let panel = div()
+            .id("bar-more-list")
+            .absolute()
+            .bottom(u(32.))
+            .left_0()
+            .w(u(300.))
+            .p(u(4.))
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .occlude()
+            .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                ws.bar_more_over_list = *on;
+                ws.bar_more_close_soon(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(26.))
+                    .px(u(8.))
+                    .text_size(u(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child(div().flex_1().child("In the background"))
+                    .child(div().font_weight(FontWeight::NORMAL).child(rows.len().to_string())),
+            )
+            .child(list);
+        div()
+            .relative()
+            .flex()
+            .flex_none()
+            .child(
+                div()
+                    .id("bar-more")
+                    .flex()
+                    .items_center()
+                    .gap(u(5.))
+                    .h(u(20.))
+                    .px(u(6.))
+                    .rounded(u(5.))
+                    .cursor_pointer()
+                    .text_color(rgb(if open { theme::text() } else { theme::text_2() }))
+                    .when(open, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                    .child(marks)
+                    .child(format!("+{}", hidden.len()))
+                    .when(failed, |d| d.child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(theme::DANGER))))
+                    .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                        ws.bar_more_over_item = *on;
+                        if *on {
+                            ws.bar_more_open = true;
+                            cx.notify();
+                        } else {
+                            ws.bar_more_close_soon(cx);
+                        }
+                    }))
+                    .on_click(cx.listener(|ws, _, _, cx| {
+                        ws.bar_more_open = !ws.bar_more_open;
+                        cx.notify();
+                    })),
+            )
+            .when(open, |d| {
+                d.child(gpui::deferred(panel.with_animation(
+                    "bar-more-in",
+                    Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                    |d, t| d.opacity(t).bottom(u(28. + 4. * t)),
+                )))
+            })
+            .into_any_element()
+    }
+
+    fn bar_more_close_soon(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(220)).await;
+            let _ = this.update(cx, |ws, cx| {
+                if !ws.bar_more_over_item && !ws.bar_more_over_list && ws.bar_more_open {
+                    ws.bar_more_open = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The chats list shuts a moment after the pointer leaves both the
@@ -11763,6 +11958,21 @@ fn row_trailer(id: ElementId, state: RowState, when: String) -> AnyElement {
 }
 
 /// "Current", on the row you are in.
+/// Background jobs and pages shown inline in the status bar before the
+/// rest fold into "+N".
+const BG_INLINE: usize = 4;
+
+/// A background job or page, as the status bar shows it.
+struct BgRow {
+    id: PaneId,
+    label: String,
+    /// The command a job runs, or the page's host.
+    detail: String,
+    state: u32,
+    failed: bool,
+    open: bool,
+}
+
 fn current_tag() -> gpui::Div {
     div()
         .flex_none()
