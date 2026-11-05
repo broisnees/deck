@@ -1,7 +1,8 @@
 //! The macOS permissions an app cannot ask for in Info.plist: whether Deck
 //! has them, where macOS lets an app find out, and the System Settings pane
-//! for each. Programs in Deck's terminals and its agents run as Deck, so
-//! these decide what they can do.
+//! for each. Terminals and agents run under Deck's background service
+//! (`deckd`), which macOS treats as a program of its own: Full Disk Access
+//! matters for both.
 
 use std::path::PathBuf;
 
@@ -140,9 +141,32 @@ impl Permission {
     }
 }
 
+/// Whether the background service has Full Disk Access: it runs the
+/// terminals and agents that outlive Deck, and macOS counts it as a program
+/// of its own, so Deck having it is not enough. `Unknown` while it is not
+/// running (or is a build that cannot say).
+pub fn service_full_disk() -> State {
+    match crate::daemon::ask(&serde_json::json!({ "op": "privacy" })) {
+        Ok(v) => match v.get("full_disk").and_then(serde_json::Value::as_bool) {
+            Some(true) => State::On,
+            Some(false) => State::Off,
+            None => State::Unknown,
+        },
+        Err(_) => State::Unknown,
+    }
+}
+
+/// The Full Disk Access pane, and the service's program shown in Finder
+/// beside it, to drag into the list (or add with +).
+pub fn grant_service() {
+    Permission::FullDisk.open();
+    let exe = crate::control::socket_dir().join("bin").join("deckd");
+    let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(exe).spawn();
+}
+
 /// Only an app with Full Disk Access can open the system's own privacy
 /// database; trying is how to tell, and reads nothing.
-fn full_disk() -> State {
+pub fn full_disk() -> State {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return State::Unknown;
     };
