@@ -81,6 +81,8 @@ deck: drive the deck window you are running in.
       until the page shows TEXT (any case) or SEL (default 30 s); exit 1 on timeout
   deck browser console | network | errors | logs [--since SEQ] [--limit N] [--failed] [--filter TEXT] [--clear]
       what the page logged, threw and loaded, oldest first; pass last_seq back as --since
+  deck browser tabs                 every page open in this window: pane, URL, title
+  deck browser storage              the page's cookies (not HttpOnly), localStorage, sessionStorage
   deck browser shot [PATH]          a PNG of just the page
   deck browser dialog [accept|dismiss [TEXT]] [--user U --password P]
       the alert, confirm, prompt or login the page has up, or its answer
@@ -688,6 +690,8 @@ fn parse_browser(verb: &str, rest: &[String]) -> Result<(String, Value), String>
             }
             "browse.read".into()
         }
+        "tabs" => "browser.tabs".into(),
+        "storage" | "application" => "browser.storage".into(),
         "console" | "network" | "errors" | "logs" => {
             if !positional.is_empty() {
                 return Err(format!("browser {verb} takes no positional arguments"));

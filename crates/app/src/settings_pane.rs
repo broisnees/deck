@@ -2083,7 +2083,12 @@ impl SettingsPane {
                         crate::adblock::set_enabled(on);
                     }, cx),
                 )
-                .about("Third-party loads from the ad and tracking networks behind most of them are dropped, so pages are lighter and quieter. A site's own content and its sign-in are never touched. Applies to pages opened after the change.")],
+                .about("Third-party loads from the ad and tracking networks behind most of them are dropped, so pages are lighter and quieter. A site's own content and its sign-in are never touched. Applies to pages opened after the change."),
+                row(
+                    "Let agents read pages",
+                    self.toggle("agents-read-pages", self.settings.agents_read_pages, |s, on| s.agents_read_pages = on, cx),
+                )
+                .about("Agents can see a page's console, network requests, cookies and storage, and run scripts in it, to test and debug what they build. Off, they can still open pages for you to look at, but read nothing from them.")],
                 None,
             ),
             group(

@@ -7372,6 +7372,22 @@ impl Workspace {
                 let (root, diff) = self.turn_diff(id)?;
                 Ok(json!({ "pane": id, "root": root, "diff": diff }))
             }),
+            // What a page holds is the agent's to read only when Settings
+            // allows it.
+            "browser.eval" | "browser.logs" | "browser.storage" | "browse.read" | "browser.shot" | "browser.snapshot"
+                if !self.settings.agents_read_pages =>
+            {
+                Err("Deck's settings don't let agents read pages (Settings › Browser › Let agents read pages); ask me to turn it on".into())
+            }
+            "browser.tabs" => Ok(self.browser_tabs(cx)),
+            "browser.storage" => {
+                let mut q = p.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("js".into(), STORAGE_JS.into());
+                    o.insert("expr".into(), true.into());
+                }
+                return self.rpc_eval(&q, caller, reply, cx);
+            }
             "browser.open" => self.rpc_open(p, caller, window, cx),
             "browser.eval" => return self.rpc_eval(p, caller, reply, cx),
             "browser.logs" => self.rpc_logs(p, caller, cx),
@@ -8172,6 +8188,33 @@ impl Workspace {
     /// Content Security Policy forbids that gets it as an expression. A
     /// page that does not answer (a dialog is up, a script is spinning)
     /// fails the call after `timeout` seconds instead of holding it.
+    /// Every page open in this window: in a tab, a split or the status
+    /// bar's background pages.
+    fn browser_tabs(&self, cx: &App) -> Value {
+        let names: HashMap<PaneId, &str> = self.named.iter().map(|(n, id)| (*id, n.as_str())).collect();
+        let mut pages: Vec<Value> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pane)| match &pane.kind {
+                PaneKind::Browser(b) if !b.read(cx).is_editor() => {
+                    let b = b.read(cx);
+                    Some(json!({
+                        "pane": id,
+                        "name": names.get(id).copied(),
+                        "url": b.url.to_string(),
+                        "title": b.title.to_string(),
+                        "loading": b.loading,
+                        "background": self.jobs.contains(id),
+                        "focused": self.focused() == Some(*id),
+                    }))
+                }
+                _ => None,
+            })
+            .collect();
+        pages.sort_by_key(|v| v["pane"].as_u64());
+        json!({ "pages": pages })
+    }
+
     fn rpc_eval(&mut self, p: &Value, caller: PaneId, reply: Reply, cx: &mut Context<Self>) {
         let res = self.browser_target(p, caller, cx).and_then(|id| {
             let js = str_param(p, "js").ok_or("missing JS")?;
@@ -11053,6 +11096,14 @@ pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui
 /// The content area never gets narrower than this to make room for chrome:
 /// past it the inspector folds away (and comes back when there is room).
 const MIN_CONTENT_PX: f32 = 520.;
+/// A page's storage, as `deck browser storage` reports it: its origin,
+/// the cookies script can see (not HttpOnly ones), and local and session
+/// storage, long values clipped.
+const STORAGE_JS: &str = "(() => { const clip = v => (v || '').length > 2000 ? v.slice(0, 2000) + '…' : (v || ''); \
+const dump = s => { const o = {}; try { for (let i = 0; i < s.length; i++) { const k = s.key(i); o[k] = clip(s.getItem(k)); } } catch (e) { o.error = String(e); } return o; }; \
+const c = {}; document.cookie.split('; ').filter(Boolean).forEach(p => { const i = p.indexOf('='); c[i < 0 ? p : p.slice(0, i)] = i < 0 ? '' : clip(p.slice(i + 1)); }); \
+return { origin: location.origin, cookies: c, localStorage: dump(window.localStorage), sessionStorage: dump(window.sessionStorage) }; })()";
+
 /// The job drawer's height to start with, and how far it drags.
 const DRAWER_H: f32 = 300.;
 const DRAWER_MIN: f32 = 120.;

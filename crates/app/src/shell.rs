@@ -330,11 +330,16 @@ deck browser errors --name app               # uncaught errors, console.error, f
 deck browser console --name app --since 120  # console output after entry 120
 deck browser network --name app --failed     # requests that failed or got 4xx/5xx
 deck browser network --name app --filter /api/
+deck browser storage --name app              # cookies (not HttpOnly), localStorage, sessionStorage
+deck browser tabs                            # every page open in this window
 ```
 
 Network entries carry method, URL, status, timing and the first part of the
 request and response bodies for fetch and XHR. Every entry has a `seq`: pass
 the last one you saw as `--since` to get only what is new after you act.
+
+Reading a page needs Settings › Browser › Let agents read pages to be on (it
+is by default). When it is off these commands say so: ask me to turn it on.
 
 ## Seeing it
 

@@ -322,9 +322,20 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [~] Prompt rewrite knows the thread (a brief of every message and the start of each answer goes with it; the shell-command prompt says Linux and GNU off macOS): the rewriter gets a short overview of the conversation so far
 - [~] First answer faster (measured: Claude Code takes ~1.9s to first output here, then hooks and 7 MCP servers, two of which always fail to connect; Deck already starts the agent when you click into a chat): measure an agent chat's time to first token on Linux and cut what Deck adds before the agent starts
 - [~] Pages step aside for the address bar's suggestions on Linux (the code parks them; check on screen)
+- [x] Agents and pages: `deck browser tabs` and `deck browser storage` (cookies, localStorage, sessionStorage) beside console, network and errors; Settings › Browser › Let agents read pages switches all page reading off
+- [x] Job drawer under the panes only, resizable by its top edge, fold and maximize, Stop keeps the job, Run starts it again
+- [x] Browser toolbar as one floating capsule
 - [~] Sidebar redesign (rows: 4px apart, 32px tall, fill-only active row, no repeated labels, last command on idle shells; project headers show their git branch; footer icons have labels on hover; still to do: the bottom strip itself, one type scale with chat and pages)
 - [x] Windows: `cargo check` passes for the whole workspace (control socket over `uds_windows`, `os.rs` for permissions, exec and detach, `deckd`'s server Unix-only with Windows stand-ins)
 - [x] Done today: Ctrl+Shift shortcut scheme, Ctrl+Backspace by word, zoom keys, keyboard back from pages, rounded and inset pages, exit bar for finished jobs, sidebar selection (Ctrl-click, Ctrl+A), no repeated row labels, last command on idle shells, command suggestions with intent and typos, job viewers not kept as sessions, X11 window class, release build
+
+### Integrations (asked 2026-11-05)
+
+- [ ] Integrations page in Settings: switch each one on, sign in (OAuth or a token kept in the keychain / Secret Service), see what it can reach
+- [ ] GitHub: my repositories, pull requests (review state, checks, diff), issues and Actions runs in a Deck page; open a repo or PR in a terminal, worktree or chat; fetch and pull from there
+- [ ] Linear: my issues and cycles by team and status, an issue's detail and comments, change status or assignee; start a chat or worktree from an issue
+- [ ] Agents use them too: `deck github …` and `deck linear …` commands (and MCP tools) once an integration is on, the same way they use `deck browser`
+- [ ] One look for both: lists, detail panes and status chips that match the sidebar and chat
 
 ### Chat scrolling and experience
 - [~] Auto-follow: the thread follows new output while you are at the bottom; scrolling up pauses it; sending or jumping resumes it (built; the state machine is not unit-tested yet)
