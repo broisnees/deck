@@ -96,7 +96,7 @@ fn header(label: &'static str, count: Option<usize>) -> gpui::Div {
         .flex()
         .items_center()
         .gap(u(6.))
-        .pt(u(20.))
+        .pt(u(16.))
         .pb(u(6.))
         .text_size(u(11.))
         .font_weight(FontWeight::MEDIUM)
@@ -151,9 +151,7 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
         .h(u(28.))
         .p(u(2.))
         .rounded(u(8.))
-        .bg(rgb(theme::pane()))
-        .border_1()
-        .border_color(rgba(theme::hairline()));
+        .bg(rgba(theme::tint()));
     for (s, label, glyph) in [
         (Section::Info, "Info", Icon::Info),
         (Section::Files, "Files", Icon::Files),
@@ -171,7 +169,11 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
                 .rounded(u(6.))
                 .text_size(u(12.))
                 .when(on, |d| {
-                    d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                    d.bg(rgb(theme::row_active()))
+                        .border_1()
+                        .border_color(rgba(theme::hairline()))
+                        .text_color(rgb(theme::text()))
+                        .font_weight(FontWeight::MEDIUM)
                 })
                 .when(!on, |d| {
                     d.text_color(rgb(theme::text_2()))
@@ -416,7 +418,7 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let Some(root) = &d.root else {
         return empty("No project").pt(u(16.)).into_any_element();
     };
-    let mut col = div().flex().flex_col().pt(u(10.));
+    let mut col = div().flex().flex_col().pt(u(12.));
     let mut stack: Vec<(&Entry, usize)> = d
         .dirs
         .get(root)
@@ -437,9 +439,9 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 .flex()
                 .items_center()
                 .gap(u(6.))
-                .h(u(24.))
+                .h(u(28.))
                 .pl(u(6. + depth as f32 * 14.))
-                .rounded(u(5.))
+                .rounded(u(6.))
                 .text_size(u(13.))
                 .text_color(rgb(if is_dir {
                     theme::text()
@@ -522,45 +524,87 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         Some(up) => format!("Tracking {up}").into(),
         None => "Not published".into(),
     };
-    let (r1, r2) = (root.clone(), root.clone());
+    let (r1, r2, r3, r4) = (root.clone(), root.clone(), root.clone(), root.clone());
+    let published = g.upstream.is_some();
     col = col.child(
         div()
             .flex()
             .flex_col()
-            .gap(u(10.))
-            .p(u(12.))
+            .gap(u(8.))
+            .p(u(4.))
             .rounded(u(10.))
             .bg(rgb(theme::raised()))
             .border_1()
             .border_color(rgba(theme::hairline()))
+            // The branch is a control: a click opens the branch picker.
             .child(
                 div()
+                    .id("git-branch")
                     .flex()
                     .items_center()
                     .gap(u(8.))
+                    .h(u(36.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
                     .child(icon(Icon::Git, 14., theme::text_2()))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .one_line()
-                            .text_size(u(14.))
+                            .text_size(u(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(g.branch.clone()),
                     )
                     .when(g.ahead > 0, |d| d.child(count_pill(format!("↑{}", g.ahead))))
-                    .when(g.behind > 0, |d| d.child(count_pill(format!("↓{}", g.behind)))),
-            )
-            .child(
-                div()
-                    .text_size(u(11.5))
-                    .text_color(rgb(theme::dim()))
-                    .child(tracking),
+                    .when(g.behind > 0, |d| d.child(count_pill(format!("↓{}", g.behind))))
+                    .child(icon(Icon::ChevronDown, 11., theme::dim()))
+                    .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, window, cx| {
+                        let at = match ev {
+                            gpui::ClickEvent::Mouse(m) => m.down.position,
+                            _ => gpui::point(gpui::px(200.), gpui::px(120.)),
+                        };
+                        ws.open_branch_picker(r3.clone(), at, window, cx);
+                    })),
             )
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .gap(u(6.))
+                    .px(u(8.))
+                    .text_size(u(11.5))
+                    .text_color(rgb(theme::dim()))
+                    .child(div().flex_1().min_w_0().one_line().child(tracking))
+                    .when(!published, |d| {
+                        d.child(
+                            div()
+                                .id("git-publish")
+                                .flex()
+                                .items_center()
+                                .gap(u(4.))
+                                .h(u(22.))
+                                .px(u(8.))
+                                .rounded(u(6.))
+                                .cursor_pointer()
+                                .text_color(rgb(theme::text()))
+                                .hover(|s| s.bg(rgb(theme::row_hover())))
+                                .child(icon(Icon::ArrowUp, 11., theme::text_2()))
+                                .child("Publish")
+                                .on_click(cx.listener(move |ws, _, window, cx| {
+                                    let _ = ws.open_editor("changes", Some(r4.clone()), None, window, cx);
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(u(4.))
+                    .p(u(4.))
+                    .pt(u(0.))
                     .child(card_button("git-changes", Icon::Pencil, "Changes").on_click(cx.listener(
                         move |ws, _, window, cx| {
                             let _ = ws.open_editor("changes", Some(r1.clone()), None, window, cx);
@@ -832,12 +876,13 @@ fn card_button(id: &'static str, glyph: Icon, label: &'static str) -> gpui::Stat
         .gap(u(6.))
         .h(u(28.))
         .rounded(u(6.))
-        .bg(rgb(theme::surface()))
+        .border_1()
+        .border_color(rgba(theme::hairline()))
         .text_size(u(12.))
-        .text_color(rgb(theme::text()))
+        .text_color(rgb(theme::text_2()))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme::surface_hover())))
-        .child(icon(glyph, 12., theme::text_2()))
+        .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+        .child(icon(glyph, 12., theme::dim()))
         .child(label)
 }
 
