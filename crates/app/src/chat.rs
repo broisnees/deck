@@ -4333,10 +4333,12 @@ impl ChatPane {
                     None if self.models().is_empty() => self.agent_name().into(),
                     None => format!("{} · Default", self.agent_name()).into(),
                 };
+                // Its own width, up to a cap: it used to collapse to "OpenC…"
+                // while the spacer beside it kept the room.
                 div()
                     .relative()
-                    .flex_shrink()
-                    .min_w_0()
+                    .flex_none()
+                    .max_w(u(240.))
                     .on_mouse_down_out(cx.listener(|c, _, _, cx| {
                         if c.model_menu.take().is_some() {
                             cx.notify();
@@ -4351,7 +4353,7 @@ impl ChatPane {
                             })
                             .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
                             .child(icon(Icon::agent(self.agent.as_str()), 13., theme::text_2()))
-                            .child(div().min_w_0().one_line().child(label))
+                            .child(div().min_w_0().max_w(u(190.)).one_line().child(label))
                             .child(icon(Icon::ChevronDown, 11., theme::dim()))
                             .on_click(cx.listener(|c, _, _, cx| {
                                 c.model_menu = match c.model_menu {
