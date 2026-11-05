@@ -297,6 +297,21 @@ In rough order of value.
 - [~] `deck do ACTION` / `deck do --list`: every ⌘K action from the CLI, behind Settings › Agents › Command line
 - [~] Remote hosts over SSH: hosts from the user's SSH config (aliases, Include, details; never written) plus `deck remote add`. ⇧⌘H / ⌘K "Connect to Host…": a folder on the host, then per host Terminal or an agent: a click opens a Deck chat whose agent process runs on the host (`ssh -T host 'cd DIR && exec agent …'` in its login shell, Deck's socket and token left out, Claude's local MCP config skipped), ⌥-click the agent's own interface in a terminal there. Terminals go through the background service like any tab. `deck remote list|add|remove|open HOST [--dir] [--agent] [--chat]`. Command building and config parsing unit-tested; not yet tried against a live host. Not yet: `deck` commands from inside a remote session (needs the socket forwarded and a Linux build), Tailscale discovery
 
+### Linux and Windows
+
+Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2, WebKit, Carbon, Keychain, LaunchAgent) and one place has a `cfg(target_os)` fallback. gpui has Linux and Windows backends and `alacritty_terminal` runs on both, so the core ports; the macOS-only parts go behind a platform layer. Every step below ends in a build that runs.
+
+- [ ] Platform layer: a `platform` module in `crates/app` with one interface per macOS service (web view, notifications, menu bar icon, global shortcuts, background service, keychain, pasteboard, screenshots, window blur, `deck://` handler). macOS keeps today's code; other targets start as stubs that say "not on this platform"
+- [ ] macOS-only dependencies (objc2*, block2, objc2-user-notifications) under `[target.'cfg(target_os = "macos")'.dependencies]`; `cargo check` for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` passes
+- [ ] Linux, first runnable build: window, sidebar, terminals (Alacritty engine), chats and agents, settings. Pages, notifications and the background service stubbed; Ghostty engine only when Zig is installed
+- [ ] Linux, full: pages through WebKitGTK, notifications through D-Bus with Approve / Deny / Reply actions, tray through StatusNotifierItem, `deckd` as a systemd user unit in place of the LaunchAgent, secrets through the Secret Service, global shortcuts through X11 grabs or the GlobalShortcuts portal on Wayland, cookie import from Chromium's Linux store
+- [ ] Linux packaging: AppImage and .deb, `deck` CLI on PATH, desktop file and `deck://` handler, `scripts/install.sh` for Linux
+- [ ] Windows, first runnable build: terminals over ConPTY (PowerShell, cmd, WSL), the control socket as a named pipe in place of the Unix socket, Windows paths, the `deck` CLI. Pages and the background service stubbed
+- [ ] Windows, full: pages through WebView2, toast notifications with buttons, tray icon, `deckd` as a per-user background task, Credential Manager for secrets, RegisterHotKey for global shortcuts, DPAPI for Chromium cookie import
+- [ ] Windows packaging: an installer (MSIX or similar), code signing, `deck://` registration
+- [ ] Agents off macOS: each adapter's config and transcript paths (`%APPDATA%`, XDG dirs) for usage; the OpenCode lifeline and `kill_tree` are `sh` and process groups, so Windows needs job objects
+- [ ] CI on ubuntu-latest and windows-latest: build, tests, and a smoke test that opens a window, starts a shell and runs a command
+
 ### Chat scrolling and experience
 - [~] Auto-follow: the thread follows new output while you are at the bottom; scrolling up pauses it; sending or jumping resumes it (built; the state machine is not unit-tested yet)
 - [~] "Jump to latest": while paused, a pill over the composer with how many new messages arrived; a click goes to the end and follows again
