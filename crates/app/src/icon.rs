@@ -75,6 +75,15 @@ icons! {
     Lock => "lock.svg",
     Theme => "theme.svg",
     Gauge => "gauge.svg",
+    Home => "home.svg",
+    Cursor => "agent-cursor.svg",
+    Amp => "agent-amp.svg",
+    Aider => "agent-aider.svg",
+    Stop => "stop.svg",
+    Maximize => "maximize.svg",
+    Package => "package.svg",
+    Chart => "chart.svg",
+    Import => "import.svg",
     Claude => "agent-claude.svg",
     Codex => "agent-codex.svg",
     Gemini => "agent-gemini.svg",
@@ -92,6 +101,9 @@ impl Icon {
             "gemini" => Icon::Gemini,
             "grok" => Icon::Grok,
             "opencode" => Icon::OpenCode,
+            "cursor-agent" | "cursor" => Icon::Cursor,
+            "amp" => Icon::Amp,
+            "aider" => Icon::Aider,
             _ => Icon::GenericAgent,
         }
     }
@@ -105,6 +117,9 @@ impl Icon {
             Icon::Gemini => 0x4f8ff7,
             Icon::Grok => 0x9b8cf7,
             Icon::OpenCode => 0xf0a030,
+            Icon::Cursor => 0x8a8f98,
+            Icon::Amp => 0xf35b5b,
+            Icon::Aider => 0x4fb3a5,
             _ => return None,
         })
     }
@@ -204,7 +219,7 @@ pub fn shimmer(_id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElemen
         .collect();
     gpui::div()
         .flex_none()
-        .child(StyledText::new(text.clone()).with_highlights(lights))
+        .child(StyledText::new(text.clone()).with_highlights(crate::theme::safe_highlights(&text, lights)))
         .into_any_element()
 }
 
