@@ -289,6 +289,9 @@ mod tests {
             permission_mode: agent_core::PermissionMode::Ask,
             env: Vec::new(),
             allowed_tools: Vec::new(),
+            remote: None,
+            disallowed_tools: Vec::new(),
+            host_only: false,
         }
     }
 

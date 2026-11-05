@@ -78,6 +78,10 @@ pub fn socket_dir() -> PathBuf {
         .join("Library/Application Support/deck")
 }
 
+pub fn stable_socket() -> PathBuf {
+    socket_dir().join("deck.sock")
+}
+
 pub fn listen() -> std::io::Result<(Server, mpsc::UnboundedReceiver<Incoming>)> {
     let dir = socket_dir();
     std::fs::create_dir_all(&dir)?;
@@ -98,6 +102,11 @@ pub fn listen() -> std::io::Result<(Server, mpsc::UnboundedReceiver<Incoming>)> 
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // A name that outlives this process: shells kept by the background
+    // service across relaunches find the Deck of the moment through it.
+    let stable = stable_socket();
+    let _ = std::fs::remove_file(&stable);
+    let _ = std::os::unix::fs::symlink(&path, &stable);
 
     let (tx, rx) = mpsc::unbounded();
     std::thread::Builder::new()

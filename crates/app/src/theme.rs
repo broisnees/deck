@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Theme {
-    /// T3 Code's dark: a #000 sidebar, near-black panes.
+    /// Black: a #000 sidebar, near-black panes.
     #[default]
     Black,
     /// macOS's own dark greys.
@@ -32,11 +32,16 @@ pub enum Theme {
     Carbon,
     /// A deep blue-black with one cyan accent.
     Abyss,
+    /// Dark and translucent: the desktop shows, blurred, through the
+    /// sidebar and the window's edges; panes stay solid enough to read.
+    Glass,
+    /// Glass, light.
+    Frost,
 }
 
 impl Theme {
     /// In the order Settings shows them: System, then dark to light.
-    pub const ALL: [Theme; 8] = [
+    pub const ALL: [Theme; 10] = [
         Theme::System,
         Theme::Obsidian,
         Theme::Black,
@@ -44,6 +49,8 @@ impl Theme {
         Theme::Graphite,
         Theme::Abyss,
         Theme::Midnight,
+        Theme::Glass,
+        Theme::Frost,
         Theme::Light,
     ];
 
@@ -57,6 +64,8 @@ impl Theme {
             Theme::Obsidian => "Obsidian",
             Theme::Carbon => "Carbon",
             Theme::Abyss => "Abyss",
+            Theme::Glass => "Glass",
+            Theme::Frost => "Frost",
         }
     }
 
@@ -76,6 +85,8 @@ impl Theme {
             Theme::Obsidian => 4,
             Theme::Carbon => 5,
             Theme::Abyss => 6,
+            Theme::Glass => 7,
+            Theme::Frost => 8,
         }
     }
 }
@@ -83,6 +94,8 @@ impl Theme {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Colors {
     pub dark: bool,
+    /// Translucent: the window is blurred and the chrome lets it through.
+    pub glass: bool,
     pub sidebar: u32,
     pub pane: u32,
     /// Cards and the composer: a step up from the pane.
@@ -153,10 +166,11 @@ const ABYSS_ANSI: [u32; 16] = [
     0xfc9aa1, 0x98edc3, 0xfedf9e, 0x9bbffe, 0xd6b8fb, 0xa7eafe, 0xf0f4f9,
 ];
 
-static ALL: [Colors; 7] = [
+static ALL: [Colors; 9] = [
     // Black
     Colors {
         dark: true,
+        glass: false,
         sidebar: 0x000000,
         pane: 0x0a0a0a,
         raised: 0x111111,
@@ -183,6 +197,7 @@ static ALL: [Colors; 7] = [
     // Graphite
     Colors {
         dark: true,
+        glass: false,
         sidebar: 0x1c1c1e,
         pane: 0x232325,
         raised: 0x2a2a2c,
@@ -209,6 +224,7 @@ static ALL: [Colors; 7] = [
     // Midnight
     Colors {
         dark: true,
+        glass: false,
         sidebar: 0x0b0e14,
         pane: 0x10141c,
         raised: 0x161b25,
@@ -235,6 +251,7 @@ static ALL: [Colors; 7] = [
     // Light
     Colors {
         dark: false,
+        glass: false,
         sidebar: 0xf0f0f0,
         pane: 0xffffff,
         raised: 0xf7f7f7,
@@ -261,6 +278,7 @@ static ALL: [Colors; 7] = [
     // Obsidian
     Colors {
         dark: true,
+        glass: false,
         sidebar: 0x000000,
         pane: 0x000000,
         raised: 0x0a0a0a,
@@ -287,6 +305,7 @@ static ALL: [Colors; 7] = [
     // Carbon
     Colors {
         dark: true,
+        glass: false,
         sidebar: 0x0f0e0c,
         pane: 0x161513,
         raised: 0x1c1b18,
@@ -313,6 +332,7 @@ static ALL: [Colors; 7] = [
     // Abyss
     Colors {
         dark: true,
+        glass: false,
         sidebar: 0x04060b,
         pane: 0x080e16,
         raised: 0x0d141e,
@@ -336,7 +356,85 @@ static ALL: [Colors; 7] = [
         tint: 0xe7ecf10f,
         ansi: ABYSS_ANSI,
     },
+    // Glass
+    Colors {
+        dark: true,
+        glass: true,
+        sidebar: 0x0b0c10,
+        pane: 0x101116,
+        raised: 0x17181e,
+        surface: 0x23242b,
+        surface_hover: 0x2c2d35,
+        row_hover: 0x1a1b21,
+        row_active: 0x23242b,
+        border: 0x1f2027,
+        text: 0xf3f4f7,
+        text_2: 0xb0b2bb,
+        dim: 0x82848f,
+        accent: 0xa5b4fc,
+        selection: 0x34365a,
+        search: 0x4b4d5a,
+        hairline: 0xffffff17,
+        input_edge: 0xffffff24,
+        focus_edge: 0xffffff38,
+        strong_edge: 0xffffff3d,
+        veil: 0x0000003d,
+        menu: 0x17181f,
+        tint: 0xffffff10,
+        ansi: DARK_ANSI,
+    },
+    // Frost
+    Colors {
+        dark: false,
+        glass: true,
+        sidebar: 0xf3f4f7,
+        pane: 0xffffff,
+        raised: 0xf8f9fb,
+        surface: 0xe6e8ee,
+        surface_hover: 0xdcdfe6,
+        row_hover: 0xe9ebf0,
+        row_active: 0xffffff,
+        border: 0xe1e3ea,
+        text: 0x1b1c20,
+        text_2: 0x52545c,
+        dim: 0x73757d,
+        accent: 0x4f46e5,
+        selection: 0xcdd0e6,
+        search: 0xc8cad4,
+        hairline: 0x0000001a,
+        input_edge: 0x00000026,
+        focus_edge: 0x00000040,
+        strong_edge: 0x00000033,
+        veil: 0xffffff59,
+        menu: 0xfbfbfd,
+        tint: 0x0000000a,
+        ansi: LIGHT_ANSI,
+    },
 ];
+
+/// The theme lets the blurred desktop through.
+pub fn glass() -> bool {
+    current().glass
+}
+
+/// The window's own ground (behind the sidebar and the status bar):
+/// see-through on a glass theme, solid otherwise.
+pub fn ground() -> gpui::Rgba {
+    if glass() {
+        gpui::rgba((sidebar() << 8) | 0x8c)
+    } else {
+        gpui::rgb(sidebar())
+    }
+}
+
+/// A pane's card: on glass, a little of the blur shows through.
+pub fn card() -> gpui::Rgba {
+    if glass() {
+        gpui::rgba((pane() << 8) | 0xec)
+    } else {
+        gpui::rgb(pane())
+    }
+}
 
 /// Index into `ALL` of the theme the window wears now.
 static CURRENT: AtomicU8 = AtomicU8::new(0);
@@ -504,13 +602,25 @@ impl<T: gpui::Styled> OneLine for T {}
 /// The rem size at 100% zoom.
 pub const REM_PX: f32 = 16.;
 
+/// `a` moved toward `b` by `t` (0-1), channel by channel.
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| {
+        let (x, y) = ((a >> s & 0xff) as f32, (b >> s & 0xff) as f32);
+        ((x + (y - x) * t).round() as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
 /// The terminal palette that matches the theme: its text on its pane.
 pub fn palette() -> term::Palette {
     let c = current();
     term::Palette {
         fg: c.text,
         bg: c.pane,
-        selection: c.selection,
+        // A soft blue, as macOS marks selected text: it reads as a
+        // selection at a glance (a grey read as a stain, or as the pane
+        // itself going grey over a whole screen), and text stays legible.
+        selection: if c.dark { mix(c.pane, 0x3d74d6, 0.36) } else { mix(c.pane, 0x9cc2ff, 0.62) },
         search: c.search,
         search_focus: c.accent,
         ansi: c.ansi,
@@ -619,5 +729,95 @@ mod tests {
         assert!(Theme::System.colors(true).dark);
         assert!(!Theme::System.colors(false).dark);
         assert_eq!(alpha(0xffffff, 0x30), 0xffffff30);
+    }
+}
+
+/// Highlights gpui can lay out: inside `text`, on character boundaries,
+/// in order and not overlapping (gpui assumes all of that, and a range
+/// past the end or inside a character aborts the app while drawing).
+pub fn safe_highlights(
+    text: &str,
+    mut hl: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
+) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
+    let snap = |mut i: usize| {
+        i = i.min(text.len());
+        while i > 0 && !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    for (r, _) in hl.iter_mut() {
+        *r = snap(r.start)..snap(r.end);
+    }
+    hl.sort_by_key(|(r, _)| r.start);
+    let mut out: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = Vec::with_capacity(hl.len());
+    let mut at = 0;
+    for (r, style) in hl {
+        let start = r.start.max(at);
+        if start < r.end {
+            at = r.end;
+            out.push((start..r.end, style));
+        }
+    }
+    out
+}
+
+/// Runs gpui can lay out: lengths that end on character boundaries and
+/// add up to exactly `text`'s length (too long or too short aborts).
+pub fn safe_runs(text: &str, runs: Vec<gpui::TextRun>) -> Vec<gpui::TextRun> {
+    let mut out: Vec<gpui::TextRun> = Vec::with_capacity(runs.len());
+    let mut at = 0;
+    for mut run in runs {
+        if at >= text.len() {
+            break;
+        }
+        let mut end = (at + run.len).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end > at {
+            run.len = end - at;
+            at = end;
+            out.push(run);
+        }
+    }
+    if at < text.len() {
+        match out.last_mut() {
+            Some(last) => last.len += text.len() - at,
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod safe_text_tests {
+    use super::*;
+
+    #[test]
+    fn highlights_and_runs_fit_the_text() {
+        let text = "a—b😀c";
+        let hl = vec![
+            (0..9, gpui::HighlightStyle::default()),
+            (2..3, gpui::HighlightStyle::default()),
+            (5..50, gpui::HighlightStyle::default()),
+        ];
+        let got = safe_highlights(text, hl);
+        for (r, _) in &got {
+            assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end) && r.end <= text.len());
+        }
+        assert!(got.windows(2).all(|w| w[0].0.end <= w[1].0.start));
+        let run = |len| gpui::TextRun {
+            len,
+            font: gpui::font("Menlo"),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = safe_runs(text, vec![run(2), run(100)]);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        let runs = safe_runs(text, vec![run(1)]);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
     }
 }

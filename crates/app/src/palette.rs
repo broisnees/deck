@@ -93,8 +93,18 @@ pub enum PaletteEvent {
 /// Rows shown at most; past this a sharper query is quicker than scrolling.
 const MAX_ROWS: usize = 60;
 
+/// What a palette offers: everything (⌘K), only actions (⌃K), or only
+/// the open tabs to switch to (⌘P / ⌃P).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    All,
+    Actions,
+    Tabs,
+}
+
 pub struct Palette {
     pub field: Entity<Field>,
+    scope: Scope,
     items: Vec<Item>,
     /// Pages matched by history for the current text, kept apart from the
     /// items given at open.
@@ -135,6 +145,18 @@ impl Palette {
             "Search tabs, actions, snippets, files and pages…"
         };
         Self::build(items, tasks, false, hint, cx)
+    }
+
+    /// Only actions, or only tabs: the same palette, narrowed.
+    pub fn scoped(items: Vec<Item>, scope: Scope, cx: &mut Context<Self>) -> Self {
+        let hint = match scope {
+            Scope::Actions => "Run an action…",
+            Scope::Tabs => "Switch to a chat, terminal or page…",
+            Scope::All => "Search tabs, actions, snippets, files and pages…",
+        };
+        let mut p = Self::build(items, false, false, hint, cx);
+        p.scope = scope;
+        p
     }
 
     /// Commands to run again (⌃R in a terminal), newest first.
@@ -183,6 +205,7 @@ impl Palette {
         });
         let mut p = Self {
             field,
+            scope: Scope::All,
             items,
             pages: Vec::new(),
             tasks,
@@ -354,6 +377,7 @@ fn lit(text: &SharedString, at: &[usize]) -> StyledText {
             ))
         })
         .collect::<Vec<_>>();
+    let lights = theme::safe_highlights(&text, lights);
     StyledText::new(text.clone()).with_highlights(lights)
 }
 
@@ -365,10 +389,10 @@ impl Render for Palette {
             .flex()
             .flex_col()
             .gap(u(2.))
-            .max_h(u(460.))
+            .max_h(u(400.))
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .p(u(8.));
+            .p(u(6.));
         let mut last_kind: Option<Kind> = None;
         for (row, (r, at)) in self.shown.iter().enumerate() {
             let selected = row == self.selected;
@@ -404,12 +428,13 @@ impl Render for Palette {
                     )
                 }
             };
-            // A quiet label where the kind changes, when nothing is typed.
-            if q.is_empty() && kind != last_kind {
+            // A quiet label where the kind changes, when nothing is typed
+            // (a narrowed palette is one kind already).
+            if q.is_empty() && kind != last_kind && self.scope == Scope::All {
                 if let Some(k) = kind {
                     list = list.child(
                         div()
-                            .px(u(12.))
+                            .px(u(10.))
                             .pt(u(if row == 0 { 6. } else { 14. }))
                             .pb(u(6.))
                             .text_size(u(11.))
@@ -426,9 +451,9 @@ impl Render for Palette {
                     .flex()
                     .items_center()
                     .gap(u(10.))
-                    .h(u(34.))
+                    .h(u(32.))
                     .px(u(10.))
-                    // Concentric with the palette: its 14 less the list's 8.
+                    // Concentric with the palette: its 12 less the list's 6.
                     .rounded(u(6.))
                     .text_size(u(13.))
                     .cursor_pointer()
@@ -470,7 +495,7 @@ impl Render for Palette {
                             ),
                     )
                     .when(
-                        !q.is_empty() && kind.is_some() && !self.snippets_only,
+                        !q.is_empty() && kind.is_some() && !self.snippets_only && self.scope == Scope::All,
                         |d| {
                             d.child(
                                 div()
@@ -510,30 +535,51 @@ impl Render for Palette {
 
         div()
             .id("palette")
-            .w(u(620.))
+            .w(u(560.))
             .max_w(relative(0.9))
             .flex()
             .flex_col()
-            .rounded(u(14.))
+            .rounded(u(12.))
             // The panes' own colour with a firmer edge, not a menu grey.
             .bg(rgb(theme::pane()))
             .border_1()
             .border_color(rgba(theme::strong_edge()))
-            .shadow_lg()
             .overflow_hidden()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(u(10.))
-                    .h(u(50.))
-                    .pl(u(18.))
-                    .pr(u(14.))
+                    .h(u(46.))
+                    .pl(u(16.))
+                    .pr(u(12.))
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
-                    .text_size(u(14.5))
-                    .child(icon(Icon::Search, 16., theme::dim()))
-                    .child(self.field.clone())
+                    .text_size(u(14.))
+                    .child(icon(
+                        match self.scope {
+                            Scope::Tabs => Icon::Sidebar,
+                            _ => Icon::Search,
+                        },
+                        15.,
+                        theme::dim(),
+                    ))
+                    // A narrowed palette says what it holds.
+                    .children((self.scope != Scope::All).then(|| {
+                        div()
+                            .flex_none()
+                            .px(u(7.))
+                            .h(u(20.))
+                            .flex()
+                            .items_center()
+                            .rounded(u(5.))
+                            .bg(rgba(theme::tint()))
+                            .text_size(u(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::text_2()))
+                            .child(if self.scope == Scope::Tabs { "Tabs" } else { "Actions" })
+                    }))
+                    .child(div().flex_1().min_w_0().child(self.field.clone()))
                     .child(
                         div()
                             .flex_none()
@@ -554,13 +600,20 @@ impl Render for Palette {
                     .flex()
                     .items_center()
                     .gap(u(16.))
-                    .h(u(34.))
-                    .px(u(18.))
+                    .h(u(32.))
+                    .px(u(16.))
                     .border_t_1()
                     .border_color(rgba(theme::hairline()))
                     .text_size(u(11.))
                     .text_color(rgb(theme::dim()))
-                    .child(crate::kbd::hints("↑↓ choose · ⏎ open · esc close").gap_x(u(18.))),
+                    .child(
+                        crate::kbd::hints(match self.scope {
+                            Scope::All => "↑↓ choose · ⏎ open · ⌃K actions · ⌘P tabs · esc close",
+                            Scope::Actions => "↑↓ choose · ⏎ run · ⌘K everything · esc close",
+                            Scope::Tabs => "↑↓ choose · ⏎ switch · ⌘K everything · esc close",
+                        })
+                        .gap_x(u(18.)),
+                    ),
             )
             .into_any_element()
     }

@@ -180,7 +180,9 @@ pub const OPENCODE: CliSpec = CliSpec {
     // the args for the one-shot `run` it falls back to.
     wire: Wire::OpenCodeJson,
     base_args: &["run", "--format", "json", "--thinking"],
-    cwd_flag: Some("--dir"),
+    // OpenCode 2 has no `--dir`; it works in the folder it starts in, which
+    // is the session's.
+    cwd_flag: None,
     model_flag: Some("--model"),
     resume: Resume::Flag("--session"),
     yolo_args: &["--auto"],
@@ -209,7 +211,7 @@ pub const OPENCODE: CliSpec = CliSpec {
     env: &[],
     setup: Some(agent_core::Setup {
         verb: "Install",
-        command: "npm install -g opencode-ai",
+        command: "npm install -g @opencode/cli",
         source: "opencode.ai",
     }),
 };
@@ -401,8 +403,6 @@ mod tests {
                 "--format",
                 "json",
                 "--thinking",
-                "--dir",
-                "/repo",
                 "--model",
                 "anthropic/x",
                 "--auto",

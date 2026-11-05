@@ -22,6 +22,8 @@ Each item says how it was verified.
 - [~] Titles from the shell; bell marks the tab
 - [~] Shell exit closes its pane
 
+- [~] Two terminal engines, picked in Settings › Terminal › Engine for new terminals: Alacritty (`alacritty_terminal`, the default) and Ghostty (`libghostty-vt` 1.4, built with Zig 0.17; cargo feature `ghostty`, on by default). Both read through deck's scanner, so prompts, blocks, the shell's folder, notifications and dark/light answers are the same. Ghostty runs on its own thread (its handles are `!Send`) and holds frames during synchronized output. Ghostty still lacks: selection and copy, find, ⌘-click links that wrap, prompt jumps and block output, history restored after a relaunch (PTY, colours, wide chars, scrollback, resize, exit codes, colour queries and modes unit-tested; not yet used in the window)
+
 ## Workspace
 
 - [x] Vertical tabs grouped Agents / Terminals / Browser; new, close, switch (⌘T, ⌘N, ⌘W, ⌘1–9, ⌃Tab)
@@ -83,7 +85,7 @@ Each item says how it was verified.
 - [x] `deck` CLI: pane, tab, browser, open; automation token (used for all the checks above)
 - [x] Control chat pinned first and opened at launch (⌘1)
 - [~] The control chat closes like any thread (× on hover, ⌘W; it is archived) and its row stays to start a fresh one; right-click it, or ⌘K, for New Conversation and Restart Agent (the same conversation on a fresh agent process)
-- [x] T3-style thread view: centred column, work logs that fold to "Worked for 4s · Ran 2 commands" (screenshot), Copy on hover, diffs struck and highlighted
+- [x] Thread view: centred column, work logs that fold to "Worked for 4s · Ran 2 commands" (screenshot), Copy on hover, diffs struck and highlighted
 - [x] Composer card with agent picker, Auto-accept edits / Full access, tokens and cost, round send / stop (screenshot)
 - [~] Messages sent mid-turn go straight to Claude Code, which queues them itself and reads them as soon as the current tool calls finish, inside the same turn; deck shows them as "Queued · after this step" and moves each into the thread where Claude read it (`--replay-user-messages`), so the rest of the turn reads as its answer. ⌘⏎ sends with `priority: "now"`. Esc stops the turn and the queue goes out next; a message Claude drops comes back to the composer. Agents that can't take input mid-turn keep deck's own queue (protocol checked against the real CLI: mid-turn delivery, and the queue surviving an interrupt; decoder unit-tested)
 - [~] Inbox sidebar: threads newest first, two-line rows with Working timer / Needs you / Done / time ago
@@ -94,12 +96,12 @@ Each item says how it was verified.
 - [x] Markdown: inline code in the mono face, links clickable (open in deck's browser) including bare URLs, code blocks scroll sideways instead of wrapping with a language label and Copy, task lists, multi-line quotes and list items, `snake_case` no longer italicised, bordered tables (unit tests + screenshot)
 - [~] Work log: steps read as sentences ("Ran `cargo test`", "Edited src/chat.rs", "Searched fn main"), present tense while running; running steps and logs spin, with a live seconds counter, and steps over a second say how long they took; the header counts "Working for 12s"; logs and opened steps fade in; commands open as `$ command` plus output (failed ones outlined); the newest plan (TodoWrite) shows as a checklist; edits show +/− and a diff built from their input (wording, plans, changed files and durations unit-tested)
 - [~] "N files changed" card after each turn: every edited file with its +/−, a click shows all its changes
-- [~] Approvals and agent questions docked above the composer (T3): Claude runs with `--permission-prompt-tool stdio`, so a tool call that needs approval shows a card with the command or the diff and Claude Code's three answers (Yes · Yes, don't ask again in this chat · No), picked with ↑↓⏎, 1–3, a click, or esc; typing a reply refuses and tells Claude what to do instead. "Always" rules are kept to the session, never written to the project's settings. AskUserQuestion shows its options (multi-select too) and takes a typed answer; ExitPlanMode shows the plan. The step waits with "waiting for you", the thread shows Needs you, and the mode chip cycles Ask before edits → Auto-accept edits → Full access. (Format taken from the real CLI; round trip tested against a stand-in CLI; decoder unit-tested.) With claude-sudo armed, its hook approves everything first, so no card appears.
+- [~] Approvals and agent questions docked above the composer: Claude runs with `--permission-prompt-tool stdio`, so a tool call that needs approval shows a card with the command or the diff and Claude Code's three answers (Yes · Yes, don't ask again in this chat · No), picked with ↑↓⏎, 1–3, a click, or esc; typing a reply refuses and tells Claude what to do instead. "Always" rules are kept to the session, never written to the project's settings. AskUserQuestion shows its options (multi-select too) and takes a typed answer; ExitPlanMode shows the plan. The step waits with "waiting for you", the thread shows Needs you, and the mode chip cycles Ask before edits → Auto-accept edits → Full access. (Format taken from the real CLI; round trip tested against a stand-in CLI; decoder unit-tested.) With claude-sudo armed, its hook approves everything first, so no card appears.
 - [~] Select and copy text inside a reply: see the queue below
-- [ ] Prune pasted images no thread refers to any more
-- [x] Steer a running turn instead of queueing (T3): see above
-- [ ] deck as an MCP server injected into every agent session (T3), alongside the CLI
-- [ ] Per-turn git checkpoints with "Edit from here", worktree per thread, diff panel (T3)
+- [x] Prune pasted images no thread refers to any more (at startup, a week old and unreferenced; `threads::prune_attachments`)
+- [x] Steer a running turn instead of queueing: see above
+- [~] deck as an MCP server in every agent: registered once with Claude Code (user scope), Codex and Gemini CLI through their own `mcp add` (marker per agent under `mcp-registered/`)
+- [~] Per-turn checkpoints with "Edit from here" (built earlier); worktree per thread: "Own branch" on a new thread's screen makes its first message start a task (its own branch and worktree, the same agent) in place of the empty thread. Diff panel: the task review; a thread-level diff panel not yet
 - [~] Command palette ⌘K: open tabs, actions (with their shortcuts), the project's files (git's list) and visited pages in one box, fuzzy-matched with the matched letters lit, word starts and runs ranked first (matcher unit-tested); ↑↓ ⏎ esc; pages step aside while it is open. Typing a brief offers "Start a task". Clear terminal moved to ⇧⌘K
 - [~] Prompt rewriting in the composer (from tower): ⏎ rewrites with a quick `claude -p` run (Haiku by default; no tools, no settings, no saved session, deck's and Claude's session variables stripped) using the thread's task and the agent's last reply, then sends; ⌃O rewrites into the box; ⌃Z brings your words back; short replies, `/` and `!` commands go as typed; a failed rewrite says so and ⏎ sends as typed; a message edited during the rewrite is left alone. Settings: Rewrite and send / Show first / Off, and Haiku / Sonnet / Opus, or a local model in Settings › Models. Off, nothing rewrites: not ⏎, not ⌃O, and a rewrite still running when it is turned off is dropped (⏎ then sends as typed) (flags checked against the installed CLI; rules unit-tested)
 - [~] Auto-retry (from tower): a chat turn that dies on an API or network error gets "continue" after 5 s, 10 s, 20 s… up to 5 minutes, 8 tries, with a countdown under the composer (esc cancels, anything you send takes over); a usage limit waits for its reset ("resets 3pm" or the epoch Claude Code gives); login, billing and bad-request errors are shown instead. Claude Code in a terminal sitting in its own "Retrying in 18s · attempt 4/10" wait, or with no response, gets one Esc and, 5 s later, Enter if its message came back into the box or "continue" (classification, backoff and screen reading unit-tested)
@@ -150,3 +152,196 @@ Each item says how it was verified.
 18. [~] Real screenshots on the website: a throwaway deck (its own data folder, HOME and ZDOTDIR; run unbundled so Panespace can fullscreen just that window) restores seeded threads (Claude's dark mode switch, Codex's flaky test, Gemini's README) beside a demo project whose tests really run and whose page is really served, and captures itself with `deck window shot` from a script in its own shell. Home shows the window with its four parts pinned and numbered; Features shows a Codex chat, Settings › Keyboard and Settings › Appearance; the hero is the social card (`og.jpg`). WebP, 40–195 KB each
 19. [~] Releases: `scripts/release.sh` builds a universal binary (Apple silicon and Intel), assembles Deck.app with its version from Cargo.toml, signs it with a Developer ID and the hardened runtime, notarizes and staples the app and then the disk image, and makes `Deck-<v>.dmg` (for people) and `Deck-<v>.zip` (for the updater) with checksums; `--publish` puts them on GitHub as `v<v>`, refusing without Developer ID, notarization, a clean tree and a pushed HEAD. Release builds sign in to https://deck.stroke.click (`DECK_API`, so the trial and plan apply). The backend's `/v1/releases/latest` now also returns the `dmg`; `/download/mac` always downloads the newest one; the site's download buttons use the disk image. Needs the Apple Developer Program for other Macs to open it
 20. [~] Free trial: every account gets 14 days (`DECK_TRIAL_DAYS`) from sign-up, no card. `/v1/me` answers `plan: "Trial"`, `active` and `trial_ends` (unix seconds), even while payments are down; a paid plan clears it. The app shows "Free trial, N days left" in Settings › Account and in the avatar menu (which opens checkout), stops on the day it ends even offline, and the gate says "Your free trial has ended". Website: pricing, home, FAQ, docs, account page (trial status and end date), terms and refund policy say so (trial and expired answers checked against a local D1; day counting unit-tested)
+
+## 2026-11-02: control plane, pages, background work
+
+Built in one pass on `sidebar-sessions-usage`. `cargo test -p app` passes (250). Not yet seen in the window: it needs a relaunch onto the new build.
+
+### Chat
+- [~] One chip for agent and model. Its menu lists the agents (ones not set up are marked) and, beside them, the hovered agent's models with a check on the current one. Picking another agent's model switches agent and model in one restart. Replaces the two rows of pills
+- [~] The thread's tokens and cost sit right of the hint line under the composer, not in the toolbar, where they pushed the send button out of a narrow composer
+- [~] New thread: "Codex in 📁 folder ⌄" opens a folder picker. The thread and its agent move there before the first message, and the sidebar re-places it
+
+### Status bar
+- [~] Chats in this window as items: agent mark (turning while it works), title, cost (or tokens). A click goes to it. Busiest first, four at most
+- [~] Background jobs and background pages as items after the chats: a terminal or site mark, the name, a state dot (running, failed, idle, loading)
+- [~] The drawer above the status bar shows a job's live terminal (Restart, Open as tab, Stop, Hide) or a background page (Open as tab, Close, Hide)
+
+### Background work
+- [~] `deck job start [--name N] [--cwd DIR] CMD` (and `deck run --bg`) runs a terminal outside every tab. Starting the same name restarts it in place. The name is guessed from the command (`npm run dev` → dev). Also `job list | logs | wait | show | stop`
+- [~] Jobs come back at launch, saved in session.json with name, command and folder. Settings › Terminal › Background jobs switches that off and lists them
+- [~] `deck browser open --bg --name N URL` opens a page outside every tab. It is laid out at 1280×900 while hidden and shown only in the drawer
+- [~] `deck read URL [--name] [--scroll N] [--max] [--json]` opens a background page (Deck's WebKit, Safari's user agent, the user's cookies), waits for it to load and render, and prints the page as Markdown.
+  - Kept: main content, headings, lists, quotes, code, tables, absolute links. Left out: navs, footers, forms, hidden parts. Open shadow roots and slots are read.
+  - `--scroll` loads more of an endless feed. `deck browser read` reads the page you are on.
+  - Extraction checked on a live GitHub page (tables fixed after). Reddit and X not yet tried on the new build
+
+### CLI and skill
+- [~] `deck history [QUERY] [--limit N]`: saved threads, newest first, whether open, past the relaunch window or archived. `deck resume ID` (an id prefix) reopens one, taking it out of the archive if need be, or focuses it if it is open
+- [~] `deck pane key --pane N KEY`: enter, escape, tab, arrows, home/end, page up/down, ctrl+X, alt+X, shift+tab
+- [~] `deck usage`: plan limits, the conversation, today, other agents and every chat's spend, as JSON
+- [~] `deck page open usage|packages`
+- [~] The skill Deck puts in every agent's skills folder at launch now covers background jobs, `deck read`, background pages, history, resume and usage (CLI parsing, job names and key bytes unit-tested)
+
+### Pages
+- [~] Usage page (⌥⌘U, ⌘K, or "History" in the usage panel):
+  - Cost or Tokens, over the past 24h, 7, 30 or 90 days.
+  - The total, with each agent's sessions and share, and a daily bar chart stacked by agent with a hover readout.
+  - Totals: processed, cached input, uncached input, output, cache savings. Breakdown by model or by day.
+  - Claude Code is read from its transcripts (a per-model split added to the cached scans). Codex is read from its `token_count` events at OpenAI list prices, kept apart from Claude's table.
+  - 30 days here: 1.2 s cold, 10 ms warm
+- [~] Packages page (⌥⌘P):
+  - The project's dependencies: npm (pnpm, yarn, bun or npm, by lockfile), Cargo (with Cargo.lock), Python (pyproject or requirements; uv, poetry or pip) and Go.
+  - Wanted, installed, and latest from the registry (fetched 8 at a time).
+  - Filters: All, Outdated, Dev. Update and Update all.
+  - Registry search (npm and crates.io) with Docs and Add. Adding or updating runs as a background job and opens it in the drawer.
+  - Manifest reading and version comparison unit-tested
+
+### Browser
+- [~] Import from another browser (Settings › Browser, or ⌘K "Import from Browser"): Chrome, Arc, Brave, Edge, Vivaldi, Chromium, Safari.
+  - History (the 3,000 newest pages) and bookmarks merge into the address bar's history.
+  - Chromium cookies are decrypted (the keychain's "… Safe Storage" key, PBKDF2 and AES-CBC through CommonCrypto, Chrome 130+'s domain-hash prefix stripped) and put in WebKit's default store, so sign-ins carry over.
+  - Safari history and bookmarks need Full Disk Access, and the import says so.
+  - Chrome history (496 pages) and bookmarks read on this Mac. The cookie import is not yet tried by hand, since it brings up a keychain prompt; the cipher round-trip is unit-tested
+
+### Sidebar and window
+- [~] A relaunch brings back only tabs and threads touched in the last 3 days; pinned rows and the control chat always come back. Older threads stay on disk for `deck history` and `deck resume`
+- [~] "Done" is a green check and the word, with no grey pill. The trailing column (time, state, close) has one width, so times line up. A split's pane count is on the second line instead of a third item on the edge
+- [~] A hairline over Usage and Settings, so the list's last row no longer runs under them
+- [~] Title bar: `📁 project / title`
+
+### Second pass (same day)
+- [~] Background service `deckd` (`deck daemon`, a LaunchAgent `com.broisnischal.deckd`, kept alive and started at login). Jobs and terminal agents run in its PTYs, so quitting Deck leaves them running; jobs running when it stopped start again (after a restart of the Mac). Output kept in a 512 KB ring and `jobs/NAME.log`. Deck's job panes run `deck job attach NAME` (tmux-style: replay, then keys, output and size pass through), so closing a pane or quitting Deck never stops the job. Deck asks the service every 2 s and attaches new jobs, closes panes of gone ones. `deck job start|list|logs|wait --for/--exit|show|attach|restart|stop` talk to the service directly and work with Deck closed (checked end to end on an isolated service: start, wait for text, wait for exit returns the job's code, logs, attach replay, stop, quit; unit tests for the PTY run, log text and argument quoting)
+- [~] Menu bar icon (the service): a terminal mark with how many run (and ! when one failed); its menu lists every job and agent with state and uptime, each with Show in Deck (`deck://job/NAME`), Restart / Start Again, Stop / Remove; Open Deck, Stop All, Quit Background Service
+- [~] Notifications you can answer: approvals carry Approve, Always Allow, Deny and Reply… (what to do instead); questions carry Reply…; a click still opens the pane. Answered in the chat without coming to the window
+- [~] Sounds (Settings › Agents › Sounds): Needs you, Finished, Job failed, each one of macOS's sounds or None, stepped with ‹ › and played as picked; Volume. Played with the notification
+- [~] Model menu: tighter rows, the models panel lined up with the hovered agent, the current agent in its colour, eases in (130 ms) and slides as the pointer moves between agents
+- [~] Status bar chats as one item (their marks stacked, how many, total spend, how many working); hovering opens the list above it (fades in, stays while the pointer moves onto it)
+- [~] Usage panel as four tabs, Limits, This chat, Chats, Today, switched by hover or click; a sliding indicator (180 ms ease-out), the content cross-fades, one fixed height so it never jumps
+- [~] Sidebar: New chat and Search one quiet style; "Recent ⌄ / Projects ⌄" is the header itself (a click switches), the + shows only on hover; days under Recent are a step quieter; a Packages row at the foot beside Usage and Settings
+- [~] Terminal completion menu: a coloured badge per kind on every row, full-width highlight, terminal font, the selected item's description in the footer
+
+### Third pass (same day)
+- [~] Terminal tabs run in the background service (Settings › Terminal › Keep running, on by default): each tab's shell (and any agent in it) is a session there, the pane attaches; quitting Deck leaves them running and a relaunch reattaches every tab, keeping its control token so `deck` inside still answers (the CLI finds Deck through a stable `deck.sock`). Closing a tab ends its session; `exit` closes the tab. Process scans (project, agent, ports) look at the session's shell, not the attach client. Sessions the saved layout doesn't name (a crash) come back as tabs. The menu bar lists them as "Claude · folder" / "Terminal · folder"
+- [~] Flicker: a failed poll of the service no longer reads as "no jobs" (it closed and reopened every job pane every 2 s)
+- [~] Deck memory: `deck memory add [--global] | list [--all] | search | forget`, per project or everywhere, in `memory.json`. A SessionStart hook in Claude Code's settings (`deck hook session-start`, merged in, others' hooks kept) hands every session the Deck brief and this project's memories; Codex, Gemini CLI and OpenCode get a managed block in their global instructions (between markers, the rest of the file theirs). Put back at every launch; `deck context` prints what a session is told (hook merge and block replace unit-tested)
+- [~] System-wide shortcuts from any app (Carbon hot keys, no Accessibility permission): ⌃⌥Space shows or hides Deck, ⌃⌥N a new chat, ⌃⌥T a new terminal; listed under "System-wide" in Settings › Keyboard and rebound there like the rest (key parsing unit-tested)
+- [~] Terminal keys: ⌘⌫ deletes to the line's start (⌃U), ⌘← / ⌘→ start and end of line (⌃A / ⌃E), ⌘⌦ to the end (⌃K), ⌥⌫ the word before (⌃W) (unit-tested)
+- [~] ⌘J in a terminal: "Describe a command" box over the prompt; the command is written into the prompt, nothing runs until you press ⏎ (rebindable)
+- [~] Completion: only commands that would run (PATH, builtins, your aliases and functions read from your rc files); history typos ("clea", "cdlear") are gone; names that start with what you typed beat scattered letters, which only show when nothing starts that way. Badges only when kinds are mixed; the selected item's description in a panel beside the menu, wrapped, instead of a cut-off footer
+- [~] Sidebar selection: ⌘-click picks rows, ⇧-click a range; "N selected · Clear · Close". ⌘K "Close Tabs Idle for a Day" (pinned, working, waiting and Settings stay)
+- [~] Themes Glass (dark) and Frost (light): the window blurs what is behind it, the sidebar and status bar let it through, panes stay almost solid. Settings › Appearance › Match coding agents' themes (on): changing the theme sets Claude Code's to ANSI dark/light, which draws with Deck's terminal colours
+- [~] Model menu drawn above everything (the composer showed through), long model lists scroll (nine rows), a note that repeats the agent's name dropped; access menu on the same recipe and layer
+- [~] Status bar chats list: two-line rows that fit (40 tall, line heights set), concentric corners, the conversation you are in first and marked Current (a terminal agent's included, from its transcript)
+- [~] Packages page: the project is a control (folder picker), search results grouped by registry with counts, Docs/Add on the row under the pointer, "In project" for ones already there, the search box no longer a box in a box
+- [~] Layout audit applied: one radius and spacing scale (6 controls, 8 rows, 10 popovers; 28 controls, 32 rows), one popover recipe and edge, context menus and hover-driven swaps no longer animate, popovers 120 ms; sidebar rows one height with trailers on one edge; settings page padding, nav rows, segments and buttons; packages and usage page controls
+
+### Fourth pass (same day)
+- [~] Branch picker: the status bar's branch and the inspector's Git card open a filter over the repository's branches (newest first, current checked); ⏎ or a click runs `git switch`, git's reason shown if it won't. Inspector Git card: the branch a control, Publish when unpublished, quiet buttons, quieter section tabs
+- [~] Sidebar: rows one line (34 tall, 14 pt titles), a trailing time and state mark (ring working, bell waiting, filled check done), an activity or project tag; headers 12.5 semibold with counts, the view switch in the same style; Search as a field-like bar with a new-chat button beside it; the foot a single icon row (Packages, Usage with context %, Settings) with working / waiting / done counts that jump to the next
+- [~] Pages in the sidebar have their own marks (chart, package); Usage and Packages take keyboard focus so ⌘W, ⌘K… reach Deck there; pages and the editor hand Deck's shortcuts (the keymap, not ⌘C/V/X/A/Z) to Deck instead of keeping them
+- [~] New chat: a failed agent start is a slim notice with Try again; Home for ~; starters on one column
+- [~] Deck and the service drop inherited agent-session markers (CLAUDECODE, CLAUDE_CODE_*), which turned Claude Code's transcript saving off in terminals Deck started
+- [~] Matching agents' themes sets Claude Code to dark / light (its ANSI themes painted grey slabs with Deck's palette)
+- [~] Reference apps no longer named in comments
+
+## Next
+
+In rough order of value.
+
+- [~] Agents' themes follow Deck's: Claude Code `theme` auto (follows the terminal's dark/light answer live; the -ansi ones drop syntax highlighting), Gemini CLI `ui.theme` "ANSI" / "ANSI Light", OpenCode `tui.json` `theme` "system" (keys from their docs); one key per file changed, the rest kept (unit-tested). Codex documents no theme setting
+- [~] Settings › Keyboard: its own search (name, group or keys, "cmd-j" or "⌘J") and where each shortcut applies ("In a terminal", "From any app"…), clash notes kept
+- [~] Settings › Agents › Deck memory: every note with its project and id, Forget on each, a field that adds one for every project
+- [~] Remaining audit fixes: new-tab corner button concentric, ⌘K group headers on the rows' edge, inspector section padding and 28-tall rows
+- [~] A background job that fails on its own (not stopped or restarted on purpose, not a tab) plays the "Job failed" sound and posts "NAME failed · exited N: last line"; clicking it opens the job in Deck
+- [ ] Deck's own structured chats keep running when Deck quits (today shells, terminal agents and jobs do). Plan: the chat's agent process runs under the service with pipes; Deck's driver talks to it through a relay; output while Deck is closed is buffered and replayed into the transcript on relaunch instead of restarting the agent with `--resume`
+
+### Check by hand first
+- [ ] Relaunch onto this build and look at every item above: model menu placement, drawer heights, status bar crowding with many chats and jobs, Usage and Packages at narrow widths, light theme
+- [ ] Cookie import from Chrome end to end: the keychain prompt, then a signed-in site (GitHub, Reddit) in a Deck page
+- [ ] `deck read` on Reddit (new and old), X, a docs site and a signed-in page. Hidden WebKit pages throttle timers, so check late-rendering sites and whether `--scroll` is needed
+
+### Background work that outlives the app
+- [~] A small `deckd` launch agent that owns the PTYs. Quitting Deck leaves jobs, agents and shells running, and reopening reattaches with scrollback. After a restart of the Mac it starts them again and resumes each agent's conversation
+- [~] `deck job wait --exit`: until the command ends, exiting with its code
+- [~] `deck events [--for working,waiting,idle,opened,closed] [--once] [--json]` (polls the window's panes; status per pane added to `pane list`): a stream of pane status, command exits, panes opened and closed, and notices (a streaming socket method)
+- [~] `deck pane prompt --pane N|--name NAME TEXT`: send to an agent, wait until it stops working, print its answer
+
+### Knowing what terminal agents are doing
+- [~] Rules per agent (Claude Code, Codex, Gemini; a generic y/n for the rest; unit-tested on screen text; screenshot fixtures still to do) matched against the screen, the title and OSC 9;4, to tell working, blocked on you, and idle. Screenshot fixtures as tests. They feed the sidebar's state and "Needs you"
+- [~] `deck report working|blocked|done|error|clear "msg" [--progress N]` (OSC 6973;report, written to /dev/tty; blocked notifies; the row's state and tag follow) (an OSC escape), so any program or agent can set its row's state and message
+- [~] A SessionStart hook installed with the skill (Deck memory's hook; tells the agent its pane) (Claude Code, Codex) that tells the agent its pane and records its conversation id for resuming
+- [~] Last-turn diffs for terminal agents: a checkpoint (out of the branch's way) when one starts working; `deck pane diff --name N` and ⌘K "Last Turn's Changes" show what it changed since. Keep / revert per hunk not yet
+
+### Usage
+- [~] OpenCode and Gemini CLI on the Usage page over a range (today only so far)
+- [~] Usage by project, and a CSV export
+- [~] History of plan limits: each reading folds into the day's peak per window (`limits-history.json`, 120 days); Usage page shows the last 14 days per window, coloured by how close to the cap
+
+### Browser
+- [ ] Saved passwords: import them from Chromium's Login Data (same key), keep them in the Keychain, and offer them in login forms
+- [~] Safari cookies (Cookies.binarycookies, needs Full Disk Access; parser unit-tested)
+- [~] Offer the import once: a bar under the browser's toolbar until answered (Import / Not now)
+- [~] Ad and tracker blocking: third-party loads from ~50 ad/tracking networks, a WebKit content rule list, Settings › Browser › Privacy
+
+### Sidebar and design
+- [ ] The rest of the redesign: project header rows, the Recent / Projects switch, task rows and the control row in the new look; one spacing scale across sidebar, chat and pages
+- [~] Sidebar filter (⌥⌘F): rows by title, project and detail; ⏎ opens the first
+- [~] Composer: `/command` (built-ins, your and the project's commands) and `$skill` completion (Claude gets `/skill`). The branch line under it is still to do
+- [~] ⌥⌘J jumps to the next row that needs you (⌘J is the AI command box); ⇧⌘↩ zooms a pane to fill its tab
+
+### Packages
+- [~] Search PyPI and Go; Remove (with Confirm); what depends on what from Cargo.lock / package-lock / pnpm-lock; npm audit and cargo audit badges and an Issues filter
+
+### Control plane
+- [~] `deck do ACTION` / `deck do --list`: every ⌘K action from the CLI, behind Settings › Agents › Command line
+- [~] Remote hosts over SSH: hosts from the user's SSH config (aliases, Include, details; never written) plus `deck remote add`. ⇧⌘H / ⌘K "Connect to Host…": a folder on the host, then per host Terminal or an agent: a click opens a Deck chat whose agent process runs on the host (`ssh -T host 'cd DIR && exec agent …'` in its login shell, Deck's socket and token left out, Claude's local MCP config skipped), ⌥-click the agent's own interface in a terminal there. Terminals go through the background service like any tab. `deck remote list|add|remove|open HOST [--dir] [--agent] [--chat]`. Command building and config parsing unit-tested; not yet tried against a live host. Not yet: `deck` commands from inside a remote session (needs the socket forwarded and a Linux build), Tailscale discovery
+
+### Linux and Windows
+
+Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2, WebKit, Carbon, Keychain, LaunchAgent) and one place has a `cfg(target_os)` fallback. gpui has Linux and Windows backends and `alacritty_terminal` runs on both, so the core ports; the macOS-only parts go behind a platform layer. Every step below ends in a build that runs.
+
+- [ ] Platform layer: a `platform` module in `crates/app` with one interface per macOS service (web view, notifications, menu bar icon, global shortcuts, background service, keychain, pasteboard, screenshots, window blur, `deck://` handler). macOS keeps today's code; other targets start as stubs that say "not on this platform"
+- [ ] macOS-only dependencies (objc2*, block2, objc2-user-notifications) under `[target.'cfg(target_os = "macos")'.dependencies]`; `cargo check` for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` passes
+- [ ] Linux, first runnable build: window, sidebar, terminals (Alacritty engine), chats and agents, settings. Pages, notifications and the background service stubbed; Ghostty engine only when Zig is installed
+- [ ] Linux, full: pages through WebKitGTK, notifications through D-Bus with Approve / Deny / Reply actions, tray through StatusNotifierItem, `deckd` as a systemd user unit in place of the LaunchAgent, secrets through the Secret Service, global shortcuts through X11 grabs or the GlobalShortcuts portal on Wayland, cookie import from Chromium's Linux store
+- [ ] Linux packaging: AppImage and .deb, `deck` CLI on PATH, desktop file and `deck://` handler, `scripts/install.sh` for Linux
+- [ ] Windows, first runnable build: terminals over ConPTY (PowerShell, cmd, WSL), the control socket as a named pipe in place of the Unix socket, Windows paths, the `deck` CLI. Pages and the background service stubbed
+- [ ] Windows, full: pages through WebView2, toast notifications with buttons, tray icon, `deckd` as a per-user background task, Credential Manager for secrets, RegisterHotKey for global shortcuts, DPAPI for Chromium cookie import
+- [ ] Windows packaging: an installer (MSIX or similar), code signing, `deck://` registration
+- [ ] Agents off macOS: each adapter's config and transcript paths (`%APPDATA%`, XDG dirs) for usage; the OpenCode lifeline and `kill_tree` are `sh` and process groups, so Windows needs job objects
+- [ ] CI on ubuntu-latest and windows-latest: build, tests, and a smoke test that opens a window, starts a shell and runs a command
+
+### Chat scrolling and experience
+- [~] Auto-follow: the thread follows new output while you are at the bottom; scrolling up pauses it; sending or jumping resumes it (built; the state machine is not unit-tested yet)
+- [~] "Jump to latest": while paused, a pill over the composer with how many new messages arrived; a click goes to the end and follows again
+- [x] Earlier history at the top: not needed as written. A thread loads whole and the list only lays out what is on screen, so there is nothing to fetch at the top; revisit if threads get long enough to load lazily
+- [ ] Smooth scrolling: trackpads already scroll by the pixel (gpui's list); easing a mouse wheel's line steps needs the list to take an animated offset, which gpui 0.2's list doesn't expose without a fork; left for that
+- [ ] Chat feel audit: message width and spacing, day separators and timestamps, hover actions (copy, retry, fork, edit), unread and "new since last visit" marks, queued-message placement, streaming pace and caret, and empty/error states. Review against the agents' own clients and fix what feels cramped or jumpy
+- [~] Keep your place: opening or folding a step or a log (or "N earlier steps") anchors the list at the top of what you are reading, so it grows downward instead of sliding the row from under the pointer; "Jump to latest" resumes following. Approval cards and the composer don't move the list (it keeps its top item). Not yet checked by hand
+- [~] Sticky prompt: scrolled into a reply, a slim bar over the thread shows the message it answers; a click scrolls back to it
+
+### Chat rendering
+- [ ] Sandboxed HTML in chat: render fenced `html` and artifact blocks in an isolated frame with no network, scripts off unless the block opts in, a clear "HTML" badge, Open in tab and Copy source. Check the content security policy, sizing to content, and that a hostile block cannot reach Deck or the page's cookies
+- [ ] Canvas rendering in chat: render canvases produced by HTML artifacts and chart blocks to a crisp Retina image, export as PNG, cap size and frames so a runaway animation cannot freeze a thread, and fall back to the source when rendering fails
+- [ ] Mermaid diagrams: render `mermaid` fences (flowchart, sequence, state, class, ER, gantt, mindmap, timeline) lazily and cache the result, pan and zoom, follow the window theme, and show the source with a parse error when a diagram is invalid. Visual fixtures in both themes and a long diagram
+- [ ] Charts: render line, bar, stacked bar, area, scatter and pie charts from a fenced spec or CSV/JSON with labelled axes, legend, hover readout, theme colours, resize and PNG export; never execute chart JavaScript. Fixtures for missing data, long labels and narrow panes
+- [ ] Diagrams beyond Mermaid: Graphviz/DOT and D2 fences rendered offline with pan and zoom, source fallback, and the same lazy loading and cache as Mermaid. Check a large graph does not stall the thread
+- [ ] Diagram and chart interaction: click to open full screen, copy as PNG or SVG, and keep the rendered result when the thread is reopened instead of re-rendering from scratch
+- [ ] Rendering budget: parse and render only what is near the viewport, cap concurrent renders, keep a cache keyed by source and theme, and add a measured long-thread fixture (hundreds of messages with code, tables, HTML, Mermaid and charts) with a time and memory budget
+- [ ] Rendering tests: fixtures for HTML, canvas, Mermaid, charts and their fallbacks; visual snapshots in light and dark; malformed and hostile input; and a check that a failed render never takes the rest of the reply with it
+
+### Accounts, devices and sync
+- [ ] Remote login: sign in to Deck with the account from another Mac, a browser or a paired device, so its open tabs, threads, jobs and dev servers can be seen and controlled from this window; an expired or revoked session drops to the local workspace without losing anything
+- [ ] Device pairing: link a second Mac with a short code or QR (never by copying a token), name each device, and list them with the last time seen and what they are running
+- [ ] Device management: rename a device, sign it out, revoke it, and sign out everywhere; a revoked device loses remote access at once but keeps its local workspace, and the account page shows the same list
+- [ ] Saved configurations: named presets for the whole workspace (theme, terminal colours and font, keybindings, snippets, browser search engine, agent and model defaults, permissions) that can be saved, edited, applied, exported and imported, with a per-project override where it makes sense
+- [ ] Choose what syncs: settings, appearance, keybindings, snippets and memory each have their own switch; terminals, files, cookies, threads and attachments stay local unless explicitly chosen. Show exactly what leaves the Mac before the first sync
+- [ ] Sync on the account: back up those presets to the account server, restore them on a new Mac during sign-in, and keep working offline. Per-key merge with a clear conflict card when two devices changed the same setting since the last sync; never last-write-wins silently
+- [ ] End-to-end encryption: derive a key from the account's recovery phrase, encrypt synced presets in the Keychain and on the server, and show the recovery phrase once with a way to rotate it; the server never sees readable settings
+- [ ] Never sync secrets: agent API keys, account tokens, browser cookies and passwords, SSH keys and environment secrets are excluded by construction, and a test checks that a full sync bundle contains none of them
+- [ ] Remote workspace presence: a device shows whether it is awake and what jobs and dev servers are running there, with Open in this window, Stop job and restart; handle a device going offline mid-command
+- [ ] Snapshot and move: export a signed bundle of the chosen configuration (and optionally the current tabs and threads) and import it on another Mac, with a version and an app-version check and a dry-run preview before anything is applied
+- [ ] Sync tests: two instances against a local account server — first sign-in, a change on each device, a conflict, offline edits that reconnect, a revoked device, a rotated recovery key, and an import that would downgrade settings
+- [ ] Migration and limits: a schema version for the synced bundle, forward and backward migration of settings, a size limit with what counts, and a clear error when the account's storage is full
+- [ ] Remote login audit: the account page and Settings list sign-ins by device, IP and time, with a "this wasn't me" action that revokes the session and starts a re-login

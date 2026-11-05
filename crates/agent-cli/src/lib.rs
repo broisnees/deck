@@ -18,7 +18,7 @@ pub mod spec;
 
 use agent_core::{
     AgentAdapter, AgentError, AgentEvent, AgentId, AgentSession, Availability, Caps, Decision,
-    HydrateMode, ModelSpec, RequestId, SessionCtx, Transcript, UserTurn,
+    HydrateMode, ModelSpec, PermissionMode, RequestId, SessionCtx, Transcript, UserTurn,
 };
 use async_trait::async_trait;
 use decode::{Decode, Exit};
@@ -165,6 +165,47 @@ impl AgentAdapter for CliAdapter {
     }
 }
 
+/// `codex exec` options for the chat's MCP servers (`-c mcp_servers.…`), and
+/// in a chat on another machine its tools that act on this one turned off:
+/// the shell (both kinds) and image viewing by feature flag, and file edits,
+/// which come with the model and have no switch, by a read-only sandbox.
+/// The `host` server's tools are approved for a chat with full access.
+pub(crate) fn codex_overrides(ctx: &SessionCtx) -> Vec<String> {
+    // A JSON string is a valid TOML basic string.
+    fn s(v: &str) -> String {
+        serde_json::Value::from(v).to_string()
+    }
+    let mut a = Vec::new();
+    for server in ctx.mcp.iter().filter(|m| m.enabled) {
+        let key: String = server.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+        let mut fields = match &server.transport {
+            agent_core::McpTransport::Stdio { command, args, env } => {
+                let args = args.iter().map(|x| s(x)).collect::<Vec<_>>().join(",");
+                let env = env.iter().map(|(k, v)| format!("{}={}", s(k), s(v))).collect::<Vec<_>>().join(",");
+                format!("command={},args=[{args}],env={{{env}}}", s(command))
+            }
+            agent_core::McpTransport::Http { url, headers } => {
+                let h = headers.iter().map(|(k, v)| format!("{}={}", s(k), s(v))).collect::<Vec<_>>().join(",");
+                format!("url={},http_headers={{{h}}}", s(url))
+            }
+        };
+        if ctx.host_only && server.name == "host" && ctx.permission_mode != PermissionMode::Ask {
+            fields.push_str(",default_tools_approval_mode=\"approve\"");
+        }
+        a.push("-c".into());
+        a.push(format!("mcp_servers.{key}={{{fields}}}"));
+    }
+    if ctx.host_only {
+        for f in ["shell_tool", "unified_exec", "view_image"] {
+            a.push("-c".into());
+            a.push(format!("features.{f}=false"));
+        }
+        a.push("--sandbox".into());
+        a.push("read-only".into());
+    }
+    a
+}
+
 /// The text actually sent to the CLI for a turn.
 ///
 /// These backends take a single prompt string per invocation, so the harness
@@ -258,11 +299,12 @@ pub(crate) fn spawn_turn(
     native: Arc<Mutex<Option<String>>>,
     resuming: bool,
 ) -> Result<TurnHandle, AgentError> {
-    let mut cmd = Command::new(spec.bin);
-    cmd.args(&args)
+    let (program, launch_args, dir) = agent_core::adapter::launch(ctx, spec.bin, &args);
+    let mut cmd = Command::new(&program);
+    cmd.args(&launch_args)
         .envs(spec.env.iter().copied())
         .envs(ctx.env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&ctx.cwd)
+        .current_dir(&dir)
         // None of these may wait on a terminal: codex reads stdin when it is
         // not one ("Reading additional input from stdin..."), and gets EOF.
         .stdin(Stdio::null())
@@ -394,8 +436,10 @@ pub(crate) fn kill_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // The group was made by `process_group(0)`, so its id is the pid.
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
+        // TERM first, then KILL: a process that came up with TERM ignored
+        // (an `opencode serve` did) would otherwise outlive us for good.
+        let _ = Command::new("sh")
+            .args(["-c", "kill -TERM -$0 2>/dev/null; sleep 3; kill -KILL -$0 2>/dev/null", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -463,13 +507,20 @@ impl AgentSession for CliSession {
     async fn send(&mut self, turn: UserTurn) -> Result<(), AgentError> {
         let prompt = self.compose(&turn);
         let resume = self.resume_arg();
-        let args = self.spec.args(
+        // On another machine nothing may change this one, full access or
+        // not: no flag that lifts the sandbox.
+        let permission = if self.ctx.host_only { PermissionMode::Ask } else { self.ctx.permission_mode };
+        let mut args = self.spec.args(
             &prompt,
             &self.ctx.cwd.to_string_lossy(),
             self.ctx.model.as_deref(),
             resume.as_deref(),
-            self.ctx.permission_mode,
+            permission,
         );
+        if self.spec.wire == Wire::CodexJson {
+            let at = self.spec.base_args.len().min(args.len());
+            args.splice(at..at, codex_overrides(&self.ctx));
+        }
         self.turns += 1;
         let resuming = self.sent == 0 && self.ctx.resume.is_some() && resume.is_some();
         self.sent += 1;
@@ -543,7 +594,50 @@ mod tests {
             permission_mode: agent_core::PermissionMode::Ask,
             env: Vec::new(),
             allowed_tools: Vec::new(),
+            remote: None,
+            disallowed_tools: Vec::new(),
+            host_only: false,
         }
+    }
+
+    fn host_ctx(mode: agent_core::PermissionMode) -> SessionCtx {
+        let mut c = ctx();
+        c.host_only = true;
+        c.permission_mode = mode;
+        c.mcp = Arc::new(vec![agent_core::McpServerSpec {
+            name: "host".into(),
+            transport: agent_core::McpTransport::Stdio {
+                command: "/Applications/Deck.app/deck".into(),
+                args: vec!["mcp".into(), "--host".into(), "dinq".into(), "--dir".into(), "~/my \"app\"".into()],
+                env: vec![("DECK_TOKEN".into(), "t".into())],
+            },
+            enabled: true,
+        }]);
+        c
+    }
+
+    #[test]
+    fn codex_on_a_host_gets_the_host_server_and_nothing_that_acts_here() {
+        let a = codex_overrides(&host_ctx(agent_core::PermissionMode::Ask));
+        assert_eq!(
+            a[1],
+            r#"mcp_servers.host={command="/Applications/Deck.app/deck",args=["mcp","--host","dinq","--dir","~/my \"app\""],env={"DECK_TOKEN"="t"}}"#
+        );
+        for f in ["features.shell_tool=false", "features.unified_exec=false", "features.view_image=false", "read-only"] {
+            assert!(a.iter().any(|x| x == f), "{f} missing from {a:?}");
+        }
+        // Full access approves the host's tools; it never lifts the sandbox.
+        let full = codex_overrides(&host_ctx(agent_core::PermissionMode::Yolo));
+        assert!(full[1].ends_with(r#",default_tools_approval_mode="approve"}"#), "{}", full[1]);
+    }
+
+    #[test]
+    fn codex_here_only_gets_its_servers() {
+        let mut c = host_ctx(agent_core::PermissionMode::Ask);
+        c.host_only = false;
+        let a = codex_overrides(&c);
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert!(codex_overrides(&ctx()).is_empty());
     }
 
     fn session(spec: &'static CliSpec) -> CliSession {

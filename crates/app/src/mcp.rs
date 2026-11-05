@@ -19,6 +19,41 @@ type Tool = (
 
 const TOOLS: &[Tool] = &[
     (
+        "deck_remote_hosts",
+        "remote.hosts",
+        "List the machines reachable over SSH (aliases from the user's SSH config and hosts added in Deck), with user@hostname.",
+        || json!({}),
+        &[],
+    ),
+    (
+        "deck_remote_run",
+        "remote.run",
+        "Run a shell command on a remote host over SSH, in a folder there, and get its output and exit code. For builds, tests, git, inspecting a server. Non-interactive: no prompts, no TTY. Default timeout 120 s.",
+        || {
+            json!({
+                "host": {"type": "string", "description": "an alias from deck_remote_hosts, or user@host"},
+                "command": {"type": "string"},
+                "dir": {"type": "string", "description": "folder on the host; ~ by default"},
+                "timeout": {"type": "integer", "description": "seconds, at most 1800"}
+            })
+        },
+        &["host", "command"],
+    ),
+    (
+        "deck_remote_read",
+        "remote.read",
+        "Read a text file on a remote host (the first 256 KB unless max_bytes says otherwise).",
+        || json!({"host": {"type": "string"}, "path": {"type": "string"}, "max_bytes": {"type": "integer"}}),
+        &["host", "path"],
+    ),
+    (
+        "deck_remote_write",
+        "remote.write",
+        "Write (replace) a text file on a remote host; its folder is created when missing.",
+        || json!({"host": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}}),
+        &["host", "path", "content"],
+    ),
+    (
         "deck_panes",
         "pane.list",
         "List deck's open panes (terminals, pages, chats) with their ids, titles, folders and what runs in them.",
@@ -323,6 +358,11 @@ const TOOLS: &[Tool] = &[
 ];
 
 pub fn run() -> i32 {
+    serve(handle)
+}
+
+/// Serve MCP on stdin/stdout with `handle` answering each request.
+pub fn serve(handle: impl Fn(&str, &Value) -> Result<Value, (i64, String)>) -> i32 {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -399,6 +439,12 @@ fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
 /// Run one tool through the control socket; a failure is the tool's
 /// answer (`isError`), not a protocol error, so the agent can read it.
 fn call(rpc: &str, args: Value) -> Value {
+    if rpc.starts_with("remote.") {
+        return match crate::remote::tool(rpc, &args) {
+            Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),
+            Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+        };
+    }
     if rpc == "window.shot" || rpc == "browser.shot" {
         return screenshot(rpc, args);
     }

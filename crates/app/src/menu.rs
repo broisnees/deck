@@ -10,12 +10,11 @@ use crate::icon::{icon, Icon};
 use crate::theme::{self, u};
 use gpui::prelude::*;
 use gpui::{
-    anchored, deferred, div, ease_out_quint, hsla, point, px, rgb, rgba, Action, Animation,
-    AnimationExt, App, BoxShadow, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    anchored, deferred, div, px, rgb, rgba, Action,
+    App, Context, ElementId, Entity, EventEmitter, FocusHandle,
     KeyDownEvent, Pixels, Point, SharedString, Subscription, Window,
 };
 use std::rc::Rc;
-use std::time::Duration;
 
 /// What an item does when picked.
 type Run = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -252,20 +251,6 @@ impl Render for ContextMenu {
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
-            .shadow(vec![
-                BoxShadow {
-                    color: hsla(0., 0., 0., 0.5),
-                    offset: point(px(0.), px(10.)),
-                    blur_radius: px(28.),
-                    spread_radius: px(0.),
-                },
-                BoxShadow {
-                    color: hsla(0., 0., 0., 0.35),
-                    offset: point(px(0.), px(1.)),
-                    blur_radius: px(3.),
-                    spread_radius: px(0.),
-                },
-            ])
             .font_family(theme::UI)
             .text_size(u(13.))
             .line_height(u(18.))
@@ -307,7 +292,9 @@ impl Render for ContextMenu {
                         .text_color(rgb(fg))
                         .when(lit, |d| d.bg(rgb(theme::surface_hover())))
                         .when(gutter, |d| match item.icon {
-                            Some(i) => d.child(icon(i, 14., glyph)),
+                            // An agent's mark in its own colour, unless the
+                            // row is greyed out.
+                            Some(i) => d.child(icon(i, 14., i.brand().filter(|_| glyph != theme::dim()).unwrap_or(glyph))),
                             None => d.child(div().flex_none().size(u(14.))),
                         })
                         .child(div().flex_1().whitespace_nowrap().child(item.label.clone()))
@@ -341,11 +328,8 @@ impl Render for ContextMenu {
                 }
             });
         }
-        col.with_animation(
-            "context-menu-in",
-            Animation::new(Duration::from_millis(110)).with_easing(ease_out_quint()),
-            |d, t| d.opacity(t),
-        )
+        // Context menus appear at once: they open many times a day.
+        col
     }
 }
 

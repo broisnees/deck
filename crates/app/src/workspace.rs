@@ -17,7 +17,7 @@ use crate::theme::{self, u, OneLine};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, div, px, rgb, rgba, AnyElement, AnyView, App, Context, ElementId, Entity,
+    actions, canvas, div, px, Animation, AnimationExt, rgb, rgba, AnyElement, AnyView, App, Context, ElementId, Entity,
     FontWeight, KeyBinding, Menu, MenuItem, MouseButton, OsAction, SharedString, StyleRefinement,
     Subscription, Task, WeakEntity, Window,
 };
@@ -32,6 +32,15 @@ use std::time::{Duration, Instant};
 actions!(
     deck,
     [
+        OpenUsage,
+        OpenPackages,
+        NextNeedsYou,
+        ZoomPane,
+        FilterSidebar,
+        ToggleDeck,
+        AskCommand,
+        CloseIdleTabs,
+        ImportBrowserData,
         NewTab,
         NewTerminal,
         NewBrowser,
@@ -50,12 +59,19 @@ actions!(
         ClosePane,
         NextTab,
         PrevTab,
+        RecentTab,
+        RecentTabBack,
+        MoveToTab,
+        ConnectHost,
+        ShowTurnDiff,
         NextPane,
         PrevPane,
         FocusAddress,
         Reload,
         ToggleDevTools,
         CommandPalette,
+        ActionPalette,
+        TabSwitcher,
         InsertSnippet,
         SaveSnippet,
         EditSnippets,
@@ -65,6 +81,7 @@ actions!(
         NewControl,
         RestartControl,
         ToggleSidebar,
+        ToggleSidebarView,
         ToggleInspector,
         Quit,
         Copy,
@@ -101,7 +118,7 @@ pub struct Shortcut {
     pub group: &'static str,
     /// What Deck ships with; the first is the one shown.
     pub defaults: &'static [&'static str],
-    context: Option<&'static str>,
+    pub context: Option<&'static str>,
     bind: fn(&str, Option<&str>) -> KeyBinding,
 }
 
@@ -148,14 +165,18 @@ pub static SHORTCUTS: &[Shortcut] = &[
         "next-tab",
         "Next tab",
         "Tabs",
-        ["cmd-shift-]", "ctrl-tab"],
+        ["cmd-shift-]"],
         NextTab
     ),
+    shortcut!("recent-tab", "Last used tab (again for older)", "Tabs", ["ctrl-tab"], RecentTab),
+    shortcut!("move-to-tab", "Move pane to a new tab", "Panes", ["alt-cmd-t"], MoveToTab),
+    shortcut!("connect-host", "Connect to a host over SSH", "Window", ["shift-cmd-h"], ConnectHost),
+    shortcut!("recent-tab-back", "Last used tab, the other way", "Tabs", ["ctrl-shift-tab"], RecentTabBack),
     shortcut!(
         "prev-tab",
         "Previous tab",
         "Tabs",
-        ["cmd-shift-[", "ctrl-shift-tab"],
+        ["cmd-shift-["],
         PrevTab
     ),
     shortcut!("split-right", "Split right", "Panes", ["cmd-d"], SplitRight),
@@ -168,7 +189,11 @@ pub static SHORTCUTS: &[Shortcut] = &[
     ),
     shortcut!("next-pane", "Next pane", "Panes", ["cmd-]"], NextPane),
     shortcut!("prev-pane", "Previous pane", "Panes", ["cmd-["], PrevPane),
-    shortcut!("quick-open", "Go to anything (in the editor: a file)", "Window", ["cmd-p"], QuickOpen),
+    shortcut!("quick-open", "Switch tabs (in the editor: open a file)", "Window", ["cmd-p"], QuickOpen),
+    // ⌃P and ⌃K stay the shell's in a terminal (previous command, kill to
+    // the end of the line).
+    shortcut!("switch-tab", "Switch tabs", "Window", ["ctrl-p"], TabSwitcher, Some("!Terminal")),
+    shortcut!("actions", "Actions", "Window", ["ctrl-k"], ActionPalette, Some("!Terminal")),
     shortcut!("focus-left", "Pane to the left", "Panes", ["alt-cmd-left"], FocusLeft),
     shortcut!("focus-right", "Pane to the right", "Panes", ["alt-cmd-right"], FocusRight),
     shortcut!("focus-up", "Pane above", "Panes", ["alt-cmd-up"], FocusUp),
@@ -188,12 +213,30 @@ pub static SHORTCUTS: &[Shortcut] = &[
         InsertSnippet
     ),
     shortcut!("settings", "Settings", "Window", ["cmd-,"], OpenSettings),
+    shortcut!("usage", "Usage and cost", "Window", ["alt-cmd-u"], OpenUsage),
+    shortcut!("next-needs-you", "Next one that needs you", "Tabs", ["alt-cmd-j"], NextNeedsYou),
+    shortcut!("zoom-pane", "Zoom the pane to fill its tab", "Panes", ["cmd-shift-enter"], ZoomPane),
+    shortcut!("filter-sidebar", "Filter the sidebar", "Window", ["alt-cmd-f"], FilterSidebar),
+    // From any app. The context matches nothing inside Deck: these are
+    // registered with macOS instead (see global.rs).
+    shortcut!("global-toggle", "Show or hide Deck", "System-wide", ["ctrl-alt-space"], ToggleDeck, Some(GLOBAL)),
+    shortcut!("global-chat", "New chat, from any app", "System-wide", ["ctrl-alt-n"], NewChat, Some(GLOBAL)),
+    shortcut!("global-terminal", "New terminal, from any app", "System-wide", ["ctrl-alt-t"], NewTerminal, Some(GLOBAL)),
+    shortcut!("ask-command", "Write a command with AI", "Terminal", ["cmd-j"], AskCommand, Some("Terminal")),
+    shortcut!("packages", "Packages", "Window", ["alt-cmd-p"], OpenPackages),
     shortcut!(
         "sidebar",
         "Show or hide the sidebar",
         "Window",
         ["cmd-b"],
         ToggleSidebar
+    ),
+    shortcut!(
+        "sidebar-view",
+        "List the sidebar by project or by time",
+        "Window",
+        ["cmd-shift-b"],
+        ToggleSidebarView
     ),
     shortcut!(
         "inspector",
@@ -273,7 +316,26 @@ pub fn install(cx: &mut App) {
 
 /// Put the keymap in place with your shortcuts from Settings, and the menus
 /// that show them. At launch, and whenever a shortcut changes.
+/// The key context of system-wide shortcuts: no element has it.
+const GLOBAL: &str = "SystemWide";
+
 pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
+    // System-wide ones go to macOS, as your keys or Deck's.
+    let global: Vec<(&'static str, String)> = SHORTCUTS
+        .iter()
+        .filter(|s| s.context == Some(GLOBAL))
+        .flat_map(|s| s.keys(mine).into_iter().map(move |k| (s.id, k.to_string())))
+        .collect();
+    crate::global::register(&global);
+    // Pages hand Deck its own shortcuts (not text editing: ⌘C, ⌘V, ⌘X,
+    // ⌘A and ⌘Z stay the page's).
+    let page_keys: Vec<String> = SHORTCUTS
+        .iter()
+        .filter(|s| s.context.is_none())
+        .flat_map(|s| s.keys(mine).into_iter().map(str::to_string))
+        .filter(|k| !matches!(k.as_str(), "cmd-c" | "cmd-v" | "cmd-x" | "cmd-a" | "cmd-z" | "cmd-shift-z"))
+        .collect();
+    crate::browser::set_forward_keys(page_keys);
     cx.clear_key_bindings();
     let mut keys = Vec::new();
     for s in SHORTCUTS {
@@ -367,6 +429,7 @@ pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Sidebar by Project or Time", ToggleSidebarView),
                 MenuItem::action("Toggle Inspector", ToggleInspector),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
@@ -637,6 +700,23 @@ enum PaneKind {
     Launcher(Entity<LauncherPane>),
     /// A task's changes, to merge, open as a PR or discard.
     Review(Entity<ReviewPane>),
+    /// A page of Deck's own: Usage, Packages.
+    Page(gpui::AnyView, PageKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageKind {
+    Usage,
+    Packages,
+}
+
+impl PageKind {
+    fn title(self) -> &'static str {
+        match self {
+            PageKind::Usage => "Usage",
+            PageKind::Packages => "Packages",
+        }
+    }
 }
 
 struct Pane {
@@ -652,6 +732,8 @@ struct Tab {
     focused: PaneId,
     /// The control chat: first in the sidebar, never closed by accident.
     pinned: bool,
+    /// Pinned by you to the top of the sidebar, above every project.
+    on_top: bool,
 }
 
 impl Tab {
@@ -684,6 +766,8 @@ pub enum Open {
     Review(String),
     /// The code editor on a project (a browser pane showing `code.rs`'s app).
     Editor(crate::code::Editor),
+    /// One of Deck's own pages.
+    Page(PageKind),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -713,6 +797,9 @@ struct UsageView {
     /// The focused Claude Code conversation: its title and its numbers.
     session: Option<(SharedString, crate::usage::SessionUse)>,
     today: Option<crate::usage::DayUse>,
+    /// Agents with no plan limits to read (OpenCode, Gemini CLI): their
+    /// day so far.
+    others: Vec<crate::usage::AgentDay>,
     busy: bool,
     at: Option<Instant>,
 }
@@ -734,7 +821,7 @@ struct ProjectGroup {
     name: String,
     root: Option<PathBuf>,
     /// Chats and agents, with when each last did something.
-    threads: Vec<(usize, Instant)>,
+    threads: Vec<(usize, i64)>,
     others: Vec<usize>,
 }
 
@@ -754,6 +841,17 @@ pub struct Workspace {
     /// Project groups folded shut in the sidebar, by name.
     folded: std::collections::HashSet<String>,
     sidebar: bool,
+    /// The sidebar by time (Now, Today, …) instead of by project.
+    recent: bool,
+    /// When each pane last did something the sidebar sorts by, in seconds
+    /// since the epoch: began or stopped work, wanted you, finished a
+    /// command, or was opened. Never mere output, which an idle agent's
+    /// status line makes all the time. Wall-clock, so it holds across
+    /// sleep and restarts.
+    touched: HashMap<PaneId, i64>,
+    /// Each tab's place in the sidebar's Recent view, by its first pane:
+    /// the time it had when the list first showed it (see `settle`).
+    settled: HashMap<PaneId, i64>,
     pub inspector: Inspector,
     refreshing: bool,
     /// Agent runtime for chats; probed in the background at startup.
@@ -815,6 +913,9 @@ pub struct Workspace {
     /// The command palette while it is open, and the pane that had the
     /// keyboard before it.
     palette: Option<(Entity<Palette>, Option<PaneId>, Subscription)>,
+    /// What the open palette offers, so its own key closes it and another
+    /// palette key switches it.
+    palette_scope: Option<crate::palette::Scope>,
     /// A one-line message at the foot of the window, and when it goes.
     toast: Option<(SharedString, Instant)>,
     /// A card in the corner that asks something (make deck the default
@@ -836,6 +937,70 @@ pub struct Workspace {
     scroll_keys: HashMap<PaneId, String>,
     /// Terminals `deck run --name` made, by name.
     named: HashMap<String, PaneId>,
+    /// Terminals that run in the background, outside every tab: dev
+    /// servers and watchers an agent started with `deck job start`. Each is
+    /// a tab in the status bar, and opens in the drawer above it.
+    jobs: Vec<PaneId>,
+    /// Background pages and when each was last used: opened, named in a
+    /// `deck` call, or shown in the drawer. One left alone for
+    /// [`BG_PAGE_IDLE`] closes, since each holds a WebKit process.
+    bg_used: HashMap<PaneId, Instant>,
+    /// The job whose terminal the drawer shows.
+    job_open: Option<PaneId>,
+    /// What each job was started with, until its shell reports it.
+    job_cmds: HashMap<PaneId, String>,
+    /// The background service's jobs, as last asked (every two seconds).
+    daemon_jobs: Vec<crate::daemon::JobInfo>,
+    /// A list request is out.
+    daemon_asking: bool,
+    /// Sidebar rows picked with ⌘-click / ⇧-click, by their tab's first
+    /// pane, and the row a ⇧-click range starts from.
+    picked: std::collections::HashSet<PaneId>,
+    pick_anchor: Option<PaneId>,
+    /// Terminal panes whose shell lives in the background service: their
+    /// session's name.
+    sessions: HashMap<PaneId, String>,
+    /// Terminal agents whose screen shows they wait on you (a permission
+    /// prompt, a choice), as last read.
+    blocked: std::collections::HashSet<PaneId>,
+    /// Deck's own pages' focus handles, so keys reach the window's keymap.
+    page_focus: HashMap<PaneId, gpui::FocusHandle>,
+    /// The branch picker, while open.
+    branch_picker: Option<BranchPicker>,
+    /// "Connect to Host": the folder field and the hosts.
+    remote_picker: Option<RemotePicker>,
+    /// The pane zoomed to fill its tab, if any.
+    zoomed: Option<PaneId>,
+    /// The sidebar's filter, while open: rows whose title or project
+    /// contain it show.
+    filter: Option<(Entity<crate::field::Field>, Subscription)>,
+    /// Tabs by when they were last looked at (their first pane), newest
+    /// first, and a ⌃Tab walk in progress: where it is and when it moved.
+    mru: Vec<PaneId>,
+    /// Each terminal agent's last turn: the project's root and the
+    /// checkpoint commit made when the turn began.
+    turn_marks: HashMap<PaneId, (PathBuf, String)>,
+    mru_walk: Option<(usize, Instant)>,
+    /// The pointer is on the sidebar's gauge: its card shows.
+    gauge_hover: bool,
+    /// Whether the window was last told to blur what is behind it.
+    glass_on: Option<bool>,
+    /// At restore: the service's tab sessions not yet attached.
+    restore_sessions: Vec<crate::daemon::JobInfo>,
+    /// The next terminal made attaches to this session (pid of its shell)
+    /// with this token, instead of starting a shell: a restore.
+    reattach: Option<(String, u32, String)>,
+    /// `deck://job/NAME` arrived before its pane: show it once attached.
+    show_when_attached: Option<String>,
+    /// The status bar's chats list, and whether the pointer is on the item
+    /// or the list.
+    bar_chats_open: bool,
+    bar_chats_over_item: bool,
+    bar_chats_over_list: bool,
+    /// The same for the status bar's "+N" list of background jobs and pages.
+    bar_more_open: bool,
+    bar_more_over_item: bool,
+    bar_more_over_list: bool,
     /// Dev servers under our terminals, for the status bar: (port, process).
     bar_ports: Vec<(u16, String)>,
     /// Whether each listening (port, process) answers HTTP: only web
@@ -850,6 +1015,12 @@ pub struct Workspace {
     /// the panel either opens.
     usage: UsageView,
     usage_open: bool,
+    /// The usage panel's tab (Limits, This chat, Chats, Today), the one
+    /// before it (the indicator slides from there) and a count of switches
+    /// (so each switch animates afresh).
+    usage_tab: usize,
+    usage_tab_prev: usize,
+    usage_tab_moves: u64,
     /// The panel was opened from the sidebar's Usage row, so it hangs over
     /// the sidebar instead of over the status bar's meter.
     usage_by_sidebar: bool,
@@ -884,15 +1055,27 @@ impl Workspace {
         })
         .detach();
         // Spinners and the like step on their own clock (icon::phase): after
-        // a frame that drew one, draw the next a fifteenth of a second later.
-        // Nothing animating, nothing drawn.
+        // a frame that drew one, redraw the views that drew one a fifteenth
+        // of a second later. Not the whole window: `refresh` would throw away
+        // every cached pane and lay all of it out again, 15 times a second
+        // for as long as an agent works. Nothing animating, nothing drawn.
         let animate = cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_secs_f32(1. / crate::icon::ANIM_FPS))
                 .await;
-            if crate::icon::take_animating()
-                && this.update_in(cx, |_, window, _| window.refresh()).is_err()
-            {
+            let alive = match crate::icon::take_animating() {
+                crate::icon::Animating::Nothing => true,
+                crate::icon::Animating::Window => this.update_in(cx, |_, window, _| window.refresh()).is_ok(),
+                crate::icon::Animating::Views(ids) => this
+                    .update(cx, |_, cx| {
+                        let app: &mut App = cx;
+                        for id in ids {
+                            app.notify(id);
+                        }
+                    })
+                    .is_ok(),
+            };
+            if !alive {
                 return;
             }
         });
@@ -908,6 +1091,9 @@ impl Workspace {
                 .collect(),
             folded: std::collections::HashSet::new(),
             sidebar: true,
+            recent: false,
+            touched: HashMap::new(),
+            settled: HashMap::new(),
             inspector: Inspector {
                 // A narrow (tiled) window cannot afford a third column.
                 open: f32::from(window.viewport_size().width) >= 1200.,
@@ -944,6 +1130,7 @@ impl Workspace {
             tasks: crate::tasks::load_all(),
             task_changes: HashMap::new(),
             palette: None,
+            palette_scope: None,
             toast: None,
             restored_at: None,
             ticks: 0,
@@ -961,12 +1148,44 @@ impl Workspace {
             placing: false,
             scroll_keys: HashMap::new(),
             named: HashMap::new(),
+            jobs: Vec::new(),
+            bg_used: HashMap::new(),
+            job_open: None,
+            job_cmds: HashMap::new(),
+            daemon_jobs: Vec::new(),
+            daemon_asking: false,
+            show_when_attached: None,
+            sessions: HashMap::new(),
+            picked: Default::default(),
+            pick_anchor: None,
+            restore_sessions: Vec::new(),
+            glass_on: None,
+            gauge_hover: false,
+            mru: Vec::new(),
+            turn_marks: HashMap::new(),
+            mru_walk: None,
+            zoomed: None,
+            filter: None,
+            branch_picker: None,
+            remote_picker: None,
+            page_focus: HashMap::new(),
+            blocked: Default::default(),
+            reattach: None,
+            bar_chats_open: false,
+            bar_chats_over_item: false,
+            bar_chats_over_list: false,
+            bar_more_open: false,
+            bar_more_over_item: false,
+            bar_more_over_list: false,
             bar_ports: Vec::new(),
             port_web: HashMap::new(),
             bar_git: None,
             conv_titles: HashMap::new(),
             usage: UsageView::default(),
             usage_open: false,
+            usage_tab: 0,
+            usage_tab_prev: 0,
+            usage_tab_moves: 0,
             usage_by_sidebar: false,
             pending_scroll: None,
             _tick: tick,
@@ -1012,6 +1231,7 @@ impl Workspace {
                 }
                 ws.restore(saved, window, cx);
                 ws.offer_default_terminal(cx);
+                ws.offer_permissions(cx);
                 ws.start_account(cx);
                 ws.start_update_checks(cx);
             });
@@ -1030,16 +1250,53 @@ impl Workspace {
             }
         })
         .detach();
+        // Deck's shortcuts pressed while a page had the keyboard.
+        {
+            let mut keys = crate::browser::watch_page_keys();
+            cx.spawn_in(window, async move |_, cx| {
+                while let Some(k) = keys.next().await {
+                    let _ = cx.update(|window, cx| {
+                        if let Ok(ks) = gpui::Keystroke::parse(&k) {
+                            window.dispatch_keystroke(ks, cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        // System-wide shortcuts, pressed in any app.
+        {
+            let mut pressed = crate::global::start();
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(id) = pressed.next().await {
+                    let _ = this.update_in(cx, |_, window, cx| {
+                        let front = window.is_window_active();
+                        match id {
+                            "global-toggle" if front => cx.hide(),
+                            "global-toggle" => {
+                                cx.activate(true);
+                                window.activate_window();
+                            }
+                            other => {
+                                cx.activate(true);
+                                window.activate_window();
+                                match other {
+                                    "global-chat" => window.dispatch_action(Box::new(NewChat), cx),
+                                    "global-terminal" => window.dispatch_action(Box::new(NewTerminal), cx),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
         // A click on one of deck's notifications brings its pane forward.
         if let Some(mut clicks) = crate::notify::start() {
             cx.spawn_in(window, async move |this, cx| {
-                while let Some(pane) = clicks.next().await {
-                    let _ = this.update_in(cx, |ws, window, cx| {
-                        if ws.panes.contains_key(&pane) {
-                            window.activate_window();
-                            ws.focus_pane(pane, window, cx);
-                        }
-                    });
+                while let Some(ev) = clicks.next().await {
+                    let _ = this.update_in(cx, |ws, window, cx| ws.notification_action(ev, window, cx));
                 }
             })
             .detach();
@@ -1081,7 +1338,8 @@ impl Workspace {
         // cannot return an error.
         let (kind, token, sub) = match what {
             Open::Terminal { cmd, cwd } => {
-                let token = new_token();
+                let reattach = self.reattach.take();
+                let token = reattach.as_ref().map_or_else(new_token, |r| r.2.clone());
                 let mut env = self.pane_env(id, &token);
                 // zsh marks its prompts and commands, for blocks.
                 env.extend(crate::shell::env());
@@ -1089,13 +1347,57 @@ impl Workspace {
                 // quit, then starts fresh beneath it.
                 let key = self.pending_scroll.take().unwrap_or_else(|| new_token()[..16].to_string());
                 let saved = crate::session::scrollback_file(&key);
-                if cmd.is_none() && saved.exists() && env.contains_key("ZDOTDIR") {
+                if cmd.is_none() && saved.exists() && env.contains_key("ZDOTDIR") && reattach.is_none() {
                     env.insert("DECK_RESTORE".into(), saved.display().to_string());
                 }
                 self.scroll_keys.insert(id, key);
                 let cwd = cwd.unwrap_or_else(|| self.cwd.clone());
                 seed = Some(cwd.clone());
-                let pty = TerminalPane::spawn(&cwd, cmd.as_deref(), env)?;
+                // In the background service when it can be: the shell (and
+                // any agent in it) outlives Deck, and this pane attaches.
+                let attach_cmd = std::env::current_exe().ok().map(|exe| {
+                    move |name: &str| {
+                        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+                        format!("exec {} job attach {}", q(&exe.to_string_lossy()), q(name))
+                    }
+                });
+                let mut session: Option<(String, u32)> = None;
+                if let Some((name, pid, _)) = reattach {
+                    session = Some((name, pid));
+                } else if self.settings.keep_terminals && attach_cmd.is_some() && crate::daemon::ask(&json!({ "op": "ping" })).is_ok() {
+                    let name = format!("tab-{}", &token[..12.min(token.len())]);
+                    let mut job_env = crate::daemon::job_env();
+                    job_env.extend(env.clone());
+                    // The shell finds whichever Deck is running now.
+                    job_env.insert("DECK_SOCKET".into(), control::stable_socket().display().to_string());
+                    // The `-c` shell that runs this reads Deck's .zshenv,
+                    // which hands ZDOTDIR back to the user's own: point it
+                    // at Deck's integration again for the login shell, or
+                    // it starts without suggestions, blocks or folder
+                    // tracking.
+                    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+                    let mut again = String::new();
+                    if let Some(z) = env.get("ZDOTDIR") {
+                        again.push_str(&format!("export ZDOTDIR={}; ", q(z)));
+                        match env.get("DECK_ZDOTDIR") {
+                            Some(own) => again.push_str(&format!("export DECK_ZDOTDIR={}; ", q(own))),
+                            None => again.push_str("unset DECK_ZDOTDIR; "),
+                        }
+                    }
+                    let line = match &cmd {
+                        Some(c) => format!("{c}; {again}exec \"$SHELL\" -l"),
+                        None => format!("{again}exec \"$SHELL\" -l"),
+                    };
+                    match crate::daemon::start_tab(&name, &line, &cwd, job_env) {
+                        Ok(job) => session = Some((name, job.pid as u32)),
+                        Err(e) => tracing::warn!("terminal stays in Deck: {e}"),
+                    }
+                }
+                let engine = self.settings.engine.term();
+                let pty = match (&session, &attach_cmd) {
+                    (Some((name, _)), Some(attach)) => TerminalPane::spawn(&cwd, Some(&attach(name)), HashMap::new(), engine)?,
+                    _ => TerminalPane::spawn(&cwd, cmd.as_deref(), env, engine)?,
+                };
                 let title = agent
                     .map(|a| a.name.to_string())
                     .or(cmd)
@@ -1108,6 +1410,10 @@ impl Workspace {
                 let look = self.settings.term_look();
                 crate::code::set_font(&look.family, self.settings.font_px);
                 let t = cx.new(|cx| TerminalPane::new(pty, title, look, window, cx));
+                if let Some((name, pid)) = session {
+                    t.update(cx, |t, _| t.set_pid(pid));
+                    self.sessions.insert(id, name);
+                }
                 let sub =
                     cx.subscribe_in(&t, window, move |ws, _, ev: &TerminalEvent, window, cx| {
                         match ev {
@@ -1116,6 +1422,7 @@ impl Workspace {
                             // notifies, so a new title has to say so.
                             TerminalEvent::Retitled => cx.notify(),
                             TerminalEvent::Alert(said) => {
+                                ws.touched.insert(id, crate::local::now());
                                 let said = said.clone();
                                 ws.alert(id, said, window, cx);
                             }
@@ -1125,6 +1432,7 @@ impl Workspace {
                                 ws.open_url_near(id, &url, window, cx);
                             }
                             TerminalEvent::CommandDone { command, exit, took } => {
+                                ws.touched.insert(id, crate::local::now());
                                 ws.command_done(id, command.clone(), *exit, *took, window, cx);
                             }
                             TerminalEvent::History => ws.open_history(id, window, cx),
@@ -1172,6 +1480,16 @@ impl Workspace {
                         window,
                         move |ws, _, ev: &ChatEvent, window, cx| match ev {
                             ChatEvent::Focused => ws.mark_focused(id, cx),
+                            ChatEvent::StartTask { brief, agent, cwd } => {
+                                let (brief, agent, cwd) = (brief.clone(), agent.clone(), cwd.clone());
+                                ws.spawn_task(brief, cwd, Some(agent), None, None, window, cx);
+                                // The empty thread made way for the task's.
+                                ws.close_pane(id, window, cx);
+                            }
+                            ChatEvent::Moved => {
+                                ws.refresh_places(cx);
+                                ws.save_session(cx);
+                            }
                             ChatEvent::OpenUrl(url) => {
                                 let url = url.clone();
                                 ws.open_url_near(id, &url, window, cx);
@@ -1202,7 +1520,13 @@ impl Workspace {
                 let (webview, events, url, code) = BrowserPane::build(&url, editor, window)?;
                 let b = cx.new(|cx| BrowserPane::new(webview, events, url, code, window, cx));
                 let zoom = self.settings.zoom as f64;
-                b.update(cx, |b, _| b.set_zoom(zoom));
+                let offer = (!self.settings.import_offered)
+                    .then(|| crate::browser_import::sources().first().map(|s| SharedString::from(s.name)))
+                    .flatten();
+                b.update(cx, |b, _| {
+                    b.set_zoom(zoom);
+                    b.import_offer = offer;
+                });
                 let sub =
                     cx.subscribe_in(&b, window, move |ws, _, ev: &BrowserEvent, window, cx| {
                         match ev {
@@ -1218,6 +1542,21 @@ impl Workspace {
                             }
                             BrowserEvent::Retitled => cx.notify(),
                             BrowserEvent::Close => ws.close_pane(id, window, cx),
+                            BrowserEvent::DismissImport => ws.answer_import_offer(window, cx),
+                            BrowserEvent::Key(k) => {
+                                // As if pressed with Deck focused: the
+                                // window's keymap runs it.
+                                // After this update, not inside it: the
+                                // keystroke redraws the window, and the
+                                // workspace is still leased here (⌘W on a
+                                // page crashed Deck with a double lease).
+                                if let Ok(ks) = gpui::Keystroke::parse(k) {
+                                    window.defer(cx, move |window, cx| {
+                                        window.dispatch_keystroke(ks, cx);
+                                    });
+                                }
+                            }
+                            BrowserEvent::Import => ws.import_from_browser(window, cx),
                             BrowserEvent::OpenFolder { path, terminal } => {
                                 let path = path.clone();
                                 let opened = if *terminal {
@@ -1235,6 +1574,36 @@ impl Workspace {
             }
             Open::Settings => self.make_settings(window, cx),
             Open::Launcher => self.make_launcher(id, window, cx),
+            Open::Page(kind) => {
+                let mut return_sub = None;
+                let view: gpui::AnyView = match kind {
+                    PageKind::Usage => {
+                        let page = cx.new(crate::usage_page::UsagePage::new);
+                        self.page_focus.insert(id, page.read(cx).focus.clone());
+                        page.into()
+                    }
+                    PageKind::Packages => {
+                        let cwd = self.focused_cwd(cx).unwrap_or_else(|| self.cwd.clone());
+                        let page = cx.new(|cx| crate::packages::PackagesPage::new(cwd, cx));
+                        self.page_focus.insert(id, page.read(cx).focus.clone());
+                        let sub = cx.subscribe_in(&page, window, move |ws, _, ev: &crate::packages::PackagesEvent, window, cx| match ev {
+                            crate::packages::PackagesEvent::Run { name, cmd, cwd } => {
+                                match ws.start_job(name.clone(), cmd.clone(), Some(cwd.clone()), window, cx) {
+                                    Ok(job) => ws.show_job(job, window, cx),
+                                    Err(e) => ws.flash(format!("Could not run {cmd}: {e}"), cx),
+                                }
+                            }
+                            crate::packages::PackagesEvent::OpenUrl(url) => {
+                                let url = url.clone();
+                                ws.open_url_near(id, &url, window, cx);
+                            }
+                        });
+                        return_sub = Some(sub);
+                        page.into()
+                    }
+                };
+                (PaneKind::Page(view, kind), None, return_sub.unwrap_or_else(|| Subscription::new(|| {})))
+            }
             Open::Review(task) => self.make_review(id, &task, window, cx)?,
         };
         self.next_id += 1;
@@ -1303,6 +1672,7 @@ impl Workspace {
                         root: Node::Leaf(id),
                         focused: id,
                         pinned: true,
+                        on_top: false,
                     },
                 );
                 // Don't yank focus from something the user already opened.
@@ -1327,7 +1697,11 @@ impl Workspace {
             }
             None => {}
         }
+        let cutoff = (crate::local::now() - RESTORE_SECS) * 1000;
         for mut s in saved {
+            if s.updated < cutoff {
+                continue;
+            }
             // Only one control chat; an older one is an ordinary thread now.
             s.control = false;
             match self.make_pane(Open::Thread(Box::new(s)), None, window, cx) {
@@ -1335,6 +1709,7 @@ impl Workspace {
                     root: Node::Leaf(id),
                     focused: id,
                     pinned: false,
+                    on_top: false,
                 }),
                 Err(e) => tracing::warn!("could not restore a thread: {e}"),
             }
@@ -1351,8 +1726,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use crate::session;
+        // Tab sessions the service kept running while Deck was closed.
+        self.restore_sessions = crate::daemon::list().unwrap_or_default().into_iter().filter(|j| j.tab).collect();
         let Some(last) = session::load() else {
             self.open_control(saved, window, cx);
+            self.adopt_sessions(window, cx);
             self.restored = true;
             return;
         };
@@ -1362,7 +1740,13 @@ impl Workspace {
         // The tab to land on, by its focused pane: indices move as the
         // control chat is put first.
         let mut active = None;
+        let now = crate::local::now();
         for (ix, tab) in last.tabs.iter().enumerate() {
+            // Only the last few days come back; pinned rows always do.
+            // Older threads stay on disk, out of the sidebar.
+            if !tab.pinned && !tab.on_top && tab.touched.is_some_and(|at| now - at > RESTORE_SECS) {
+                continue;
+            }
             let mut leaves = Vec::new();
             let Some(root) = self.rebuild(&tab.root, &mut threads, &mut leaves, window, cx) else {
                 continue;
@@ -1380,6 +1764,11 @@ impl Workspace {
                 .or(leaves.first())
                 .copied()
                 .unwrap_or(0);
+            if let Some(at) = tab.touched {
+                for &id in &leaves {
+                    self.touched.insert(id, at);
+                }
+            }
             if ix <= last.active {
                 active = Some(focused);
             }
@@ -1387,6 +1776,7 @@ impl Workspace {
                 focused,
                 root,
                 pinned,
+                on_top: tab.on_top,
             });
         }
         // Tabs opened before the restore finished (`deck open`) stay, after.
@@ -1395,9 +1785,11 @@ impl Workspace {
         self.tabs = back;
         self.tabs.extend(opened);
         self.sidebar = last.sidebar;
+        self.recent = last.recent;
         self.inspector.open = last.inspector;
         self.sidebar_px = last.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         self.inspector_px = last.inspector_width.clamp(INSPECTOR_MIN, INSPECTOR_MAX);
+        self.adopt_sessions(window, cx);
         let mut rest: Vec<_> = threads.into_values().collect();
         rest.sort_by_key(|s| s.updated);
         self.open_control(rest, window, cx);
@@ -1414,6 +1806,23 @@ impl Workspace {
         self.restored = true;
         self.restored_at = Some(Instant::now());
         cx.notify();
+    }
+
+    /// Sessions running in the service that no saved tab named (Deck
+    /// crashed before saving): each comes back as a tab of its own.
+    fn adopt_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for j in std::mem::take(&mut self.restore_sessions).into_iter().filter(|j| j.running) {
+            self.reattach = Some((j.name.clone(), j.pid as u32, new_token()));
+            match self.make_pane(Open::Terminal { cmd: None, cwd: Some(j.cwd.clone()) }, None, window, cx) {
+                Ok(id) => self.tabs.push(Tab {
+                    root: Node::Leaf(id),
+                    focused: id,
+                    pinned: false,
+                    on_top: false,
+                }),
+                Err(e) => tracing::warn!("could not attach {}: {e}", j.name),
+            }
+        }
     }
 
     /// One saved node back as panes; a pane that cannot come back (its
@@ -1460,9 +1869,25 @@ impl Workspace {
             }
             NodeState::Pane(p) => {
                 let (what, agent) = match p {
-                    PaneState::Terminal { cwd, agent, scrollback } => {
+                    PaneState::Terminal { cwd, agent, scrollback, session, token } => {
                         self.pending_scroll = scrollback.clone();
                         let cwd = cwd.clone().filter(|c| c.is_dir());
+                        // Still running in the service: attach, nothing
+                        // is started or resumed.
+                        let live = session.as_ref().and_then(|name| {
+                            self.restore_sessions.iter().find(|j| &j.name == name && j.running).map(|j| (name.clone(), j.pid as u32))
+                        });
+                        if let Some((name, pid)) = live {
+                            self.reattach = Some((name.clone(), pid, token.clone().unwrap_or_else(new_token)));
+                            self.restore_sessions.retain(|j| j.name != name);
+                            let id = self
+                                .make_pane(Open::Terminal { cmd: None, cwd }, None, window, cx)
+                                .map_err(|e| tracing::warn!("could not attach a session: {e}"))
+                                .ok()?;
+                            self.restored_as.insert(id, p.clone());
+                            leaves.push(id);
+                            return Some(Node::Leaf(id));
+                        }
                         let tab = agent
                             .as_ref()
                             .filter(|a| a.tab)
@@ -1505,9 +1930,12 @@ impl Workspace {
         // Several Claude Code tabs in one folder: the one that printed last
         // is the conversation written last.
         let mut claude: HashMap<PathBuf, Vec<(Instant, PaneId)>> = HashMap::new();
+        let mut conversation: HashMap<PaneId, String> = HashMap::new();
         for (&id, pane) in &self.panes {
             if let (PaneKind::Terminal(t), Some(place)) = (&pane.kind, self.places.get(&id)) {
-                if matches!(place.agent, Some(("claude", _))) {
+                if let Some(s) = &place.session {
+                    conversation.insert(id, s.clone());
+                } else if matches!(place.agent, Some(("claude", _))) {
                     claude
                         .entry(place.cwd.clone())
                         .or_default()
@@ -1525,12 +1953,12 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        let mut conversation: HashMap<PaneId, String> = HashMap::new();
+        let known: std::collections::HashSet<String> = conversation.values().cloned().collect();
         for (cwd, mut panes) in claude {
             panes.sort_by_key(|p| std::cmp::Reverse(p.0));
             let sessions = crate::session::claude_sessions(&cwd)
                 .into_iter()
-                .filter(|s| !chats.contains(s));
+                .filter(|s| !chats.contains(s) && !known.contains(s));
             for ((_, id), session) in panes.into_iter().zip(sessions) {
                 conversation.insert(id, session);
             }
@@ -1565,6 +1993,8 @@ impl Workspace {
                         cwd: place.map(|p| p.cwd.clone()),
                         scrollback: agent.is_none().then(|| self.scroll_keys.get(&id).cloned()).flatten(),
                         agent,
+                        session: self.sessions.get(&id).cloned(),
+                        token: self.sessions.contains_key(&id).then(|| pane.token.clone()).flatten(),
                     }
                 }
                 PaneKind::Browser(b) => PaneState::Browser {
@@ -1575,7 +2005,7 @@ impl Workspace {
                 },
                 PaneKind::Settings(_) => PaneState::Settings,
                 // An empty new tab is not worth bringing back.
-                PaneKind::Launcher(_) | PaneKind::Review(_) => return None,
+                PaneKind::Launcher(_) | PaneKind::Review(_) | PaneKind::Page(..) => return None,
             })
         };
         fn node_state(
@@ -1625,15 +2055,21 @@ impl Workspace {
                 pinned: tab.pinned,
                 focused: kept.iter().position(|&p| p == tab.focused).unwrap_or(0),
                 root,
+                on_top: tab.on_top,
+                touched: kept.iter().filter_map(|id| self.touched.get(id)).max().copied(),
             });
         }
+        // Background jobs are the service's to keep, not the session's.
+        let jobs = Vec::new();
         Session {
+            jobs,
             tabs,
             active,
             sidebar: self.sidebar,
             inspector: self.inspector.open,
             sidebar_width: self.sidebar_px,
             inspector_width: self.inspector_px,
+            recent: self.recent,
         }
     }
 
@@ -1719,56 +2155,6 @@ impl Workspace {
         self.flash("Agent restarted", cx);
     }
 
-    fn open_control_menu(
-        &mut self,
-        at: gpui::Point<gpui::Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::menu::{Entry, Item};
-        let ws = cx.entity().downgrade();
-        let open = self.control_tab().is_some();
-        let (fresh, again, close) = (ws.clone(), ws.clone(), ws);
-        let entries: Vec<Entry> = vec![
-            Item::new("New Conversation", move |window, cx| {
-                let _ = fresh.update(cx, |ws, cx| ws.new_control(window, cx));
-            })
-            .icon(Icon::Plus)
-            .into(),
-            Item::new("Restart Agent", move |window, cx| {
-                let _ = again.update(cx, |ws, cx| ws.restart_control(window, cx));
-            })
-            .icon(Icon::Refresh)
-            .disabled(!open)
-            .into(),
-            Entry::Separator,
-            Item::new("Close", move |window, cx| {
-                let _ = close.update(cx, |ws, cx| {
-                    if let Some(ix) = ws.control_tab() {
-                        ws.close_tab(ix, window, cx);
-                    }
-                });
-            })
-            .icon(Icon::Close)
-            .shortcut("⌘W")
-            .disabled(!open)
-            .into(),
-        ];
-        let restore = window.focused(cx);
-        self.menu = Some(crate::menu::open(
-            entries,
-            at,
-            restore,
-            window,
-            cx,
-            |ws: &mut Self, _, cx| {
-                ws.menu = None;
-                cx.notify();
-            },
-        ));
-        cx.notify();
-    }
-
     fn control_tab(&self) -> Option<usize> {
         self.tabs.iter().position(|t| t.pinned)
     }
@@ -1785,6 +2171,7 @@ impl Workspace {
             root: Node::Leaf(id),
             focused: id,
             pinned: false,
+            on_top: false,
         });
         self.focus_pane(id, window, cx);
         Ok(id)
@@ -1913,8 +2300,9 @@ impl Workspace {
         }
         if let Ok(exe) = std::env::current_exe() {
             // So `deck …` resolves to this very binary inside its own panes,
-            // and tools that honour $BROWSER (gh, python, cargo doc --open)
-            // open links in a pane here instead of another app.
+            // and tools that honour $BROWSER (gh, python) open links in a
+            // pane here instead of another app. Just the path: many run
+            // $BROWSER as one program, and `deck URL` opens it.
             if let Some(dir) = exe.parent() {
                 let path = std::env::var("PATH").unwrap_or_default();
                 env.insert(
@@ -1922,7 +2310,7 @@ impl Workspace {
                     crate::tidy_path(&format!("{}:{path}", dir.display())),
                 );
             }
-            env.insert("BROWSER".into(), format!("{} open", exe.display()));
+            env.insert("BROWSER".into(), exe.display().to_string());
         }
         env
     }
@@ -1930,6 +2318,7 @@ impl Workspace {
     /// Record focus that already happened natively (a click in the pane).
     fn mark_focused(&mut self, id: PaneId, cx: &mut Context<Self>) {
         if let Some(ix) = self.tab_of(id) {
+            self.touch_mru(ix);
             if self.tabs[ix].focused != id || self.active != ix {
                 self.tabs[ix].focused = id;
                 self.active = ix;
@@ -1946,6 +2335,7 @@ impl Workspace {
         for p in self.tabs[ix].leaves() {
             self.unseen.remove(&p);
         }
+        self.touched.insert(id, crate::local::now());
         self.active = ix;
         self.tabs[ix].focused = id;
         match self.panes.get(&id).map(|p| &p.kind) {
@@ -1975,6 +2365,13 @@ impl Workspace {
                 window.focus(&l.read(cx).focus);
                 crate::browser::reclaim_keyboard(window);
             }
+            Some(PaneKind::Page(..)) => {
+                match self.page_focus.get(&id) {
+                    Some(f) => window.focus(f),
+                    None => window.blur(),
+                }
+                crate::browser::reclaim_keyboard(window);
+            }
             None => {}
         }
         self.inspector.data = Default::default();
@@ -1989,9 +2386,773 @@ impl Workspace {
         }
     }
 
+    /// Open the branch picker for the repository at `root`, its top-left
+    /// near `at` (it is moved to fit the window).
+    pub fn open_branch_picker(&mut self, root: PathBuf, at: gpui::Point<gpui::Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let out = std::process::Command::new("git")
+            .args(["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)\t%(committerdate:relative)", "refs/heads"])
+            .current_dir(&root)
+            .output();
+        let branches: Vec<(String, String)> = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let (b, w) = l.split_once('\t')?;
+                    Some((b.to_string(), w.replace(" ago", "")))
+                })
+                .collect(),
+            _ => return self.flash("Not a git repository.".to_string(), cx),
+        };
+        let field = cx.new(|cx| {
+            let mut f = crate::field::Field::new("Filter branches", cx);
+            f.bare = true;
+            f.popup = true;
+            f
+        });
+        let sub = cx.subscribe_in(&field, window, |ws, _, ev: &crate::field::FieldEvent, window, cx| {
+            use crate::field::FieldEvent;
+            let n = ws.branch_matches(cx).len();
+            match ev {
+                FieldEvent::Changed => {
+                    if let Some(p) = ws.branch_picker.as_mut() {
+                        p.sel = 0;
+                    }
+                }
+                FieldEvent::PopupKey("up") => {
+                    if let Some(p) = ws.branch_picker.as_mut() {
+                        p.sel = (p.sel + n.max(1) - 1) % n.max(1);
+                    }
+                }
+                FieldEvent::PopupKey("down") | FieldEvent::PopupKey("tab") => {
+                    if let Some(p) = ws.branch_picker.as_mut() {
+                        p.sel = (p.sel + 1) % n.max(1);
+                    }
+                }
+                FieldEvent::PopupKey("enter") | FieldEvent::Submit(_) => {
+                    let sel = ws.branch_picker.as_ref().map_or(0, |p| p.sel);
+                    if let Some(b) = ws.branch_matches(cx).get(sel).cloned() {
+                        ws.switch_branch(b, window, cx);
+                    }
+                }
+                FieldEvent::PopupKey("escape") | FieldEvent::Cancel => ws.close_branch_picker(window, cx),
+                _ => {}
+            }
+            cx.notify();
+        });
+        window.focus(&field.read(cx).focus);
+        let current = git_head(&root);
+        self.branch_picker = Some(BranchPicker { field, _sub: sub, branches, current, sel: 0, root, at });
+        cx.notify();
+    }
+
+    /// What to open on a host: its shell, an agent's own interface, or a
+    /// Deck chat whose agent runs there.
+    fn open_remote(&mut self, host: &str, dir: &str, what: RemoteOpen, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = if dir.trim().is_empty() { "~".to_string() } else { dir.trim().to_string() };
+        let opened = match what {
+            RemoteOpen::Terminal => self.new_tab(
+                Open::Terminal { cmd: Some(crate::remote::terminal_command(host, &dir, None)), cwd: None },
+                None,
+                window,
+                cx,
+            ),
+            RemoteOpen::Tui(agent) => self.new_tab(
+                Open::Terminal { cmd: Some(crate::remote::terminal_command(host, &dir, Some(agent.cmd))), cwd: None },
+                None,
+                window,
+                cx,
+            ),
+            RemoteOpen::Chat(agent) => {
+                let opened = self.new_tab(Open::Chat { agent: Some(agent.to_string()), cwd: None }, None, window, cx);
+                if let Ok(id) = &opened {
+                    if let Some(PaneKind::Chat(c)) = self.panes.get(id).map(|p| &p.kind) {
+                        let (host, dir) = (host.to_string(), PathBuf::from(&dir));
+                        c.update(cx, |c, cx| c.set_remote(host, dir, cx));
+                    }
+                }
+                opened
+            }
+        };
+        match opened {
+            Ok(_) => self.flash(format!("On {host}"), cx),
+            Err(e) => self.flash(format!("Couldn't open {host}: {e}"), cx),
+        }
+    }
+
+    fn open_remote_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = cx.new(|cx| {
+            // Empty means home (`open_remote` reads it as `~`).
+            let mut f = crate::field::Field::new("~  (home), or a folder such as ~/src/app", cx);
+            f.bare = true;
+            f.popup = true;
+            f
+        });
+        let sub = cx.subscribe_in(&field, window, |ws, _, ev: &crate::field::FieldEvent, window, cx| {
+            use crate::field::FieldEvent;
+            let Some(p) = ws.remote_picker.as_mut() else { return };
+            let n = p.hosts.len().max(1);
+            match ev {
+                FieldEvent::PopupKey("up") => p.sel = (p.sel + n - 1) % n,
+                FieldEvent::PopupKey("down") | FieldEvent::PopupKey("tab") => p.sel = (p.sel + 1) % n,
+                FieldEvent::PopupKey("enter") | FieldEvent::Submit(_) => {
+                    if let Some(h) = p.hosts.get(p.sel).map(|h| h.name.clone()) {
+                        let dir = p.field.read(cx).text().to_string();
+                        ws.close_remote_picker(window, cx);
+                        ws.open_remote(&h, &dir, RemoteOpen::Terminal, window, cx);
+                    }
+                }
+                FieldEvent::PopupKey("escape") | FieldEvent::Cancel => ws.close_remote_picker(window, cx),
+                _ => {}
+            }
+            cx.notify();
+        });
+        window.focus(&field.read(cx).focus);
+        self.remote_picker = Some(RemotePicker { hosts: crate::remote::hosts(), field, sel: 0, _sub: sub });
+        cx.notify();
+    }
+
+    fn close_remote_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_picker.take().is_some() {
+            if let Some(id) = self.focused() {
+                self.focus_pane(id, window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn render_remote_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = self.remote_picker.as_ref()?;
+        let dir = p.field.read(cx).text().to_string();
+        let agents: Vec<&'static Agent> = self
+            .installed
+            .iter()
+            .copied()
+            .filter(|a| matches!(a.cmd, "claude" | "codex" | "gemini" | "opencode"))
+            .collect();
+        // A quiet action: no border, a tint on hover; `primary` (the one ⏎
+        // opens) carries the tint at rest.
+        let action = |id: ElementId, primary: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(6.))
+                .h(u(26.))
+                .px(u(9.))
+                .rounded(u(6.))
+                .text_size(u(12.))
+                .text_color(rgb(if primary { theme::text() } else { theme::text_2() }))
+                .when(primary, |d| d.bg(rgba(theme::tint())))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(theme::tint())).text_color(rgb(theme::text())))
+        };
+        let mut list = div().id("remote-list").flex().flex_col().gap(u(2.)).max_h(u(380.)).overflow_y_scroll().p(u(6.));
+        for (i, h) in p.hosts.iter().enumerate() {
+            let selected = i == p.sel;
+            let mut row = div()
+                .id(ElementId::NamedInteger("host".into(), i as u64))
+                .flex()
+                .flex_col()
+                .gap(u(8.))
+                .px(u(10.))
+                .py(u(9.))
+                .rounded(u(8.))
+                .when(selected, |d| d.bg(rgb(theme::row_active())))
+                .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+                .on_hover(cx.listener(move |ws, hovered: &bool, _, cx| {
+                    if let Some(p) = ws.remote_picker.as_mut().filter(|p| *hovered && p.sel != i) {
+                        p.sel = i;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(10.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(u(28.))
+                                .rounded(u(7.))
+                                .bg(rgba(theme::tint()))
+                                .child(icon(Icon::Globe, 14., if selected { theme::text_2() } else { theme::dim() })),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .one_line()
+                                        .text_size(u(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(theme::text()))
+                                        .child(h.name.clone()),
+                                )
+                                .children((!h.detail.is_empty()).then(|| {
+                                    div().one_line().text_size(u(11.5)).text_color(rgb(theme::dim())).child(h.detail.clone())
+                                })),
+                        )
+                        .when(!selected, |d| d.child(icon(Icon::Terminal, 13., theme::dim()))),
+                );
+            if selected {
+                let (host, d) = (h.name.clone(), dir.clone());
+                let mut actions = div().flex().flex_wrap().items_center().gap(u(4.)).pl(u(38.)).child(
+                    action(ElementId::NamedInteger("host-term".into(), i as u64), true)
+                        .child(icon(Icon::Terminal, 12., theme::text_2()))
+                        .child("Terminal")
+                        .child(crate::kbd::key("⏎"))
+                        .on_click(cx.listener(move |ws, _, w, cx| {
+                            ws.close_remote_picker(w, cx);
+                            ws.open_remote(&host, &d, RemoteOpen::Terminal, w, cx);
+                        })),
+                );
+                for (j, a) in agents.iter().enumerate() {
+                    let (host, d, agent) = (h.name.clone(), dir.clone(), *a);
+                    let chat = self.chats.as_ref().is_some_and(|c| c.registry.get(&agent_core::AgentId::new(agent.cmd)).is_some());
+                    actions = actions.child(
+                        action(ElementId::Name(format!("host-{i}-{j}").into()), false)
+                            .child(icon(Icon::agent(agent.cmd), 12., Icon::agent(agent.cmd).brand().unwrap_or(theme::text_2())))
+                            .child(agent.name)
+                            .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, w, cx| {
+                                // A click: Deck's chat with it there (its own
+                                // interface when Deck has no chat for it);
+                                // ⌥-click: its own interface in a terminal.
+                                let what = if chat && !ev.modifiers().alt { RemoteOpen::Chat(agent.cmd) } else { RemoteOpen::Tui(agent) };
+                                ws.close_remote_picker(w, cx);
+                                ws.open_remote(&host, &d, what, w, cx);
+                            })),
+                    );
+                }
+                row = row.child(actions);
+            }
+            list = list.child(row);
+        }
+        if p.hosts.is_empty() {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(6.))
+                    .px(u(12.))
+                    .py(u(18.))
+                    .text_size(u(12.5))
+                    .text_color(rgb(theme::dim()))
+                    .child(div().text_color(rgb(theme::text_2())).child("No hosts yet"))
+                    .child("Add a Host to ~/.ssh/config, or run `deck remote add user@host --name box --key ~/box.pem`."),
+            );
+        }
+        let panel = div()
+            .id("remote-picker")
+            .absolute()
+            .top(u(72.))
+            .left_0()
+            .right_0()
+            .mx_auto()
+            .w(u(600.))
+            .flex()
+            .flex_col()
+            .rounded(u(12.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_lg()
+            .overflow_hidden()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(10.))
+                    .h(u(48.))
+                    .px(u(16.))
+                    .border_b_1()
+                    .border_color(rgba(theme::hairline()))
+                    .child(icon(Icon::Folder, 14., theme::dim()))
+                    .child(div().flex_1().text_size(u(13.5)).child(p.field.clone()))
+                    .child(crate::kbd::key("esc")),
+            )
+            .child(
+                div()
+                    .px(u(16.))
+                    .pt(u(10.))
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child(format!("Hosts · {}", p.hosts.len())),
+            )
+            .child(list)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(34.))
+                    .px(u(16.))
+                    .border_t_1()
+                    .border_color(rgba(theme::hairline()))
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child(crate::kbd::hints("↑↓ choose · ⏎ terminal · ⌥ click an agent for its own interface · esc close").gap_x(u(18.))),
+            );
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|ws, _, w, cx| ws.close_remote_picker(w, cx)),
+                )
+                .child(gpui::deferred(panel).with_priority(3))
+                .into_any_element(),
+        )
+    }
+
+    fn close_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branch_picker.take().is_some() {
+            if let Some(id) = self.focused() {
+                self.focus_pane(id, window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The branches the filter lets through, in order.
+    fn branch_matches(&self, cx: &App) -> Vec<String> {
+        let Some(p) = &self.branch_picker else { return Vec::new() };
+        let q = p.field.read(cx).text().to_lowercase();
+        p.branches.iter().map(|(b, _)| b).filter(|b| q.split_whitespace().all(|w| b.to_lowercase().contains(w))).cloned().collect()
+    }
+
+    /// `git switch` in the picker's repository; what git said if it would
+    /// not (uncommitted changes in the way).
+    fn switch_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.branch_picker.as_ref().map(|p| p.root.clone()) else { return };
+        self.close_branch_picker(window, cx);
+        let task = cx.background_executor().spawn(async move {
+            // One that does not exist yet is made from where you are.
+            let exists = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+                .current_dir(&root)
+                .status()
+                .is_ok_and(|s| s.success());
+            let args: Vec<&str> = if exists { vec!["switch", &branch] } else { vec!["switch", "-c", &branch] };
+            std::process::Command::new("git").args(&args).current_dir(&root).output().map(|o| (o, branch))
+        });
+        cx.spawn(async move |this, cx| {
+            let r = task.await;
+            let _ = this.update(cx, |ws, cx| {
+                match r {
+                    Ok((o, b)) if o.status.success() => ws.flash(format!("On {b}."), cx),
+                    Ok((o, _)) => {
+                        let why = String::from_utf8_lossy(&o.stderr);
+                        let why = why.lines().find(|l| l.starts_with("error")).unwrap_or("git would not switch").trim_start_matches("error: ");
+                        ws.flash(format!("Couldn't switch: {why}"), cx)
+                    }
+                    Err(e) => ws.flash(format!("Couldn't run git: {e}"), cx),
+                }
+                ws.refresh_bar_git(cx);
+                ws.refresh_inspector(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The branch switcher, over the status bar's branch: the current one
+    /// on top with its project, a filter, every branch with how long since
+    /// its last commit, and, for a name that matches none, "Create branch".
+    fn render_branch_picker(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = self.branch_picker.as_ref()?;
+        let matches = self.branch_matches(cx);
+        let when: HashMap<&str, &str> = p.branches.iter().map(|(b, w)| (b.as_str(), w.as_str())).collect();
+        const W: f32 = 320.;
+        let zoom = self.settings.zoom;
+        let vw = f32::from(window.viewport_size().width) / zoom;
+        let vh = f32::from(window.viewport_size().height) / zoom;
+        let left = (f32::from(p.at.x) / zoom).min(vw - W - 8.).max(8.);
+        // Above its anchor when it sits low (the status bar), else below.
+        let low = f32::from(p.at.y) / zoom > vh / 2.;
+        let typed = p.field.read(cx).text().trim().to_string();
+        let can_create = !typed.is_empty()
+            && !typed.contains(char::is_whitespace)
+            && !p.branches.iter().any(|(b, _)| *b == typed);
+        let project = p.root.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut list = div().id("branch-list").flex().flex_col().gap(u(1.)).max_h(u(300.)).overflow_y_scroll().p(u(4.));
+        for (i, b) in matches.iter().enumerate() {
+            let on = i == p.sel;
+            let current = p.current.as_deref() == Some(b.as_str());
+            let name = b.clone();
+            list = list.child(
+                div()
+                    .id(ElementId::NamedInteger("branch".into(), i as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(30.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .text_size(u(13.))
+                    .text_color(rgb(if on || current { theme::text() } else { theme::text_2() }))
+                    .when(on, |d| d.bg(rgba(theme::alpha(theme::text(), 0x12))))
+                    .when(!on, |d| d.hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
+                    .child(icon(Icon::Git, 12., if current { theme::accent() } else { theme::dim() }))
+                    .child(div().flex_1().min_w_0().one_line().when(current, |d| d.font_weight(FontWeight::MEDIUM)).child(b.clone()))
+                    .when(current, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .h(u(18.))
+                                .px(u(6.))
+                                .flex()
+                                .items_center()
+                                .rounded(u(4.))
+                                .bg(rgba(theme::alpha(theme::accent(), 0x22)))
+                                .text_size(u(10.5))
+                                .text_color(rgb(theme::accent()))
+                                .child("Current"),
+                        )
+                    })
+                    .children(when.get(b.as_str()).map(|w| div().flex_none().text_size(u(11.)).text_color(rgb(theme::dim())).child(w.to_string())))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |ws, _, window, cx| ws.switch_branch(name.clone(), window, cx))),
+            );
+        }
+        if matches.is_empty() && !can_create {
+            list = list.child(div().h(u(36.)).flex().items_center().justify_center().text_size(u(12.5)).text_color(rgb(theme::dim())).child("No branch matches"));
+        }
+        let action = |id: &'static str, glyph: Icon, label: String| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(u(8.))
+                .h(u(30.))
+                .px(u(8.))
+                .rounded(u(6.))
+                .cursor_pointer()
+                .text_size(u(12.5))
+                .text_color(rgb(theme::text_2()))
+                .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                .child(icon(glyph, 13., theme::dim()))
+                .child(div().flex_1().min_w_0().one_line().child(label))
+        };
+        let new_name = typed.clone();
+        let footer = div()
+            .flex()
+            .flex_col()
+            .gap(u(1.))
+            .p(u(4.))
+            .border_t_1()
+            .border_color(rgba(theme::hairline()))
+            .when(can_create, |d| {
+                d.child(
+                    action("branch-create", Icon::Plus, format!("Create branch “{new_name}” from here"))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |ws, _, window, cx| ws.switch_branch(new_name.clone(), window, cx))),
+                )
+            })
+            .child(
+                action("branch-changes", Icon::Files, "Open changes".to_string()).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|ws, _, window, cx| {
+                        ws.close_branch_picker(window, cx);
+                        if let Err(e) = ws.open_editor("changes", None, None, window, cx) {
+                            tracing::warn!("could not open the editor: {e}");
+                        }
+                    }),
+                ),
+            );
+        let panel = div()
+            .id("branch-picker")
+            .absolute()
+            .left(u(left))
+            .when(low, |d| d.bottom(u(vh - f32::from(p.at.y) / zoom + 6.)))
+            .when(!low, |d| d.top(u(f32::from(p.at.y) / zoom + 6.)))
+            .w(u(W))
+            .flex()
+            .flex_col()
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .h(u(34.))
+                    .px(u(12.))
+                    .text_size(u(12.))
+                    .child(div().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child("Switch branch"))
+                    .child(div().flex_1())
+                    .child(icon(Icon::Folder, 11., theme::dim()))
+                    .child(div().text_color(rgb(theme::dim())).child(project)),
+            )
+            .child(
+                // The filter: a field in the header, no box of its own.
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(34.))
+                    .mx(u(4.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .bg(rgba(theme::tint()))
+                    .child(icon(Icon::Search, 13., theme::dim()))
+                    .child(div().flex_1().child(p.field.clone())),
+            )
+            .child(list)
+            .child(footer)
+            .child(
+                div()
+                    .flex()
+                    .gap(u(12.))
+                    .h(u(26.))
+                    .px(u(12.))
+                    .items_center()
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child("↑↓ choose")
+                    .child("⏎ switch")
+                    .child("esc close"),
+            )
+            .with_animation(
+                "branch-picker-in",
+                Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                |d, t| d.opacity(t),
+            );
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, window, cx| ws.close_branch_picker(window, cx)))
+                .child(gpui::deferred(panel).with_priority(3))
+                .into_any_element(),
+        )
+    }
+
+    /// The import offer was answered: no browser pane shows it again.
+    fn answer_import_offer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for p in self.panes.values() {
+            if let PaneKind::Browser(b) = &p.kind {
+                b.update(cx, |b, cx| {
+                    b.import_offer = None;
+                    b.importing = false;
+                    cx.notify();
+                });
+            }
+        }
+        let mut next = self.settings.clone();
+        next.import_offered = true;
+        self.apply_settings(next, window, cx);
+    }
+
+    /// Import from the browser the offer named (the first one found):
+    /// history, bookmarks and its cookies, then the offer goes.
+    fn import_from_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(src) = crate::browser_import::sources().into_iter().next() else {
+            return self.answer_import_offer(window, cx);
+        };
+        for p in self.panes.values() {
+            if let PaneKind::Browser(b) = &p.kind {
+                b.update(cx, |b, cx| {
+                    b.importing = true;
+                    cx.notify();
+                });
+            }
+        }
+        let task = cx.background_executor().spawn(async move { crate::browser_import::import(&src, true) });
+        cx.spawn_in(window, async move |this, cx| {
+            let (report, jar) = task.await;
+            if !jar.is_empty() {
+                crate::browser_import::install_cookies(&jar);
+            }
+            let _ = this.update_in(cx, |ws, window, cx| {
+                ws.flash(report.summary(), cx);
+                ws.answer_import_offer(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Go to the next pane that wants you (a question, an approval, a bell),
+    /// after the one you are in, round the end.
+    fn next_needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let order: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.leaves()).collect();
+        let at = self.focused().and_then(|f| order.iter().position(|p| *p == f)).unwrap_or(0);
+        let next = (1..=order.len())
+            .map(|i| order[(at + i) % order.len()])
+            .find(|id| self.status(*id, cx) == Some(Status::Attention) || self.unseen.contains(id));
+        match next {
+            Some(id) => self.focus_pane(id, window, cx),
+            None => self.flash("Nothing needs you.".to_string(), cx),
+        }
+    }
+
+    /// Open the sidebar's filter (or focus it if open).
+    fn open_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar = true;
+        if let Some((f, _)) = &self.filter {
+            window.focus(&f.read(cx).focus);
+            return;
+        }
+        let field = cx.new(|cx| crate::field::Field::new("Filter tabs and threads", cx));
+        let sub = cx.subscribe_in(&field, window, |ws, _, ev: &crate::field::FieldEvent, window, cx| match ev {
+            crate::field::FieldEvent::Cancel => {
+                ws.filter = None;
+                if let Some(id) = ws.focused() {
+                    ws.focus_pane(id, window, cx);
+                }
+                cx.notify();
+            }
+            crate::field::FieldEvent::Submit(_) => {
+                // ⏎ opens the first row that matches.
+                if let Some(ix) = (0..ws.tabs.len()).find(|&ix| ws.row_matches(ix, cx)) {
+                    ws.filter = None;
+                    ws.activate(ix, window, cx);
+                }
+                cx.notify();
+            }
+            _ => cx.notify(),
+        });
+        window.focus(&field.read(cx).focus);
+        self.filter = Some((field, sub));
+        cx.notify();
+    }
+
+    /// The row passes the sidebar's filter: its title, project or second
+    /// line contain every word typed.
+    fn row_matches(&self, ix: usize, cx: &App) -> bool {
+        let Some((f, _)) = &self.filter else { return true };
+        let q = f.read(cx).text().to_lowercase();
+        if q.trim().is_empty() {
+            return true;
+        }
+        let Some(tab) = self.tabs.get(ix) else { return false };
+        let mut hay = self.pane_title(tab.focused, cx).to_lowercase();
+        for id in tab.leaves() {
+            if let Some(p) = self.places.get(&id) {
+                hay.push(' ');
+                hay.push_str(&p.project.to_lowercase());
+            }
+            if let Some(d) = self.row_detail(id, cx) {
+                hay.push(' ');
+                hay.push_str(&d.to_lowercase());
+            }
+        }
+        q.split_whitespace().all(|w| hay.contains(w))
+    }
+
+    /// A click on a sidebar row: ⌘ adds it to (or takes it from) the
+    /// selection, ⇧ selects the rows between the last one and it; a plain
+    /// click clears the selection and opens the row.
+    fn row_click(&mut self, ix: usize, m: gpui::Modifiers, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.tabs.get(ix).map(|t| t.leaves()[0]) else { return };
+        if m.platform {
+            if !self.picked.remove(&key) {
+                self.picked.insert(key);
+            }
+            self.pick_anchor = Some(key);
+            cx.notify();
+            return;
+        }
+        if m.shift {
+            let from = self.pick_anchor.and_then(|a| self.tab_of(a)).unwrap_or(self.active);
+            let (a, b) = if from <= ix { (from, ix) } else { (ix, from) };
+            for t in &self.tabs[a..=b] {
+                if !t.pinned {
+                    self.picked.insert(t.leaves()[0]);
+                }
+            }
+            self.pick_anchor = Some(key);
+            cx.notify();
+            return;
+        }
+        if !self.picked.is_empty() {
+            self.picked.clear();
+            cx.notify();
+        }
+        self.pick_anchor = Some(key);
+        self.activate(ix, window, cx);
+    }
+
+    fn row_picked(&self, ix: usize) -> bool {
+        self.tabs.get(ix).is_some_and(|t| self.picked.contains(&t.leaves()[0]))
+    }
+
+    /// Close every picked row.
+    fn close_picked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut ixs: Vec<usize> = std::mem::take(&mut self.picked).iter().filter_map(|id| self.tab_of(*id)).collect();
+        ixs.sort_unstable();
+        ixs.dedup();
+        for ix in ixs.into_iter().rev() {
+            if !self.tabs[ix].pinned {
+                self.close_tab(ix, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Close tabs nothing has happened in for a day: not pinned, not the
+    /// control chat, not working or waiting on you, not jobs.
+    fn close_idle_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = crate::local::now();
+        let old: Vec<usize> = (0..self.tabs.len())
+            .filter(|&ix| {
+                let t = &self.tabs[ix];
+                !t.pinned
+                    && !t.on_top
+                    && Some(ix) != self.settings_tab()
+                    && t.leaves().iter().all(|&id| {
+                        !matches!(self.status(id, cx), Some(Status::Working | Status::Attention))
+                            && now - self.last_active(id, cx) > 86_400
+                    })
+            })
+            .collect();
+        let n = old.len();
+        for ix in old.into_iter().rev() {
+            self.close_tab(ix, window, cx);
+        }
+        self.flash(
+            match n {
+                0 => "Nothing idle for a day.".to_string(),
+                1 => "Closed 1 tab idle for a day.".to_string(),
+                n => format!("Closed {n} tabs idle for a day."),
+            },
+            cx,
+        );
+    }
+
     /// Drop a pane for good. A closed chat thread is archived, not lost.
     fn discard(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        // A tab closed: its shell in the service ends too. (Quitting Deck
+        // discards nothing, so sessions outlive it.)
+        if let Some(name) = self.sessions.remove(&id) {
+            cx.background_executor().spawn(async move { crate::daemon::stop(&name) }).detach();
+        }
+        self.jobs.retain(|j| *j != id);
+        self.bg_used.remove(&id);
+        self.job_cmds.remove(&id);
+        if self.job_open == Some(id) {
+            self.job_open = None;
+        }
         self.working_since.remove(&id);
+        self.touched.remove(&id);
+        self.settled.remove(&id);
         self.restored_as.remove(&id);
         if let Some(Pane {
             kind: PaneKind::Chat(c),
@@ -2086,8 +3247,27 @@ impl Workspace {
             }
             _ => None,
         };
+        // Control, Settings and a task's work have places of their own.
+        let pinnable = !tab.pinned && Some(ix) != self.settings_tab() && !self.is_task_tab(tab, cx);
+        let on_top = tab.on_top;
         let ws = cx.entity().downgrade();
         let mut entries: Vec<Entry> = Vec::new();
+        if pinnable {
+            let pin = ws.clone();
+            entries.push(
+                Item::new(if on_top { "Unpin" } else { "Pin to Top" }, move |_, cx| {
+                    let _ = pin.update(cx, |ws, cx| {
+                        if let Some(ix) = ws.tab_of(pane) {
+                            ws.tabs[ix].on_top = !on_top;
+                            cx.notify();
+                        }
+                    });
+                })
+                .icon(Icon::Pin)
+                .into(),
+            );
+            entries.push(Entry::Separator);
+        }
         if let Some(url) = url {
             entries.push(
                 Item::new("Copy URL", move |_, cx| {
@@ -2098,6 +3278,97 @@ impl Workspace {
             );
             entries.push(Entry::Separator);
         }
+        let pick = ws.clone();
+        let picked_now = self.picked.contains(&pane) || self.tab_of(pane).is_some_and(|ix| self.row_picked(ix));
+        entries.push(
+            Item::new(if picked_now { "Deselect" } else { "Select" }, move |_, cx| {
+                let _ = pick.update(cx, |ws, cx| {
+                    if let Some(ix) = ws.tab_of(pane) {
+                        let key = ws.tabs[ix].leaves()[0];
+                        if !ws.picked.remove(&key) {
+                            ws.picked.insert(key);
+                        }
+                        ws.pick_anchor = Some(key);
+                        cx.notify();
+                    }
+                });
+            })
+            .icon(Icon::Check)
+            .into(),
+        );
+        entries.push(Entry::Separator);
+        // Where it works: a terminal there, Finder, its path, its files.
+        if let Some(dir) = self.cwd_of(pane, cx).filter(|d| d.is_dir()) {
+            let (term, reveal, copy, files) = (ws.clone(), dir.clone(), dir.clone(), ws.clone());
+            let (d1, d4) = (dir.clone(), dir.clone());
+            entries.push(
+                Item::new("Open Terminal Here", move |window, cx| {
+                    let d = d1.clone();
+                    let _ = term.update(cx, |ws, cx| {
+                        let _ = ws.new_tab(Open::Terminal { cmd: None, cwd: Some(d) }, None, window, cx);
+                    });
+                })
+                .icon(Icon::Terminal)
+                .into(),
+            );
+            entries.push(
+                Item::new("Open Files", move |window, cx| {
+                    let d = d4.clone();
+                    let _ = files.update(cx, |ws, cx| {
+                        let root = crate::inspect::project_root(&d);
+                        if let Err(e) = ws.open_editor("files", Some(root), None, window, cx) {
+                            tracing::warn!("could not open the editor: {e}");
+                        }
+                    });
+                })
+                .icon(Icon::Files)
+                .into(),
+            );
+            entries.push(
+                Item::new("Reveal in Finder", move |_, _| {
+                    let _ = std::process::Command::new("/usr/bin/open").arg(&reveal).spawn();
+                })
+                .icon(Icon::Folder)
+                .into(),
+            );
+            entries.push(
+                Item::new("Copy Path", move |_, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.display().to_string()))
+                })
+                .icon(Icon::Copy)
+                .into(),
+            );
+            entries.push(Entry::Separator);
+        }
+        if self.turn_marks.contains_key(&pane) {
+            let diff = ws.clone();
+            entries.push(
+                Item::new("Last Turn's Changes", move |window, cx| {
+                    let _ = diff.update(cx, |ws, cx| {
+                        ws.focus_pane(pane, window, cx);
+                        ws.show_turn_diff(window, cx);
+                    });
+                })
+                .icon(Icon::Files)
+                .into(),
+            );
+        }
+        let key = tab.leaves()[0];
+        let picked = self.picked.contains(&key);
+        let pick = ws.clone();
+        entries.push(
+            Item::new(if picked { "Deselect" } else { "Select" }, move |_, cx| {
+                let _ = pick.update(cx, |ws, cx| {
+                    if !ws.picked.remove(&key) {
+                        ws.picked.insert(key);
+                    }
+                    cx.notify();
+                });
+            })
+            .icon(Icon::Check)
+            .into(),
+        );
+        entries.push(Entry::Separator);
         let close = ws.clone();
         entries.push(
             Item::new(
@@ -2129,6 +3400,25 @@ impl Workspace {
                 },
             )
             .icon(Icon::CloseOthers)
+            .into(),
+        );
+        let idle = cx.entity().downgrade();
+        let picked_n = self.picked.len();
+        if picked_n > 0 {
+            let closer = cx.entity().downgrade();
+            entries.push(
+                Item::new(format!("Close {picked_n} Selected"), move |window, cx| {
+                    let _ = closer.update(cx, |ws, cx| ws.close_picked(window, cx));
+                })
+                .icon(Icon::Close)
+                .into(),
+            );
+        }
+        entries.push(
+            Item::new("Close Tabs Idle for a Day", move |window, cx| {
+                let _ = idle.update(cx, |ws, cx| ws.close_idle_tabs(window, cx));
+            })
+            .icon(Icon::Clock)
             .into(),
         );
         // A page on screen is a native view the menu cannot cover, so keep
@@ -2261,6 +3551,122 @@ impl Workspace {
         self.focus_pane(next, window, cx);
     }
 
+    /// Save the project of terminal agent `id` as a checkpoint (out of the
+    /// way of its branch, index and stash), off the main thread.
+    fn snapshot_turn(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        let is_agent = matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Terminal(_)))
+            && self.places.get(&id).is_some_and(|p| p.agent.is_some());
+        let Some(cwd) = is_agent.then(|| self.cwd_of(id, cx)).flatten() else { return };
+        let task = cx.background_executor().spawn(async move {
+            let root = crate::checkpoint::root(&cwd)?;
+            let refname = crate::checkpoint::refname(&format!("pane-{id}"), "turn");
+            crate::checkpoint::save(&root, &refname).ok().map(|c| (root, c))
+        });
+        cx.spawn(async move |this, cx| {
+            if let Some(found) = task.await {
+                let _ = this.update(cx, |ws, _| {
+                    ws.turn_marks.insert(id, found);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// What pane `id`'s agent changed since its turn began: `git diff`
+    /// against the snapshot, and the files it added.
+    fn turn_diff(&self, id: PaneId) -> Result<(PathBuf, String), String> {
+        let (root, commit) = self.turn_marks.get(&id).ok_or("no turn recorded for that pane yet: one starts when its agent starts working")?;
+        let out = std::process::Command::new("git")
+            .args(["diff", "--stat", "--patch", commit.trim()])
+            .current_dir(root)
+            .output()
+            .map_err(|e| e.to_string())?;
+        Ok((root.clone(), String::from_utf8_lossy(&out.stdout).into_owned()))
+    }
+
+    /// ⌘K "Last Turn's Changes": the focused agent's turn diff in a
+    /// terminal beside it, paged.
+    fn show_turn_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.focused() else { return };
+        let Some((root, commit)) = self.turn_marks.get(&id).cloned() else {
+            return self.flash("No agent turn recorded in this pane yet.".to_string(), cx);
+        };
+        let cmd = format!("git -c color.ui=always diff --stat --patch {} | less -R", commit.trim());
+        if let Err(e) = self.split(id, Open::Terminal { cmd: Some(cmd), cwd: Some(root) }, Axis::Row, window, cx) {
+            self.flash(format!("Couldn't show the diff: {e}"), cx);
+        }
+    }
+
+    /// A tab was looked at: first in the recently-used order, unless a
+    /// ⌃Tab walk is passing through it.
+    fn touch_mru(&mut self, ix: usize) {
+        let walking = self.mru_walk.is_some_and(|(_, at)| at.elapsed() < MRU_WALK);
+        let Some(key) = self.tabs.get(ix).map(|t| t.leaves()[0]) else { return };
+        if walking {
+            return;
+        }
+        self.mru.retain(|k| *k != key);
+        self.mru.insert(0, key);
+    }
+
+    /// ⌃Tab: the tab used before this one; pressed again within a moment,
+    /// the one before that, and so on, as app switchers do. Where the walk
+    /// stops becomes the most recent.
+    fn recent_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let keys: Vec<PaneId> = self.tabs.iter().map(|t| t.leaves()[0]).collect();
+        self.mru.retain(|k| keys.contains(k));
+        for k in &keys {
+            if !self.mru.contains(k) {
+                self.mru.push(*k);
+            }
+        }
+        if self.mru.len() < 2 {
+            return;
+        }
+        let walking = self.mru_walk.is_some_and(|(_, at)| at.elapsed() < MRU_WALK);
+        let pos = if walking {
+            self.mru_walk.map_or(0, |(p, _)| p)
+        } else {
+            // The last walk ended where it stopped: that tab is now first.
+            self.mru_walk = None;
+            self.touch_mru(self.active);
+            0
+        };
+        let n = self.mru.len() as isize;
+        let next = (pos as isize + step).rem_euclid(n) as usize;
+        self.mru_walk = Some((next, Instant::now()));
+        let key = self.mru[next];
+        if let Some(ix) = self.tab_of(key) {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// The focused pane, out of its split and into a tab of its own, in
+    /// front: a page or terminal that needs the whole window.
+    fn move_to_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.focused() else { return };
+        let Some(ix) = self.tab_of(id) else { return };
+        if self.tabs[ix].root == Node::Leaf(id) {
+            return self.flash("Already a tab of its own.".to_string(), cx);
+        }
+        let tab = &mut self.tabs[ix];
+        tab.root.remove(id);
+        if tab.focused == id {
+            tab.focused = tab.leaves()[0];
+        }
+        self.tabs.insert(
+            ix + 1,
+            Tab {
+                root: Node::Leaf(id),
+                focused: id,
+                pinned: false,
+                on_top: false,
+            },
+        );
+        self.focus_pane(id, window, cx);
+        cx.notify();
+    }
+
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             return;
@@ -2277,6 +3683,46 @@ impl Workspace {
     /// unless something visible changed.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ticks += 1;
+        // Terminal agents waiting on you, read off their screens.
+        let mut blocked = std::collections::HashSet::new();
+        let mut newly: Vec<(PaneId, String)> = Vec::new();
+        for (&id, pane) in &self.panes {
+            let PaneKind::Terminal(t) = &pane.kind else { continue };
+            let agent = pane.agent.map(|a| a.cmd).or_else(|| self.places.get(&id).and_then(|p| p.agent.as_ref().map(|(c, _)| *c)));
+            let Some(agent) = agent else { continue };
+            if let Some(why) = agent_blocked(agent, &t.read(cx).tail(24)) {
+                if !self.blocked.contains(&id) {
+                    newly.push((id, why.to_string()));
+                }
+                blocked.insert(id);
+            }
+        }
+        for (id, why) in newly {
+            self.alert(id, Some(why), window, cx);
+        }
+        if blocked != self.blocked {
+            self.blocked = blocked;
+            cx.notify();
+        }
+        if self.ticks % 30 == 0 {
+            self.close_idle_pages(window, cx);
+        }
+        if self.ticks % 2 == 0 && !self.daemon_asking {
+            self.daemon_asking = true;
+            let ask = cx.background_executor().spawn(async move { crate::daemon::list() });
+            cx.spawn_in(window, async move |this, cx| {
+                let jobs = ask.await;
+                let _ = this.update_in(cx, |ws, window, cx| {
+                    ws.daemon_asking = false;
+                    // No answer is not "no jobs": leave every pane as it is
+                    // (closing and reopening them is a flicker every 2 s).
+                    if let Ok(jobs) = jobs {
+                        ws.sync_daemon(jobs, window, cx);
+                    }
+                });
+            })
+            .detach();
+        }
         // Agent dots go idle on a timer, not on an event; repaint only when
         // one of them actually changes.
         let statuses: Vec<(PaneId, Status)> = self
@@ -2289,10 +3735,20 @@ impl Workspace {
         let focused = self.focused();
         let looking = window.is_window_active();
         let mut ask: Vec<(PaneId, String)> = Vec::new();
+        let stamp = crate::local::now();
         for (id, now) in &sorted {
             let was = self.statuses.iter().find(|(p, _)| p == id).map(|(_, s)| *s);
             if was == Some(Status::Working) && *now != Status::Working && focused != Some(*id) {
                 self.unseen.insert(*id);
+            }
+            // A terminal agent starting a turn: the project as it was, so
+            // the turn's changes can be shown (`deck pane diff --turn`).
+            if *now == Status::Working && was.is_some_and(|w| w != Status::Working) {
+                self.snapshot_turn(*id, cx);
+            }
+            // Began or stopped work, or started wanting you.
+            if was.is_some_and(|w| w != *now) {
+                self.touched.insert(*id, stamp);
             }
             // A chat that started waiting on you, while you look elsewhere.
             if *now == Status::Attention
@@ -2354,6 +3810,17 @@ impl Workspace {
         let working = sorted.iter().any(|(_, s)| *s == Status::Working);
         if sorted != self.statuses || working {
             self.statuses = sorted;
+            cx.notify();
+        }
+        // A pane is first touched when it opens; a chat keeps its own time.
+        for (id, pane) in &self.panes {
+            if !matches!(pane.kind, PaneKind::Chat(_)) {
+                self.touched.entry(*id).or_insert(stamp);
+            }
+        }
+        self.settle(cx);
+        // The sidebar's "5m"s move on.
+        if self.sidebar && self.ticks.is_multiple_of(30) {
             cx.notify();
         }
         if window.is_window_active() && self.ticks.is_multiple_of(2) {
@@ -2635,18 +4102,29 @@ impl Workspace {
         let conv = self.focused_agent(cx).and_then(|(_, conv)| conv);
         let title = self.focused().map(|id| self.pane_title(id, cx)).unwrap_or_default();
         let today = self.usage_open;
+        // Their records are read only when someone is looking at them.
+        let agent = self.focused_agent(cx).map(|(cmd, _)| cmd);
+        let others = today || matches!(agent, Some("opencode" | "gemini"));
         let work = cx.background_executor().spawn(async move {
             let claude = crate::usage::claude_limits();
             let codex = crate::usage::codex_limits();
+            // Kept by day, for the Usage page's limit history.
+            crate::usage::record_limits(claude.as_ref().ok(), codex.as_ref());
+            let others: Option<Vec<_>> = others.then(|| {
+                [crate::usage::opencode_today(), crate::usage::gemini_today()]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            });
             let session = conv.and_then(|(cwd, id)| {
                 let id = id.or_else(|| crate::usage::claude_latest_session(&cwd))?;
                 crate::usage::claude_session(&cwd, &id)
             });
             let today = today.then(crate::usage::claude_today);
-            (claude, codex, session, today)
+            (claude, codex, session, today, others)
         });
         cx.spawn(async move |this, cx| {
-            let (claude, codex, session, today) = work.await;
+            let (claude, codex, session, today, others) = work.await;
             let _ = this.update(cx, |ws, cx| {
                 let u = &mut ws.usage;
                 u.busy = false;
@@ -2656,6 +4134,9 @@ impl Workspace {
                 u.session = session.map(|s| (title, s));
                 if today.is_some() {
                     u.today = today;
+                }
+                if let Some(o) = others {
+                    u.others = o;
                 }
                 cx.notify();
             });
@@ -2688,10 +4169,17 @@ impl Workspace {
             .as_ref()
             .filter(|_| agent == Some("claude"))
             .map(|(_, s)| s.context_used as f32 / s.context_window.max(1) as f32 * 100.);
-        if top.is_none() && ctx.is_none() {
+        // OpenCode and Gemini CLI have no plan limits to show: their day.
+        let day = agent
+            .and_then(|a| self.usage.others.iter().find(|d| d.agent == a))
+            .filter(|_| top.is_none());
+        if top.is_none() && ctx.is_none() && day.is_none() {
             return None;
         }
-        let glyph = Icon::agent(if agent == Some("codex") { "codex" } else { "claude" });
+        let glyph = Icon::agent(match agent {
+            Some(a @ ("codex" | "opencode" | "gemini")) => a,
+            _ => "claude",
+        });
         let on = self.usage_open;
         Some(
             div()
@@ -2715,6 +4203,17 @@ impl Workspace {
                         .child(short_limit(&l.label))
                         .child(meter_bar(l.used_pct, 28.))
                         .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
+                        // When it frees up, in full colour so it reads at a
+                        // glance: "◷ resets in 2h 14m".
+                        .children(l.resets_at.and_then(until).map(|t| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(u(4.))
+                                .ml(u(4.))
+                                .child(icon(Icon::Clock, 11., theme::text_2()))
+                                .child(div().text_color(rgb(theme::text())).child(format!("resets in {t}")))
+                        }))
                 }))
                 .children(tight.map(|l| {
                     div()
@@ -2723,6 +4222,17 @@ impl Workspace {
                         .gap(u(4.))
                         .child(short_limit(&l.label))
                         .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
+                }))
+                .children(day.map(|d| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(4.))
+                        .child(div().text_color(rgb(theme::dim())).child("today"))
+                        .child(tokens(d.tokens))
+                        .when(d.cost_usd >= 0.01, |e| {
+                            e.child(div().text_color(rgb(theme::dim())).child(format!("· ${:.2}", d.cost_usd)))
+                        })
                 }))
                 .children(ctx.map(|pct| {
                     div()
@@ -2739,6 +4249,59 @@ impl Workspace {
 
     /// Open the usage panel over the status bar's meter or over the
     /// sidebar's Usage row, or shut it.
+    /// The usage numbers at a glance, over the sidebar's gauge on hover:
+    /// the plan's windows, the context, today's spend. No actions.
+    fn render_usage_card(&self) -> AnyElement {
+        let us = &self.usage;
+        let line = |k: String, pct: Option<f32>, v: String| {
+            div()
+                .flex()
+                .items_center()
+                .gap(u(8.))
+                .h(u(20.))
+                .child(div().flex_1().text_color(rgb(theme::text_2())).child(k))
+                .children(pct.map(|p| meter_bar(p, 48.)))
+                .child(div().min_w(u(40.)).flex().justify_end().text_color(rgb(pct.map_or(theme::text(), level_color))).child(v))
+        };
+        let mut col = div()
+            .absolute()
+            .bottom(u(32.))
+            .left_0()
+            .w(u(240.))
+            .p(u(10.))
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .text_size(u(12.));
+        if let Some(Ok(l)) = &us.claude {
+            for lim in &l.limits {
+                col = col.child(line(format!("Claude {}", lim.label), Some(lim.used_pct), pct_text(lim.used_pct)));
+            }
+        }
+        if let Some(l) = &us.codex {
+            for lim in &l.limits {
+                col = col.child(line(format!("Codex {}", lim.label), Some(lim.used_pct), pct_text(lim.used_pct)));
+            }
+        }
+        if let Some((_, s)) = &us.session {
+            let pct = s.context_used as f32 / s.context_window.max(1) as f32 * 100.;
+            col = col.child(line("Context".into(), Some(pct), pct_text(pct)));
+        }
+        if let Some(t) = &us.today {
+            col = col.child(line(
+                "Today".into(),
+                None,
+                t.cost_usd.map_or_else(|| tokens(t.output + t.input), |c| format!("${c:.2}")),
+            ));
+        }
+        col.child(div().pt(u(6.)).text_size(u(11.)).text_color(rgb(theme::dim())).child("Click for details"))
+            .into_any_element()
+    }
+
     fn toggle_usage(&mut self, by_sidebar: bool, cx: &mut Context<Self>) {
         let again = self.usage_open && self.usage_by_sidebar == by_sidebar;
         self.usage_open = !again;
@@ -2823,10 +4386,44 @@ impl Workspace {
         Some((short_limit(&top.label), top.used_pct))
     }
 
+    /// One of Deck's own pages at the foot of the sidebar: opens its tab,
+    /// lifted like an open row while it is the one you are in.
+    #[allow(dead_code)]
+    fn render_page_row(&self, kind: PageKind, glyph: Icon, cx: &mut Context<Self>) -> AnyElement {
+        let active = self
+            .focused()
+            .is_some_and(|id| matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Page(_, k)) if *k == kind));
+        let tone = if active { theme::text() } else { theme::text_2() };
+        let group: SharedString = format!("page-row-{}", kind.title()).into();
+        let key = match kind {
+            PageKind::Usage => "usage",
+            PageKind::Packages => "packages",
+        };
+        sidebar_row(div().id(ElementId::Name(group.clone())), 0., active, false)
+            .group(group.clone())
+            .h(u(ROW_ONE_LINE))
+            .pr(u(ROW_END + 3.))
+            .text_size(u(13.))
+            .text_color(rgb(tone))
+            .child(lead(icon(glyph, 15., tone)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .group_hover(group.clone(), |s| s.text_color(rgb(theme::text())))
+                    .child(kind.title()),
+            )
+            .children(keycap(hint(key, &self.settings.keys)).map(|k| k.invisible().group_hover(group, |s| s.visible())))
+            .on_click(cx.listener(move |ws, _, w, cx| ws.open_page(kind, w, cx)))
+            .into_any_element()
+    }
+
     /// Usage at the foot of the sidebar, above Settings: shut, how full the
     /// conversation's context is (or the plan's 5-hour window); a click
     /// opens the usage panel over it, with the context, the tokens and
     /// what is left of the plan.
+    #[allow(dead_code)]
     fn render_usage_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let on = self.usage_open && self.usage_by_sidebar;
         let tone = if on { theme::text() } else { theme::text_2() };
@@ -2861,76 +4458,114 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The usage panel over the status bar's end: plan limits with when
-    /// they reset, the conversation you are in, and today.
+    /// The usage panel over the status bar's end (or the sidebar's Usage
+    /// row): four tabs, Limits, This chat, Chats and Today, switched by
+    /// hovering or clicking. One height for all four, so switching never
+    /// makes it jump; the indicator slides, the content cross-fades.
     fn render_usage_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        const W: f32 = 340.;
+        const PAD: f32 = 14.;
+        const BODY_H: f32 = 330.;
         let us = &self.usage;
-        let section = |title: &str| {
+        let label = |text: &str| {
             div()
-                .pt(u(12.))
                 .pb(u(6.))
                 .text_size(u(11.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(theme::dim()))
-                .child(title.to_string())
+                .child(text.to_string())
         };
-        let row = |label: SharedString, pct: f32, note: Option<String>| {
+        let meter_row = |name: SharedString, pct: f32, note: Option<String>| {
             div()
                 .flex()
                 .flex_col()
                 .gap(u(5.))
-                .py(u(5.))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .child(div().flex_1().text_color(rgb(theme::text())).child(label))
-                        .child(div().text_color(rgb(level_color(pct))).child(pct_text(pct))),
+                        .gap(u(8.))
+                        .child(div().flex_1().text_color(rgb(theme::text())).child(name))
+                        .children(note.map(|n| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(n)))
+                        .child(div().w(u(38.)).flex().justify_end().text_color(rgb(level_color(pct))).child(pct_text(pct))),
                 )
                 .child(meter_bar(pct, 0.))
-                .children(note.map(|n| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(n)))
+        };
+        let agent_head = |mark: Icon, name: &str, plan: Option<String>| {
+            div()
+                .flex()
+                .items_center()
+                .gap(u(8.))
+                .child(icon(mark, 14., mark.brand().unwrap_or(theme::text())))
+                .child(div().flex_1().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(name.to_string()))
+                .children(plan.map(|p| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(p)))
         };
         let limits_block = |l: &crate::usage::Limits, name: &str| {
-            let mut col = div().flex().flex_col().child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(u(8.))
-                    .pt(u(4.))
-                    .child(icon(Icon::agent(l.agent), 14., theme::text()))
-                    .child(div().flex_1().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(name.to_string()))
-                    .children(l.plan.clone().map(|p| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(p))),
-            );
+            let mut col = div().flex().flex_col().gap(u(10.)).child(agent_head(Icon::agent(l.agent), name, l.plan.clone()));
             for lim in &l.limits {
-                col = col.child(row(lim.label.clone().into(), lim.used_pct, lim.resets_at.map(resets_in)));
+                col = col.child(meter_row(lim.label.clone().into(), lim.used_pct, lim.resets_at.map(resets_in)));
             }
             col
         };
-        let mut body = div().flex().flex_col().text_size(u(12.5));
+        let stat = |k: &str, v: String| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(u(2.))
+                .flex_1()
+                .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(k.to_string()))
+                .child(div().text_size(u(14.)).font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(v))
+        };
+        let empty = |text: &str| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(theme::dim()))
+                .child(text.to_string())
+        };
+
+        // Limits: each agent's plan windows.
+        let mut limits = div().flex().flex_col().gap(u(20.));
         match &us.claude {
-            Some(Ok(l)) => body = body.child(limits_block(l, "Claude")),
-            Some(Err(e)) => {
-                body = body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(u(8.))
-                        .pt(u(4.))
-                        .child(icon(Icon::Claude, 14., theme::text()))
-                        .child(div().flex_1().text_color(rgb(theme::text_2())).child(e.clone())),
-                )
-            }
-            None => body = body.child(div().pt(u(4.)).text_color(rgb(theme::dim())).child("Reading usage…")),
+            Some(Ok(l)) => limits = limits.child(limits_block(l, "Claude")),
+            Some(Err(e)) => limits = limits.child(agent_head(Icon::Claude, "Claude", None)).child(div().text_color(rgb(theme::text_2())).child(e.clone())),
+            None => limits = limits.child(div().text_color(rgb(theme::dim())).child("Reading usage…")),
         }
-        // A chat whose agent deck cannot read the transcript of (OpenCode,
-        // Codex, Gemini) speaks for itself: its own reports.
+        if let Some(l) = &us.codex {
+            limits = limits.child(limits_block(l, "Codex"));
+        }
+        // Agents without plan limits (OpenCode, Gemini CLI, Grok…): what
+        // they used today, so every installed agent is on this tab.
+        for a in self.installed.iter().filter(|a| !matches!(a.cmd, "claude" | "codex")) {
+            let mark = Icon::agent(a.cmd);
+            let day = us.others.iter().find(|d| d.agent == a.cmd);
+            let note = match day {
+                Some(d) if d.cost_usd >= 0.01 => format!("Today {} replies · {} · ${:.2}", d.replies, tokens(d.tokens), d.cost_usd),
+                Some(d) => format!("Today {} replies · {} tokens", d.replies, tokens(d.tokens)),
+                None => "Nothing used today".to_string(),
+            };
+            limits = limits.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(4.))
+                    .child(agent_head(mark, a.name, Some("No plan limits".into())))
+                    .child(div().pl(u(22.)).text_size(u(11.5)).text_color(rgb(theme::dim())).child(note)),
+            );
+        }
+
+        // This chat: the conversation you are in.
         let reported = us.session.is_none().then(|| self.focused_chat_usage(cx)).flatten();
-        if let Some((title, s)) = &us.session {
+        let chat: AnyElement = if let Some((title, s)) = &us.session {
             let pct = s.context_used as f32 / s.context_window.max(1) as f32 * 100.;
-            body = body
-                .child(section("This conversation"))
-                .child(div().one_line().text_color(rgb(theme::text())).child(title.clone()))
-                .child(row(
+            div()
+                .flex()
+                .flex_col()
+                .gap(u(18.))
+                .child(div().one_line().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(title.clone()))
+                .child(meter_row(
                     "Context".into(),
                     pct,
                     Some(format!(
@@ -2940,64 +4575,55 @@ impl Workspace {
                         s.model.as_deref().map(|m| format!(" · {}", crate::usage::model_name(m))).unwrap_or_default()
                     )),
                 ))
+                .child(div().flex().gap(u(12.)).child(stat("Turns", s.turns.to_string())).child(stat("Cost", s.cost_usd.map_or("—".into(), |c| format!("${c:.2}")))))
                 .child(
                     div()
-                        .text_size(u(11.))
-                        .text_color(rgb(theme::dim()))
-                        .child(format!(
-                            "{} turns · {} in · {} out · {} cached{}",
-                            s.turns,
-                            tokens(s.input),
-                            tokens(s.output),
-                            tokens(s.cache_read),
-                            s.cost_usd.map(|c| format!(" · ${c:.2}")).unwrap_or_default()
-                        )),
-                );
+                        .flex()
+                        .gap(u(12.))
+                        .child(stat("In", tokens(s.input)))
+                        .child(stat("Out", tokens(s.output)))
+                        .child(stat("Cached", tokens(s.cache_read))),
+                )
+                .into_any_element()
         } else if let Some(c) = &reported {
             let u_ = &c.usage;
             let who = match &c.model {
                 Some(m) => format!("{} · {m}", c.agent),
                 None => c.agent.to_string(),
             };
-            body = body
-                .child(section("This conversation"))
-                .child(div().one_line().text_color(rgb(theme::text())).child(c.title.clone()));
-            body = match (u_.context_used(), u_.context_window) {
-                (Some(f), Some(w)) => body.child(row(
-                    "Context".into(),
-                    f * 100.,
-                    Some(format!("{} of {} · {who}", tokens(u_.context), tokens(w))),
-                )),
-                _ if u_.context > 0 => body.child(
-                    div()
-                        .py(u(5.))
-                        .text_color(rgb(theme::text_2()))
-                        .child(format!("{} in context · {who}", tokens(u_.context))),
-                ),
-                _ => body.child(div().py(u(5.)).text_color(rgb(theme::text_2())).child(who)),
+            let mut col = div()
+                .flex()
+                .flex_col()
+                .gap(u(18.))
+                .child(div().one_line().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(c.title.clone()));
+            col = match (u_.context_used(), u_.context_window) {
+                (Some(f), Some(w)) => col.child(meter_row("Context".into(), f * 100., Some(format!("{} of {} · {who}", tokens(u_.context), tokens(w))))),
+                _ => col.child(div().text_color(rgb(theme::text_2())).child(who)),
             };
-            body = body.child(
+            col.child(
                 div()
-                    .text_size(u(11.))
-                    .text_color(rgb(theme::dim()))
-                    .child(format!(
-                        "{} in · {} out · {} cached{}",
-                        tokens(u_.input),
-                        tokens(u_.output),
-                        tokens(u_.cache_read + u_.cache_write),
-                        u_.cost_usd.filter(|c| *c > 0.).map(|c| format!(" · ${c:.2}")).unwrap_or_default()
-                    )),
-            );
-        }
-        // Every chat open here, by what it spent: one click to the one
-        // that costs the most.
+                    .flex()
+                    .gap(u(12.))
+                    .child(stat("In", tokens(u_.input)))
+                    .child(stat("Out", tokens(u_.output)))
+                    .child(stat("Cached", tokens(u_.cache_read + u_.cache_write)))
+                    .child(stat("Cost", u_.cost_usd.filter(|c| *c > 0.).map_or("—".into(), |c| format!("${c:.2}")))),
+            )
+            .into_any_element()
+        } else {
+            empty("Open a chat to see its context and spend").into_any_element()
+        };
+
+        // Chats: every chat in this window by what it spent.
         let spend = self.chat_spend(cx);
-        if spend.len() > 1 {
-            let focused = self.focused();
-            let mut list = div().flex().flex_col().gap(u(1.));
-            for c in spend.iter().take(5) {
+        let focused = self.focused();
+        let chats: AnyElement = if spend.is_empty() {
+            empty("No chats have spent anything yet").into_any_element()
+        } else {
+            let mut list = div().flex().flex_col().gap(u(1.)).mx(u(-6.));
+            for c in spend.iter().take(8) {
                 let pane = c.pane;
-                let figure = match c.usage.cost_usd.filter(|v| *v > 0.) {
+                let figure = match c.usage.cost_usd.filter(|v| *v >= 0.01) {
                     Some(v) => format!("${v:.2}"),
                     None => tokens(c.usage.tokens()),
                 };
@@ -3007,18 +4633,26 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap(u(8.))
-                        .h(u(28.))
-                        // Rows bleed into the panel's padding so their hover
-                        // has room.
-                        .mx(u(-6.))
+                        .h(u(36.))
                         .px(u(6.))
-                        .rounded(u(6.))
+                        .rounded(u(7.))
                         .cursor_pointer()
                         .when(focused == Some(pane), |d| d.bg(rgb(theme::surface())))
                         .when(focused != Some(pane), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-                        .child(icon(c.mark, 13., theme::text_2()))
-                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text())).child(c.title.clone()))
-                        .child(div().flex_none().text_size(u(11.)).text_color(rgb(theme::text_2())).child(figure))
+                        .child(icon(c.mark, 13., c.mark.brand().unwrap_or(theme::text_2())))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().w_full().one_line().text_color(rgb(theme::text())).child(c.title.clone()))
+                                .child(div().w_full().one_line().text_size(u(10.5)).text_color(rgb(theme::dim())).child(match &c.model {
+                                    Some(m) => format!("{} · {m}", c.agent),
+                                    None => c.agent.to_string(),
+                                })),
+                        )
+                        .child(div().flex_none().text_size(u(11.5)).text_color(rgb(theme::text_2())).child(figure))
                         .on_click(cx.listener(move |ws, _, window, cx| {
                             ws.usage_open = false;
                             ws.focus_pane(pane, window, cx);
@@ -3026,30 +4660,122 @@ impl Workspace {
                         })),
                 );
             }
-            body = body.child(section("Chats in this window")).child(list);
-        }
+            list.into_any_element()
+        };
+
+        // Today: Claude Code across projects, and agents with no limits.
+        let mut today = div().flex().flex_col().gap(u(18.));
         if let Some(t) = &us.today {
-            body = body.child(section("Today, all projects")).child(
+            today = today
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(u(10.))
+                        .child(agent_head(Icon::Claude, "Claude Code", Some(format!("{} conversations", t.sessions))))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(u(12.))
+                                .child(stat("Cost", t.cost_usd.map_or("—".into(), |c| format!("${c:.2}"))))
+                                .child(stat("Written", tokens(t.output)))
+                                .child(stat("New in", tokens(t.input + t.cache_write)))
+                                .child(stat("Cached", tokens(t.cache_read))),
+                        ),
+                );
+        }
+        for d in &us.others {
+            let name = AGENTS.iter().find(|a| a.cmd == d.agent).map_or(d.agent, |a| a.name);
+            today = today.child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(u(2.))
-                    .child(div().text_color(rgb(theme::text_2())).child(format!(
-                        "{} conversations{}",
-                        t.sessions,
-                        t.cost_usd.map(|c| format!(" · ${c:.2} at API prices")).unwrap_or_default()
-                    )))
-                    .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(format!(
-                        "{} written · {} new in · {} read from cache",
-                        tokens(t.output),
-                        tokens(t.input + t.cache_write),
-                        tokens(t.cache_read)
-                    ))),
+                    .gap(u(10.))
+                    .child(agent_head(Icon::agent(d.agent), name, d.model.clone().map(|m| crate::usage::model_name(&m))))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(u(12.))
+                            .child(stat("Cost", if d.cost_usd >= 0.01 { format!("${:.2}", d.cost_usd) } else { "—".into() }))
+                            .child(stat("Replies", d.replies.to_string()))
+                            .child(stat("Tokens", tokens(d.tokens))),
+                    ),
             );
         }
-        if let Some(l) = &us.codex {
-            body = body.child(div().pt(u(10.)).child(limits_block(l, "Codex")));
+        if us.today.is_none() && us.others.is_empty() {
+            today = today.child(empty("Nothing used yet today"));
         }
+
+        let tab = self.usage_tab.min(3);
+        let prev = self.usage_tab_prev.min(3);
+        let names = ["Limits", "This chat", "Chats", "Today"];
+        let tab_w = (W - PAD * 2. - 4.) / 4.;
+        let mut tabs = div()
+            .relative()
+            .flex()
+            .h(u(28.))
+            .p(u(2.))
+            .rounded(u(8.))
+            .bg(rgba(theme::tint()))
+            // The indicator under the tabs, sliding from the last tab to
+            // this one.
+            .child(
+                div()
+                    .absolute()
+                    .top(u(2.))
+                    .h(u(24.))
+                    .w(u(tab_w))
+                    .rounded(u(6.))
+                    .bg(rgb(theme::row_active()))
+                    .border_1()
+                    .border_color(rgba(theme::hairline()))
+                    .with_animation(
+                        ElementId::NamedInteger("usage-ind".into(), (prev * 4 + tab) as u64 + self.usage_tab_moves * 16),
+                        Animation::new(Duration::from_millis(150)).with_easing(gpui::ease_out_quint()),
+                        move |d, t| d.left(u(2. + (prev as f32 + (tab as f32 - prev as f32) * t) * tab_w)),
+                    ),
+            );
+        for (i, name) in names.iter().enumerate() {
+            let on = i == tab;
+            tabs = tabs.child(
+                div()
+                    .id(ElementId::NamedInteger("usage-tab".into(), i as u64))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(u(tab_w))
+                    .h(u(24.))
+                    .text_size(u(12.))
+                    .cursor_pointer()
+                    .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
+                    .when(on, |d| d.font_weight(FontWeight::MEDIUM))
+                    .hover(|s| s.text_color(rgb(theme::text())))
+                    .on_hover(cx.listener(move |ws, over: &bool, _, cx| {
+                        if *over {
+                            ws.set_usage_tab(i, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |ws, _, _, cx| ws.set_usage_tab(i, cx)))
+                    .child(*name),
+            );
+        }
+        let content: AnyElement = match tab {
+            0 => limits.into_any_element(),
+            1 => chat,
+            2 => chats,
+            _ => today.into_any_element(),
+        };
+        let body = div()
+            .id("usage-body")
+            .flex()
+            .flex_col()
+            .h(u(BODY_H))
+            .pt(u(16.))
+            .overflow_y_scroll()
+            .child(div().flex().flex_col().min_h_full().child(label(names[tab])).child(content))
+;
+
         let updated = us.at.map(|t| match t.elapsed().as_secs() {
             0..=9 => "Updated just now".to_string(),
             s if s < 120 => format!("Updated {s}s ago"),
@@ -3077,27 +4803,27 @@ impl Workspace {
                     .id("usage-panel")
                     .absolute()
                     .when(by_sidebar, |d| {
-                        d.bottom(u(bar + theme::GUTTER + ROW_ONE_LINE * 2. + 2. + 6.)).left(u(theme::GUTTER))
+                        d.bottom(u(bar + theme::GUTTER + 34. + 6. + 6.)).left(u(theme::GUTTER))
                     })
                     .when(!by_sidebar, |d| d.bottom(u(bar + 6.)).right(u(theme::GUTTER)))
-                    .w(u(320.))
-                    .max_h(gpui::relative(0.8))
-                    .overflow_y_scroll()
+                    .w(u(W))
                     .flex()
                     .flex_col()
-                    .p(u(14.))
+                    .p(u(PAD))
                     .rounded(u(12.))
                     .bg(rgb(theme::menu()))
                     .border_1()
-                    .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
-                    .shadow_lg()
+                    .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                    .text_size(u(12.5))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(tabs)
                     .child(body)
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .mt(u(12.))
+                            .gap(u(4.))
+                            .mt(u(10.))
                             .pt(u(10.))
                             .border_t_1()
                             .border_color(rgba(theme::hairline()))
@@ -3105,13 +4831,46 @@ impl Workspace {
                             .text_color(rgb(theme::dim()))
                             .child(div().flex_1().child(updated.unwrap_or_default()))
                             .child(
+                                div()
+                                    .id("usage-open-page")
+                                    .flex()
+                                    .items_center()
+                                    .gap(u(4.))
+                                    .h(u(22.))
+                                    .px(u(7.))
+                                    .rounded(u(6.))
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::text_2()))
+                                    .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                                    .child(icon(Icon::Chart, 12., theme::text_2()))
+                                    .child("History")
+                                    .on_click(cx.listener(|ws, _, w, cx| {
+                                        ws.usage_open = false;
+                                        ws.open_page(PageKind::Usage, w, cx);
+                                    })),
+                            )
+                            .child(
                                 icon_button("usage-refresh", Icon::Refresh)
                                     .size(u(22.))
                                     .on_click(cx.listener(|ws, _, _, cx| ws.refresh_usage(cx))),
                             ),
+                    )
+                    .with_animation(
+                        "usage-panel-in",
+                        Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                        |d, t| d.opacity(t).mb(u(-4. * (1. - t))),
                     ),
             )
             .into_any_element()
+    }
+
+    fn set_usage_tab(&mut self, tab: usize, cx: &mut Context<Self>) {
+        if tab != self.usage_tab {
+            self.usage_tab_prev = self.usage_tab;
+            self.usage_tab = tab;
+            self.usage_tab_moves += 1;
+            cx.notify();
+        }
     }
 
     /// The focused pane's project and branch, read from `.git` itself so it
@@ -3188,7 +4947,7 @@ impl Workspace {
                 }
                 PaneKind::Launcher(l) => l.read(cx).cwd.clone(),
                 PaneKind::Review(r) => Some(r.read(cx).task.worktree.clone()),
-                PaneKind::Browser(_) | PaneKind::Chat(_) | PaneKind::Settings(_) => None,
+                PaneKind::Browser(_) | PaneKind::Chat(_) | PaneKind::Settings(_) | PaneKind::Page(..) => None,
             })
     }
 
@@ -3220,6 +4979,12 @@ impl Workspace {
         }
         let zoomed = next.zoom != self.settings.zoom;
         let themed = next.theme != self.settings.theme;
+        // Agents follow: Claude Code takes its ANSI theme, which draws
+        // with the terminal palette Deck sets for this theme.
+        if themed && next.match_agent_themes {
+            let dark = next.theme.colors(crate::theme::is_dark()).dark;
+            std::thread::spawn(move || crate::shell::match_agent_themes(dark));
+        }
         if next.keys != self.settings.keys {
             rebind(cx, &next.keys);
         }
@@ -3253,7 +5018,7 @@ impl Workspace {
                     let settings = self.settings.clone();
                     s.update(cx, |s, cx| s.sync(&settings, None, cx))
                 }
-                PaneKind::Chat(_) | PaneKind::Launcher(_) | PaneKind::Review(_) => {}
+                PaneKind::Chat(_) | PaneKind::Launcher(_) | PaneKind::Review(_) | PaneKind::Page(..) => {}
             }
         }
         if zoomed || themed {
@@ -3390,11 +5155,51 @@ impl Workspace {
         cx.notify();
     }
 
+    /// ⌃K (actions) or ⌘P (tabs): the palette narrowed to one kind. Its
+    /// own key again closes it; another palette's key switches to that one.
+    fn toggle_scoped_palette(&mut self, scope: crate::palette::Scope, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::palette::Kind;
+        if self.palette.is_some() {
+            let same = self.palette_scope == Some(scope);
+            self.close_palette(window, cx);
+            if same {
+                return;
+            }
+        }
+        let want = match scope {
+            crate::palette::Scope::Actions => Kind::Action,
+            crate::palette::Scope::Tabs => Kind::Tab,
+            crate::palette::Scope::All => return self.toggle_palette(false, window, cx),
+        };
+        let from = self.focused();
+        let items: Vec<Item> = self.palette_items(cx).into_iter().filter(|i| i.kind == want).collect();
+        let palette = cx.new(|cx| Palette::scoped(items, scope, cx));
+        let sub = cx.subscribe_in(&palette, window, move |ws, _, ev: &PaletteEvent, window, cx| match ev {
+            PaletteEvent::Close => ws.close_palette(window, cx),
+            PaletteEvent::Run(pick) => {
+                let pick = pick.clone();
+                ws.close_palette(window, cx);
+                ws.run_pick(pick, window, cx);
+            }
+            PaletteEvent::Query(_) => {}
+        });
+        let focus = palette.read(cx).focus(cx);
+        self.palette = Some((palette, from, sub));
+        self.palette_scope = Some(scope);
+        window.focus(&focus);
+        crate::browser::reclaim_keyboard(window);
+        cx.notify();
+    }
+
     fn toggle_palette(&mut self, snippets_only: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
+            let same = self.palette_scope == Some(crate::palette::Scope::All) || snippets_only;
             self.close_palette(window, cx);
-            return;
+            if same {
+                return;
+            }
         }
+        self.palette_scope = Some(crate::palette::Scope::All);
         let from = self.focused();
         let cwd = self.focused_cwd(cx).unwrap_or_else(|| self.cwd.clone());
         let in_repo = cwd.ancestors().any(|d| d.join(".git").exists());
@@ -3482,6 +5287,7 @@ impl Workspace {
     }
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_scope = None;
         if let Some((_, from, _)) = self.palette.take() {
             if let Some(id) = from.filter(|id| self.panes.contains_key(id)) {
                 self.focus_pane(id, window, cx);
@@ -3495,7 +5301,7 @@ impl Workspace {
     fn cover_pages(&self, covered: bool, cx: &mut Context<Self>) {
         for pane in self.panes.values() {
             if let PaneKind::Browser(b) = &pane.kind {
-                b.update(cx, |b, _| b.set_covered(covered));
+                b.update(cx, |b, cx| b.set_covered(covered, cx));
             }
         }
     }
@@ -3648,6 +5454,55 @@ impl Workspace {
                 Box::new(OpenSettings),
             ),
             action(
+                "Usage",
+                "Cost and tokens by day and model",
+                Icon::Chart,
+                key("usage"),
+                Box::new(OpenUsage),
+            ),
+            action(
+                "Packages",
+                "This project's dependencies, outdated ones and the registry",
+                Icon::Package,
+                key("packages"),
+                Box::new(OpenPackages),
+            ),
+            action(
+                "Connect to Host…",
+                "A terminal, an agent or a chat on a machine over SSH",
+                Icon::Globe,
+                key("connect-host"),
+                Box::new(ConnectHost),
+            ),
+            action(
+                "Last Turn's Changes",
+                "What the agent in this terminal changed since its turn began",
+                Icon::Files,
+                None,
+                Box::new(ShowTurnDiff),
+            ),
+            action(
+                "Move Pane to New Tab",
+                "The focused pane out of its split, into a tab of its own",
+                Icon::Maximize,
+                key("move-to-tab"),
+                Box::new(MoveToTab),
+            ),
+            action(
+                "Close Tabs Idle for a Day",
+                "Tabs and threads untouched since yesterday; pinned ones stay",
+                Icon::Close,
+                None,
+                Box::new(CloseIdleTabs),
+            ),
+            action(
+                "Import from Browser",
+                "History, bookmarks and sign-ins from Chrome, Arc, Brave, Edge or Safari",
+                Icon::Import,
+                None,
+                Box::new(ImportBrowserData),
+            ),
+            action(
                 "Split Right",
                 "",
                 Icon::Split,
@@ -3702,6 +5557,13 @@ impl Workspace {
                 Icon::Sidebar,
                 key("sidebar"),
                 Box::new(ToggleSidebar),
+            ),
+            action(
+                "Sidebar by Project or Time",
+                "Projects, or Now, Today, Yesterday…",
+                Icon::Clock,
+                key("sidebar-view"),
+                Box::new(ToggleSidebarView),
             ),
             action(
                 "Toggle Inspector",
@@ -3872,6 +5734,26 @@ impl Workspace {
     /// A script or terminal link macOS opened deck with: a new terminal tab
     /// running it, in front.
     fn open_handled(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = url.strip_prefix("deck://job/") {
+            let name = crate::handler::percent_decode(name);
+            cx.activate(true);
+            window.activate_window();
+            // A terminal tab's session: go to its tab.
+            if let Some(id) = self.sessions.iter().find(|(_, n)| **n == name).map(|(id, _)| *id) {
+                self.focus_pane(id, window, cx);
+                return;
+            }
+            match self.named.get(&name).copied().filter(|id| self.panes.contains_key(id)) {
+                Some(id) => self.show_job(id, window, cx),
+                None => self.show_when_attached = Some(name),
+            }
+            return;
+        }
+        if url.starts_with("deck://open") {
+            cx.activate(true);
+            window.activate_window();
+            return;
+        }
         if url.starts_with("deck://") {
             self.deck_url(url, cx);
             cx.activate(true);
@@ -3927,6 +5809,81 @@ impl Workspace {
     fn mark_default_terminal_asked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut next = self.settings.clone();
         next.asked_default_terminal = true;
+        self.apply_settings(next, window, cx);
+        self.offer_permissions(cx);
+    }
+
+    /// Once, on a first launch (after the default-terminal question): when
+    /// Deck or its background service lacks Full Disk Access, say what that
+    /// breaks and open the way to it. The service's answer is asked off the
+    /// main thread; it may still be starting.
+    fn offer_permissions(&mut self, cx: &mut Context<Self>) {
+        use crate::privacy::{Permission, State};
+        if self.settings.asked_permissions || self.notice.is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let (app, service) = cx
+                .background_executor()
+                .spawn(async move {
+                    // The service starts with Deck; give it a moment to answer.
+                    let mut service = State::Unknown;
+                    for _ in 0..20 {
+                        service = crate::privacy::service_full_disk();
+                        if service != State::Unknown {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    (Permission::FullDisk.state(), service)
+                })
+                .await;
+            let missing: Vec<&str> = [(app, "Deck"), (service, "its background service (deckd)")]
+                .into_iter()
+                .filter(|(s, _)| *s == State::Off)
+                .map(|(_, who)| who)
+                .collect();
+            if missing.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |ws, cx| {
+                if ws.notice.is_some() || ws.settings.asked_permissions {
+                    return;
+                }
+                ws.notice = Some(Notice {
+                    title: "Give Deck Full Disk Access?".into(),
+                    detail: Some(
+                        format!(
+                            "{} cannot read Downloads, Desktop or Documents yet, so terminals and agents fail there (an SSH key in Downloads gives \"Operation not permitted\"). Settings › Permissions shows what is on and opens each pane.",
+                            missing.join(" and ")
+                        )
+                        .into(),
+                    ),
+                    buttons: vec![
+                        (
+                            "Open Permissions".into(),
+                            Rc::new(|ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                                ws.mark_permissions_asked(window, cx);
+                                ws.open_settings_at(crate::settings_pane::Page::Permissions, window, cx);
+                            }),
+                        ),
+                        (
+                            "Not Now".into(),
+                            Rc::new(|ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                                ws.mark_permissions_asked(window, cx)
+                            }),
+                        ),
+                    ],
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn mark_permissions_asked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut next = self.settings.clone();
+        next.asked_permissions = true;
         self.apply_settings(next, window, cx);
     }
 
@@ -4749,6 +6706,22 @@ impl Workspace {
     }
 
     /// ⌘,: the one Settings tab, opened or brought forward.
+    /// One of Deck's own pages: the tab it has, or a new one.
+    fn open_page(&mut self, kind: PageKind, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.panes.iter().find_map(|(id, p)| match p.kind {
+            PaneKind::Page(_, k) if k == kind => Some(*id),
+            _ => None,
+        });
+        match existing {
+            Some(id) => self.focus_pane(id, window, cx),
+            None => {
+                if let Err(e) = self.new_tab(Open::Page(kind), None, window, cx) {
+                    tracing::warn!("{}: {e}", kind.title());
+                }
+            }
+        }
+    }
+
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let existing = self.panes.iter().find_map(|(id, p)| match p.kind {
             PaneKind::Settings(_) => Some(*id),
@@ -4808,9 +6781,20 @@ impl Workspace {
         let PaneKind::Terminal(t) = &pane.kind else {
             return None;
         };
-        // Anything ringing wants you; past that, only agents have a state.
+        // Anything ringing wants you; past that, only agents have a state,
+        // unless the program said its own with `deck report`.
         if t.read(cx).bell {
             return Some(Status::Attention);
+        }
+        if self.blocked.contains(&id) {
+            return Some(Status::Attention);
+        }
+        if let Some((state, _)) = &t.read(cx).reported {
+            return Some(match state.as_str() {
+                "working" => Status::Working,
+                "blocked" | "error" => Status::Attention,
+                _ => Status::Idle,
+            });
         }
         let agent = pane.agent.is_some() || self.places.get(&id).is_some_and(|p| p.agent.is_some());
         agent.then(|| {
@@ -4954,7 +6938,10 @@ impl Workspace {
                 let c = c.read(cx);
                 c.activity().or_else(|| c.waiting_for())
             }
-            PaneKind::Terminal(t) => t.read(cx).alert.clone(),
+            PaneKind::Terminal(t) => {
+                let t = t.read(cx);
+                t.reported.as_ref().map(|(_, m)| m.clone()).filter(|m| !m.is_empty()).or_else(|| t.alert.clone())
+            }
             _ => None,
         }
     }
@@ -5002,10 +6989,18 @@ impl Workspace {
             let _ = this.update(cx, |ws, cx| match got {
                 Ok(cmd) => {
                     if let Some(PaneKind::Terminal(t)) = ws.panes.get(&id).map(|p| &p.kind) {
-                        t.update(cx, |t, _| t.paste_text(&cmd));
+                        t.update(cx, |t, cx| {
+                            t.ask_done(cx);
+                            t.paste_text(&cmd)
+                        });
                     }
                 }
-                Err(e) => ws.flash(format!("Couldn't write that command: {e}"), cx),
+                Err(e) => {
+                    if let Some(PaneKind::Terminal(t)) = ws.panes.get(&id).map(|p| &p.kind) {
+                        t.update(cx, |t, cx| t.ask_done(cx));
+                    }
+                    ws.flash(format!("Couldn't write that command: {e}"), cx)
+                }
             });
         })
         .detach();
@@ -5033,6 +7028,37 @@ impl Workspace {
         }
     }
 
+    /// A button on one of Deck's notifications: answer the chat's request
+    /// where it is, without coming to the window; a click opens the pane.
+    fn notification_action(&mut self, ev: crate::notify::Event, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::notify::Event;
+        let pane = match &ev {
+            Event::Open(p) | Event::Allow(p) | Event::AllowAlways(p) | Event::Deny(p) | Event::Reply(p, _) => *p,
+        };
+        let chat = match self.panes.get(&pane).map(|p| &p.kind) {
+            Some(PaneKind::Chat(c)) => Some(c.clone()),
+            Some(_) => None,
+            None => return,
+        };
+        match (ev, chat) {
+            (Event::Allow(_), Some(c)) => c.update(cx, |c, cx| c.approve(false, cx)),
+            (Event::AllowAlways(_), Some(c)) => c.update(cx, |c, cx| c.approve(true, cx)),
+            (Event::Deny(_), Some(c)) => c.update(cx, |c, cx| c.deny(cx)),
+            (Event::Reply(_, text), Some(c)) => c.update(cx, |c, cx| c.reply(text, cx)),
+            (Event::Reply(_, text), None) => {
+                // A terminal agent: the words go to its prompt.
+                if let Some(PaneKind::Terminal(t)) = self.panes.get(&pane).map(|p| &p.kind) {
+                    t.update(cx, |t, cx| t.send(&text, true, cx));
+                }
+            }
+            _ => {
+                window.activate_window();
+                self.focus_pane(pane, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn post(&mut self, id: PaneId, body: String, cx: &App) {
         let now = Instant::now();
         if self
@@ -5044,7 +7070,21 @@ impl Workspace {
         }
         self.alerted.insert(id, (now, body.clone()));
         let title = self.pane_title(id, cx);
-        crate::notify::post(id, &title, &body);
+        use crate::notify::Kind;
+        let kind = match self.panes.get(&id).map(|p| &p.kind) {
+            Some(PaneKind::Chat(c)) => match c.read(cx).ask_is_permission() {
+                Some(true) => Kind::Permission,
+                Some(false) => Kind::Question,
+                None => Kind::Info,
+            },
+            _ => Kind::Info,
+        };
+        let sound = match (kind, self.status(id, cx)) {
+            (Kind::Permission | Kind::Question, _) | (_, Some(Status::Attention)) => &self.settings.sound_attention,
+            _ => &self.settings.sound_done,
+        };
+        crate::notify::play(sound, self.settings.sound_volume);
+        crate::notify::post_kind(id, &title, &body, kind);
     }
 
     fn pane_title(&self, id: PaneId, cx: &App) -> SharedString {
@@ -5097,6 +7137,10 @@ impl Workspace {
                 kind: PaneKind::Launcher(_),
                 ..
             }) => "New Tab".into(),
+            Some(Pane {
+                kind: PaneKind::Page(_, k),
+                ..
+            }) => k.title().into(),
             Some(Pane {
                 kind: PaneKind::Review(r),
                 ..
@@ -5154,6 +7198,8 @@ impl Workspace {
             Some(PaneKind::Settings(_)) => "Preferences".into(),
             Some(PaneKind::Launcher(_)) => "New tab".into(),
             Some(PaneKind::Review(_)) => "Task review".into(),
+            Some(PaneKind::Page(_, PageKind::Usage)) => "Cost and tokens".into(),
+            Some(PaneKind::Page(_, PageKind::Packages)) => "Dependencies".into(),
             Some(PaneKind::Terminal(_)) | None => "terminal".into(),
         }
     }
@@ -5215,6 +7261,13 @@ impl Workspace {
                 "unknown or expired token: run deck from a terminal inside a deck window".into(),
             ));
         };
+        // A background page named in a call is in use: it stays open.
+        let target = str_param(p, "name")
+            .and_then(|n| self.named.get(n).copied())
+            .or_else(|| p.get("pane").and_then(Value::as_u64));
+        if let Some(t) = target.and_then(|id| self.bg_used.get_mut(&id)) {
+            *t = Instant::now();
+        }
         let r = match req.method.as_str() {
             "pane.list" => Ok(self.list(caller, cx)),
             "pane.split" => self.rpc_split(p, caller, window, cx),
@@ -5229,6 +7282,69 @@ impl Workspace {
             "pane.close" => self.existing(p).map(|id| {
                 self.close_pane(id, window, cx);
                 json!({ "closed": id })
+            }),
+            "job.start" => self.rpc_job_start(p, caller, window, cx),
+            "job.list" => Ok(self.job_list(cx)),
+            "job.show" => self.existing(p).map(|id| {
+                self.show_job(id, window, cx);
+                json!({ "shown": id })
+            }),
+            "job.stop" => self.existing(p).map(|id| {
+                self.stop_job(id, window, cx);
+                json!({ "stopped": id })
+            }),
+            "usage.get" => Ok(self.usage_json(cx)),
+            "action.list" => Ok(json!({ "actions": self.palette_items(cx).into_iter().filter_map(|i| match i.pick {
+                crate::palette::Pick::Action(_) => Some(json!({ "name": i.title.as_ref(), "about": i.detail.as_ref(), "keys": i.hint.as_ref().map(|h| h.as_ref()) })),
+                _ => None,
+            }).collect::<Vec<_>>() })),
+            "action.run" => {
+                if !self.settings.cli_actions {
+                    return reply.send(Err("running Deck's actions from the CLI is off (Settings › Agents)".into()));
+                }
+                let want = str_param(p, "name").or_else(|| str_param(p, "text")).unwrap_or("").to_lowercase();
+                let found = self.palette_items(cx).into_iter().find_map(|i| match i.pick {
+                    crate::palette::Pick::Action(a) if i.title.to_lowercase() == want => Some((i.title, a)),
+                    _ => None,
+                });
+                match found {
+                    Some((title, a)) => {
+                        window.dispatch_action(a, cx);
+                        Ok(json!({ "ran": title.as_ref() }))
+                    }
+                    None => Err(format!("no action {want:?} (see `deck do --list`)")),
+                }
+            }
+            "page.open" => {
+                let kind = match str_param(p, "page").or_else(|| str_param(p, "text")).unwrap_or("usage") {
+                    "usage" => PageKind::Usage,
+                    "packages" | "deps" => PageKind::Packages,
+                    other => return reply.send(Err(format!("no page {other:?}: usage or packages"))),
+                };
+                self.open_page(kind, window, cx);
+                Ok(json!({ "page": kind.title() }))
+            }
+            "thread.history" => Ok(self.thread_history(p, cx)),
+            "thread.resume" => self.thread_resume(p, window, cx),
+            "pane.key" => self.rpc_key(p, cx),
+            "remote.open" => {
+                let host = str_param(p, "host").unwrap_or("").to_string();
+                if host.is_empty() {
+                    return reply.send(Err("which host? see `deck remote list`".into()));
+                }
+                let dir = str_param(p, "dir").unwrap_or("~").to_string();
+                let agent = str_param(p, "agent").and_then(|a| AGENTS.iter().find(|x| x.cmd == a));
+                let what = match (agent, p.get("chat").and_then(Value::as_bool).unwrap_or(false)) {
+                    (Some(a), true) => RemoteOpen::Chat(a.cmd),
+                    (Some(a), false) => RemoteOpen::Tui(a),
+                    (None, _) => RemoteOpen::Terminal,
+                };
+                self.open_remote(&host, &dir, what, window, cx);
+                Ok(json!({ "host": host, "dir": dir }))
+            }
+            "pane.diff" => self.existing(p).and_then(|id| {
+                let (root, diff) = self.turn_diff(id)?;
+                Ok(json!({ "pane": id, "root": root, "diff": diff }))
             }),
             "browser.open" => self.rpc_open(p, caller, window, cx),
             "browser.eval" => return self.rpc_eval(p, caller, reply, cx),
@@ -5353,10 +7469,20 @@ impl Workspace {
                     }
                     PaneKind::Settings(_) => json!({ "kind": "settings" }),
                     PaneKind::Launcher(_) => json!({ "kind": "new-tab" }),
+                    PaneKind::Page(_, k) => json!({ "kind": k.title().to_lowercase() }),
                     PaneKind::Review(r) => json!({ "kind": "review", "task": r.read(cx).task.id }),
                 };
                 v["id"] = json!(id);
                 v["tab"] = json!(ix + 1);
+                v["status"] = json!(match self.status(id, cx) {
+                    Some(Status::Working) => "working",
+                    Some(Status::Attention) => "waiting",
+                    Some(Status::Idle) => "idle",
+                    None => "none",
+                });
+                if let Some(msg) = self.agent_activity(id, cx) {
+                    v["activity"] = json!(msg);
+                }
                 v["title"] = json!(self.pane_title(id, cx).as_ref());
                 v["focused"] = json!(focused);
                 if let Some(a) = pane.agent {
@@ -5509,6 +7635,322 @@ impl Workspace {
         Ok(json!({ "pane": id, "name": name, "reused": false }))
     }
 
+    /// `deck job start`: a terminal outside every tab, running CMD. Its
+    /// name finds it again; starting the same name restarts it in place.
+    fn rpc_job_start(
+        &mut self,
+        p: &Value,
+        caller: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let cmd = str_param(p, "cmd").filter(|c| !c.trim().is_empty()).ok_or("nothing to run")?.to_string();
+        let name = str_param(p, "name").map(str::to_string).unwrap_or_else(|| job_name(&cmd));
+        let cwd = str_param(p, "cwd").map(PathBuf::from).filter(|c| c.is_dir()).or_else(|| self.cwd_of(caller, cx));
+        let id = self.start_job(name.clone(), cmd, cwd, window, cx).map_err(|e| e.to_string())?;
+        // The caller keeps the keyboard; the job runs out of the way.
+        self.focus_pane(caller, window, cx);
+        cx.notify();
+        Ok(json!({ "pane": id, "name": name, "restarted": false }))
+    }
+
+    fn start_job(
+        &mut self,
+        name: String,
+        cmd: String,
+        cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<PaneId> {
+        let cwd = cwd.unwrap_or_else(|| self.cwd.clone());
+        let job = crate::daemon::start(&name, &cmd, &cwd, crate::daemon::job_env()).map_err(anyhow::Error::msg)?;
+        let id = match self.named.get(&name).copied().filter(|id| self.jobs.contains(id)) {
+            Some(id) => id,
+            None => self.attach_pane(&job.name, &cwd, window, cx)?,
+        };
+        self.job_cmds.insert(id, cmd);
+        self.daemon_jobs.retain(|j| j.name != job.name);
+        self.daemon_jobs.push(job);
+        cx.notify();
+        Ok(id)
+    }
+
+    /// A terminal pane showing the background service's job `name`: it
+    /// runs `deck job attach NAME`, so closing it (or quitting Deck) leaves
+    /// the job running.
+    fn attach_pane(&mut self, name: &str, cwd: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<PaneId> {
+        let exe = std::env::current_exe()?;
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let cmd = format!("exec {} job attach {}", q(&exe.to_string_lossy()), q(name));
+        let id = self.make_pane(Open::Terminal { cmd: Some(cmd), cwd: Some(cwd.to_path_buf()) }, None, window, cx)?;
+        self.jobs.push(id);
+        self.named.insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    /// The service's jobs, as just asked: a pane for each new one, and
+    /// panes whose job is gone closed.
+    fn sync_daemon(&mut self, jobs: Vec<crate::daemon::JobInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        let jobs: Vec<crate::daemon::JobInfo> = jobs.into_iter().filter(|j| !j.tab).collect();
+        let changed = jobs != self.daemon_jobs;
+        for j in &jobs {
+            let has = self.named.get(&j.name).is_some_and(|id| self.panes.contains_key(id));
+            if !has {
+                if let Err(e) = self.attach_pane(&j.name, &j.cwd, window, cx) {
+                    tracing::warn!("could not show job {}: {e}", j.name);
+                }
+            }
+        }
+        // A job pane whose job the service no longer has.
+        let gone: Vec<PaneId> = self
+            .jobs
+            .iter()
+            .copied()
+            .filter(|id| matches!(self.panes.get(id).map(|p| &p.kind), Some(PaneKind::Terminal(_))))
+            .filter(|id| {
+                let name = self.named.iter().find(|(_, v)| *v == id).map(|(n, _)| n.as_str());
+                name.is_none_or(|n| !jobs.iter().any(|j| j.name == n))
+            })
+            .collect();
+        self.daemon_jobs = jobs;
+        for id in gone {
+            self.named.retain(|_, v| *v != id);
+            self.close_pane(id, window, cx);
+        }
+        if let Some(name) = self.show_when_attached.take() {
+            match self.named.get(&name).copied() {
+                Some(id) => self.show_job(id, window, cx),
+                None => self.show_when_attached = Some(name),
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The service's record of the job in pane `id`.
+    fn daemon_job(&self, id: PaneId) -> Option<&crate::daemon::JobInfo> {
+        let name = self.named.iter().find(|(_, v)| **v == id).map(|(n, _)| n)?;
+        self.daemon_jobs.iter().find(|j| &j.name == name)
+    }
+
+    fn job_list(&self, cx: &App) -> Value {
+        let names: HashMap<PaneId, &str> = self.named.iter().map(|(n, id)| (*id, n.as_str())).collect();
+        let jobs: Vec<Value> = self
+            .jobs
+            .iter()
+            .filter_map(|&id| {
+                if let PaneKind::Browser(b) = &self.panes.get(&id)?.kind {
+                    return Some(json!({
+                        "pane": id,
+                        "name": names.get(&id).copied(),
+                        "kind": "page",
+                        "url": b.read(cx).url.as_ref(),
+                    }));
+                }
+                let j = self.daemon_job(id)?;
+                Some(json!({
+                    "kind": if j.agent.is_some() { "agent" } else { "job" },
+                    "pane": id,
+                    "name": j.name,
+                    "command": j.cmd,
+                    "running": j.running,
+                    "exit": j.exit,
+                    "cwd": j.cwd,
+                }))
+            })
+            .collect();
+        json!({ "jobs": jobs })
+    }
+
+    /// Open a job in the drawer, or shut the drawer if it already shows it.
+    fn show_job(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.jobs.contains(&id) {
+            // A pane in a tab: go there.
+            self.focus_pane(id, window, cx);
+            return;
+        }
+        self.job_open = Some(id);
+        if let Some(PaneKind::Terminal(t)) = self.panes.get(&id).map(|p| &p.kind) {
+            let f = t.read(cx).focus.clone();
+            window.focus(&f);
+        }
+        cx.notify();
+    }
+
+    /// Close the background pages nobody has used for [`BG_PAGE_IDLE`]. The
+    /// one in the drawer counts as in use.
+    fn close_idle_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.job_open.and_then(|id| self.bg_used.get_mut(&id)) {
+            *t = Instant::now();
+        }
+        let idle: Vec<PaneId> = self
+            .bg_used
+            .iter()
+            .filter(|(_, used)| used.elapsed() >= BG_PAGE_IDLE)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in idle {
+            self.bg_used.remove(&id);
+            if self.jobs.contains(&id) {
+                self.named.retain(|_, v| *v != id);
+                self.close_pane(id, window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn stop_job(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(j) = self.daemon_job(id).cloned() {
+            self.daemon_jobs.retain(|x| x.name != j.name);
+            cx.background_executor().spawn(async move { crate::daemon::stop(&j.name) }).detach();
+        }
+        self.named.retain(|_, v| *v != id);
+        self.close_pane(id, window, cx);
+        cx.notify();
+    }
+
+    /// The drawer's job as a tab of its own: it leaves the status bar.
+    fn job_to_tab(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.jobs.retain(|j| *j != id);
+        self.bg_used.remove(&id);
+        if let Some(PaneKind::Browser(b)) = self.panes.get(&id).map(|p| &p.kind) {
+            b.update(cx, |b, _| b.set_visible(true));
+        }
+        self.job_open = None;
+        self.tabs.push(Tab {
+            root: Node::Leaf(id),
+            focused: id,
+            pinned: false,
+            on_top: false,
+        });
+        self.focus_pane(id, window, cx);
+        cx.notify();
+    }
+
+    /// Ids of the chat threads open in this window.
+    fn open_threads(&self, cx: &App) -> HashMap<String, PaneId> {
+        self.panes
+            .iter()
+            .filter_map(|(&id, p)| match &p.kind {
+                PaneKind::Chat(c) => Some((c.read(cx).thread_id().to_string(), id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `deck history [--query Q] [--limit N]`: saved threads, newest first,
+    /// open, closed (archived) or past the relaunch window alike.
+    fn thread_history(&self, p: &Value, cx: &App) -> Value {
+        let q = str_param(p, "query").unwrap_or("").to_lowercase();
+        let limit = p.get("limit").and_then(Value::as_u64).or_else(|| str_param(p, "limit").and_then(|l| l.parse().ok())).unwrap_or(30) as usize;
+        let open = self.open_threads(cx);
+        let mut all: Vec<(crate::threads::Saved, bool)> =
+            crate::threads::load_all().into_iter().map(|s| (s, false)).collect();
+        all.extend(crate::threads::load_archived().into_iter().map(|s| (s, true)));
+        all.sort_by_key(|(s, _)| std::cmp::Reverse(s.updated));
+        let rows: Vec<Value> = all
+            .into_iter()
+            .filter(|(s, _)| {
+                q.is_empty()
+                    || s.title.to_lowercase().contains(&q)
+                    || s.cwd.to_string_lossy().to_lowercase().contains(&q)
+            })
+            .take(limit)
+            .map(|(s, archived)| {
+                json!({
+                    "id": s.id,
+                    "title": s.title,
+                    "agent": s.agent,
+                    "cwd": s.cwd,
+                    "updated": s.updated / 1000,
+                    "messages": s.transcript.messages.len(),
+                    "open_pane": open.get(&s.id),
+                    "archived": archived,
+                })
+            })
+            .collect();
+        json!({ "threads": rows })
+    }
+
+    /// `deck resume ID`: the thread back in a tab of its own, or focused if
+    /// it is open. An archived one comes out of the archive.
+    fn thread_resume(&mut self, p: &Value, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+        let want = str_param(p, "id").or_else(|| str_param(p, "text")).ok_or("which thread? see `deck history`")?;
+        if let Some((_, &pane)) = self.open_threads(cx).iter().find(|(id, _)| id.starts_with(want)) {
+            self.focus_pane(pane, window, cx);
+            return Ok(json!({ "pane": pane, "reopened": false }));
+        }
+        let saved = crate::threads::load_all()
+            .into_iter()
+            .chain(crate::threads::load_archived())
+            .filter(|s| s.id.starts_with(want))
+            .max_by_key(|s| s.updated)
+            .ok_or_else(|| format!("no thread {want:?} (see `deck history`)"))?;
+        crate::threads::unarchive(&saved.id);
+        let id = self.new_tab(Open::Thread(Box::new(saved)), None, window, cx).map_err(|e| e.to_string())?;
+        Ok(json!({ "pane": id, "reopened": true }))
+    }
+
+    /// `deck pane key --pane N KEY`: a key press, by name.
+    fn rpc_key(&mut self, p: &Value, cx: &mut Context<Self>) -> Result<Value, String> {
+        let id = self.existing(p)?;
+        let name = str_param(p, "key").or_else(|| str_param(p, "text")).ok_or("which key? e.g. ctrl+c, enter, escape, up")?;
+        let seq = key_bytes(name).ok_or_else(|| format!("unknown key {name:?}"))?;
+        match self.panes.get(&id).map(|p| &p.kind) {
+            Some(PaneKind::Terminal(t)) => t.update(cx, |t, cx| t.send(&seq, false, cx)),
+            _ => return Err(format!("pane {id} is not a terminal")),
+        }
+        Ok(json!({ "pane": id, "key": name }))
+    }
+
+    /// `deck usage`: what the usage panel shows, as JSON.
+    fn usage_json(&self, cx: &App) -> Value {
+        let limits = |l: &crate::usage::Limits| {
+            json!({
+                "agent": l.agent,
+                "plan": l.plan,
+                "limits": l.limits.iter().map(|x| json!({
+                    "label": x.label,
+                    "used_pct": x.used_pct,
+                    "resets_in_secs": x.resets_at.and_then(|t| t.duration_since(std::time::SystemTime::now()).ok()).map(|d| d.as_secs()),
+                })).collect::<Vec<_>>(),
+            })
+        };
+        let us = &self.usage;
+        json!({
+            "claude": match &us.claude {
+                Some(Ok(l)) => limits(l),
+                Some(Err(e)) => json!({ "error": e }),
+                None => Value::Null,
+            },
+            "codex": us.codex.as_ref().map(limits),
+            "conversation": us.session.as_ref().map(|(title, s)| json!({
+                "title": title.as_ref(),
+                "model": s.model,
+                "context_used": s.context_used,
+                "context_window": s.context_window,
+                "input": s.input, "output": s.output,
+                "cache_read": s.cache_read, "cache_write": s.cache_write,
+                "turns": s.turns, "cost_usd": s.cost_usd,
+            })),
+            "today": us.today.as_ref().map(|t| json!({
+                "conversations": t.sessions,
+                "input": t.input, "output": t.output,
+                "cache_read": t.cache_read, "cache_write": t.cache_write,
+                "cost_usd": t.cost_usd,
+            })),
+            "others": us.others.iter().map(|d| json!({
+                "agent": d.agent, "tokens": d.tokens, "cost_usd": d.cost_usd,
+                "replies": d.replies, "model": d.model,
+            })).collect::<Vec<_>>(),
+            "chats": self.chat_spend(cx).iter().map(|c| json!({
+                "pane": c.pane, "title": c.title.as_ref(), "agent": c.agent.as_ref(),
+                "tokens": c.usage.tokens(), "cost_usd": c.usage.cost_usd,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     fn rpc_tab(
         &mut self,
         p: &Value,
@@ -5551,6 +7993,7 @@ impl Workspace {
             PaneKind::Settings(_) => return Err(format!("pane {id} is the Settings tab")),
             PaneKind::Launcher(_) => return Err(format!("pane {id} is an empty new tab")),
             PaneKind::Review(_) => return Err(format!("pane {id} is a task review")),
+            PaneKind::Page(_, k) => return Err(format!("pane {id} is the {} page", k.title())),
         }
         Ok(json!({ "pane": id }))
     }
@@ -5579,6 +8022,7 @@ impl Workspace {
             PaneKind::Settings(_) => reply.send(Err(format!("pane {id} is the Settings tab"))),
             PaneKind::Launcher(_) => reply.send(Err(format!("pane {id} is an empty new tab"))),
             PaneKind::Review(_) => reply.send(Err(format!("pane {id} is a task review"))),
+            PaneKind::Page(_, k) => reply.send(Err(format!("pane {id} is the {} page", k.title()))),
         }
     }
 
@@ -5613,6 +8057,24 @@ impl Workspace {
         let tab = ["tab", "new_tab"]
             .iter()
             .any(|k| p.get(*k).and_then(Value::as_bool) == Some(true));
+        // A background page: no split, a tab in the status bar.
+        if p.get("bg").and_then(Value::as_bool) == Some(true) {
+            let id = self.make_pane(Open::Browser { url: url.into() }, None, window, cx).map_err(|e| e.to_string())?;
+            if let Some(PaneKind::Browser(b)) = self.panes.get(&id).map(|p| &p.kind) {
+                b.update(cx, |b, _| {
+                    b.size_offscreen();
+                    b.set_visible(false);
+                });
+            }
+            self.jobs.push(id);
+            self.bg_used.insert(id, Instant::now());
+            let n = name.map_or_else(|| format!("page {id}"), str::to_string);
+            self.named.insert(n.clone(), id);
+            // The caller keeps the keyboard.
+            self.focus_pane(caller, window, cx);
+            cx.notify();
+            return Ok(json!({ "pane": id, "name": n, "background": true }));
+        }
         let id = if tab {
             self.new_tab(Open::Browser { url: url.into() }, None, window, cx)
                 .map_err(|e| e.to_string())?
@@ -6037,6 +8499,7 @@ impl Workspace {
             PaneKind::Settings(s) => s.clone().into(),
             PaneKind::Launcher(l) => l.clone().into(),
             PaneKind::Review(r) => r.clone().into(),
+            PaneKind::Page(v, _) => v.clone(),
         };
         let body = view
             .cached(StyleRefinement::default().size_full())
@@ -6109,11 +8572,21 @@ impl Workspace {
                 kind: PaneKind::Review(_),
                 ..
             }) => (Icon::Git, theme::text()),
+            Some(Pane {
+                kind: PaneKind::Page(_, k),
+                ..
+            }) => (
+                match k {
+                    PageKind::Usage => Icon::Chart,
+                    PageKind::Packages => Icon::Package,
+                },
+                theme::text(),
+            ),
             _ => (Icon::Terminal, theme::text_2()),
         }
     }
 
-    /// The sidebar is an inbox, as in T3 Code: the control chat first, then
+    /// The sidebar is an inbox: the control chat first, then
     /// threads with what each one needs from you, then the terminals and
     /// pages they opened. Empty sections are not drawn.
     /// The project a tab belongs to: its first pane's (a terminal's or
@@ -6143,7 +8616,7 @@ impl Workspace {
         for (ix, tab) in self.tabs.iter().enumerate() {
             // The control chat has its own row; a task's work, its task's;
             // Settings, the footer.
-            if tab.pinned || self.is_task_tab(tab, cx) || Some(ix) == settings {
+            if tab.pinned || tab.on_top || self.is_task_tab(tab, cx) || Some(ix) == settings {
                 continue;
             }
             let (name, root) = self.tab_project(tab, cx);
@@ -6159,7 +8632,7 @@ impl Workspace {
                 }
             };
             match self.group(tab) {
-                Group::Threads => group.threads.push((ix, self.last_active(tab.leaves()[0], cx))),
+                Group::Threads => group.threads.push((ix, self.settled_at(tab, cx))),
                 Group::Workspace => group.others.push(ix),
             }
         }
@@ -6189,7 +8662,7 @@ impl Workspace {
         };
         let ix = g
             .tabs()
-            .max_by_key(|&ix| self.tabs.get(ix).map(|t| self.last_active(t.focused, cx)))
+            .max_by_key(|&ix| self.tabs.get(ix).map(|t| self.tab_touched(t, cx)))
             .or_else(|| g.tabs().next());
         if let Some(ix) = ix {
             self.folded.remove(&g.name);
@@ -6199,21 +8672,7 @@ impl Workspace {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let groups = self.project_groups(cx);
-
-        let header = |label: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap(u(2.))
-                .h(u(28.))
-                .mt(u(14.))
-                .pl(u(theme::ROW_PAD))
-                .pr(u(ROW_END))
-                .text_size(u(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::dim()))
-                .child(div().flex_1().child(label))
-        };
+        let header = sidebar_header;
 
         let mut list = div()
             .id("tabs")
@@ -6224,46 +8683,21 @@ impl Workspace {
             .overflow_y_scroll()
             .px(u(theme::GUTTER))
             .pb(u(theme::GUTTER))
-            .child(
-                // The first row, on the same edges as every row under it:
-                // a tint marks it as the action, no box around it.
+            .children(self.filter.as_ref().map(|(f, _)| {
                 div()
-                    .id("new-chat")
-                    .group("new-chat")
                     .flex()
                     .items_center()
                     .gap(u(ROW_GAP))
-                    .h(u(32.))
+                    .h(u(ROW_ONE_LINE))
                     .pl(u(theme::ROW_PAD))
-                    .pr(u(ROW_END + 6.))
+                    .pr(u(ROW_END + 4.))
                     .mb(u(4.))
                     .rounded(u(theme::ROW_RADIUS))
-                    .bg(rgba(theme::tint()))
-                    .text_size(u(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(theme::text()))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::surface())))
-                    .child(lead(icon(Icon::Plus, 14., theme::text())))
-                    .child(div().flex_1().child("New chat"))
-                    .children(keycap(hint("new-chat", &self.settings.keys)).map(|k| {
-                        k.font_weight(FontWeight::NORMAL)
-                            .invisible()
-                            .group_hover("new-chat", |s| s.visible())
-                    }))
-                    .on_click(cx.listener(|ws, _, window, cx| {
-                        let what = Open::Chat {
-                            agent: None,
-                            cwd: ws.focused_cwd(cx),
-                        };
-                        if ws.new_tab(what, None, window, cx).is_err() {
-                            let at = ws.agent_menu_at();
-                            ws.open_agent_menu(at, window, cx);
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(self.render_control_row(cx));
+                    .bg(rgb(theme::surface()))
+                    .child(lead(icon(Icon::Search, 14., theme::text_2())))
+                    .child(div().flex_1().child(f.clone()))
+                    .into_any_element()
+            }));
 
         let open: Vec<crate::tasks::Task> = self
             .tasks
@@ -6278,25 +8712,20 @@ impl Workspace {
             }
         }
 
+        list = list.children(self.render_pinned(cx));
         // New agents: the picker, under its own small header.
         if !groups.is_empty() {
-            list = list.child(
-                header("Projects").child(
-                    icon_button("agents-plus", Icon::Plus)
-                        .size(u(22.))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            ws.open_agent_menu(ev.position, window, cx);
-                        })),
-                ),
-            );
+            list = list.child(self.render_view_header(cx));
         } else {
             list = list.child(self.render_sidebar_empty(cx));
+        }
+        if self.recent {
+            list = list.children(self.render_recent(&groups, cx));
         }
         // Folded projects stack close as one list; an open one gets room
         // after its rows, so groups read by space rather than lines.
         let mut prev_open = false;
-        for (gi, g) in groups.iter().enumerate() {
+        for (gi, g) in groups.iter().enumerate().filter(|_| !self.recent) {
             let gap = if gi == 0 { 2. } else if prev_open { 12. } else { 0. };
             list = list.child(self.render_project_header(g, gi, gap, cx));
             prev_open = !self.folded.contains(&g.name);
@@ -6309,9 +8738,9 @@ impl Workspace {
             ixs.sort_unstable();
             for ix in ixs {
                 list = list.child(if g.threads.iter().any(|t| t.0 == ix) {
-                    self.render_thread_row(ix, cx)
+                    self.render_thread_row(ix, None, cx)
                 } else {
-                    self.render_tab_row(ix, &self.tabs[ix], cx)
+                    self.render_tab_row(ix, &self.tabs[ix], None, cx)
                 });
             }
         }
@@ -6337,6 +8766,8 @@ impl Workspace {
                             window.titlebar_double_click();
                         }
                     })
+                    .gap(u(2.))
+                    .child(self.new_chat_button("new-chat", cx))
                     .child(
                         icon_button("hide-sidebar", Icon::Sidebar).on_click(cx.listener(
                             |ws, _, _, cx| {
@@ -6347,16 +8778,194 @@ impl Workspace {
                     ),
             )
             .child(list)
+            .children((!self.picked.is_empty()).then(|| self.render_pick_bar(cx)))
             .child(
                 div()
                     .flex_none()
                     .flex()
                     .flex_col()
                     .gap(u(2.))
-                    .px(u(theme::GUTTER))
+                    .mx(u(theme::GUTTER))
+                    .pt(u(6.))
                     .pb(u(theme::GUTTER))
-                    .child(self.render_usage_row(cx))
-                    .child(self.render_settings_row(cx)),
+                    .border_t_1()
+                    .border_color(rgba(theme::hairline()))
+                    .child(self.render_sidebar_foot(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The sidebar's foot: one quiet row. On the left, icons for the
+    /// project's packages, usage (with how full the context is) and
+    /// Settings; on the right, how many are working, waiting on you and
+    /// done, each a click from the next one.
+    fn render_sidebar_foot(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut working = 0;
+        let mut waiting = 0;
+        let mut done = 0;
+        for t in &self.tabs {
+            for id in t.leaves() {
+                match self.status(id, cx) {
+                    Some(Status::Working) => working += 1,
+                    Some(Status::Attention) => waiting += 1,
+                    _ if self.unseen.contains(&id) => done += 1,
+                    _ => {}
+                }
+            }
+        }
+        let settings_on = self.settings_tab() == Some(self.active);
+        let page_on = |k: PageKind| {
+            self.focused().is_some_and(|id| matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Page(_, kk)) if *kk == k))
+        };
+        let tool = |id: &'static str, glyph: Icon, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(u(4.))
+                .h(u(30.))
+                .min_w(u(30.))
+                .px(u(6.))
+                .rounded(u(7.))
+                .cursor_pointer()
+                .text_size(u(11.))
+                .text_color(rgb(theme::dim()))
+                .when(on, |d| d.bg(rgb(theme::row_active())))
+                .hover(|s| s.bg(rgb(theme::row_hover())))
+                .child(icon(glyph, 15., if on { theme::text() } else { theme::text_2() }))
+        };
+        let glance = self.usage_glance(cx);
+        let count = |id: &'static str, mark: AnyElement, n: usize| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(u(4.))
+                .h(u(26.))
+                .px(u(6.))
+                .rounded(u(6.))
+                .cursor_pointer()
+                .text_size(u(12.5))
+                .text_color(rgb(theme::text_2()))
+                .hover(|s| s.bg(rgb(theme::row_hover())))
+                .child(mark)
+                .child(n.to_string())
+        };
+        let done_mark = div()
+            .size(u(13.))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(theme::text()))
+            .child(icon(Icon::Check, 8., theme::sidebar()))
+            .into_any_element();
+        div()
+            .flex()
+            .items_center()
+            .gap(u(2.))
+            .h(u(34.))
+            .child(
+                tool("foot-packages", Icon::Package, page_on(PageKind::Packages))
+                    .on_click(cx.listener(|ws, _, w, cx| ws.open_page(PageKind::Packages, w, cx))),
+            )
+            .child(
+                // Hover: the numbers in a small card. Click: the full panel.
+                div()
+                    .relative()
+                    .child(
+                        tool("foot-usage", Icon::Gauge, self.usage_open || page_on(PageKind::Usage))
+                            .children(glance.map(|(_, pct)| div().text_color(rgb(level_color(pct))).child(pct_text(pct))))
+                            .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                                if ws.gauge_hover != *on {
+                                    ws.gauge_hover = *on;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(|ws, _, _, cx| {
+                                ws.gauge_hover = false;
+                                ws.toggle_usage(true, cx)
+                            })),
+                    )
+                    .when(self.gauge_hover && !self.usage_open, |d| d.child(gpui::deferred(self.render_usage_card()).with_priority(2))),
+            )
+            .child(tool("foot-settings", Icon::Settings, settings_on).on_click(cx.listener(|ws, _, w, cx| ws.open_settings(w, cx))))
+            .child(div().flex_1())
+            .when(working > 0, |d| {
+                d.child(
+                    count("foot-working", spinner("foot-spin", 12., theme::accent()), working)
+                        .on_click(cx.listener(|ws, _, w, cx| ws.next_with(Status::Working, w, cx))),
+                )
+            })
+            .when(waiting > 0, |d| {
+                d.child(
+                    count("foot-waiting", icon(Icon::Bell, 12., theme::accent()), waiting)
+                        .on_click(cx.listener(|ws, _, w, cx| ws.next_needs_you(w, cx))),
+                )
+            })
+            .when(done > 0, |d| {
+                d.child(count("foot-done", done_mark, done).on_click(cx.listener(|ws, _, w, cx| {
+                    let next = ws.tabs.iter().flat_map(|t| t.leaves()).find(|id| ws.unseen.contains(id));
+                    if let Some(id) = next {
+                        ws.focus_pane(id, w, cx);
+                    }
+                })))
+            })
+            .into_any_element()
+    }
+
+    /// The next pane in this state after the one you are in.
+    fn next_with(&mut self, want: Status, window: &mut Window, cx: &mut Context<Self>) {
+        let order: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.leaves()).collect();
+        let at = self.focused().and_then(|f| order.iter().position(|p| *p == f)).unwrap_or(0);
+        if let Some(id) = (1..=order.len()).map(|i| order[(at + i) % order.len()]).find(|id| self.status(*id, cx) == Some(want)) {
+            self.focus_pane(id, window, cx);
+        }
+    }
+
+    /// "3 selected · Close · Clear", while rows are picked.
+    fn render_pick_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let n = self.picked.len();
+        let button = |id: &'static str, label: &'static str, strong: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .h(u(26.))
+                .px(u(10.))
+                .rounded(u(6.))
+                .text_size(u(12.))
+                .cursor_pointer()
+                .when(strong, |d| d.bg(rgb(theme::text())).text_color(rgb(theme::sidebar())).hover(|s| s.opacity(0.88)))
+                .when(!strong, |d| d.text_color(rgb(theme::text_2())).hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(4.))
+            .mx(u(theme::GUTTER))
+            .mb(u(6.))
+            .h(u(38.))
+            .pl(u(12.))
+            .pr(u(6.))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .text_size(u(12.5))
+            .child(div().flex_1().text_color(rgb(theme::text())).child(format!("{n} selected")))
+            .child(button("pick-clear", "Clear", false).on_click(cx.listener(|ws, _, _, cx| {
+                ws.picked.clear();
+                cx.notify();
+            })))
+            .child(button("pick-close", "Close", true).on_click(cx.listener(|ws, _, w, cx| ws.close_picked(w, cx))))
+            .with_animation(
+                "pick-bar-in",
+                Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                |d, t| d.opacity(t).mt(u(4. * (1. - t))),
             )
             .into_any_element()
     }
@@ -6372,6 +8981,7 @@ impl Workspace {
 
     /// Settings, at the foot of the sidebar: opens it, and while it is open
     /// is its row, lifted like any open row and closed the same way.
+    #[allow(dead_code)]
     fn render_settings_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let tab = self.settings_tab();
         let active = tab == Some(self.active);
@@ -6379,6 +8989,7 @@ impl Workspace {
         sidebar_row(div().id("open-settings"), 0., active, false)
             .group("settings-row")
             .h(u(ROW_ONE_LINE))
+            .pr(u(ROW_END + 3.))
             .text_size(u(13.))
             .text_color(rgb(tone))
             .child(lead(icon(Icon::Settings, 15., tone)))
@@ -6502,6 +9113,168 @@ impl Workspace {
     /// on the same edge as every row's title, so the list keeps two edges.
     /// Folded it says how many tabs it holds; hovered, it offers a new chat
     /// or terminal there.
+    /// Projects or Recent: two marks in one small track, the one in use
+    /// lifted like an open row.
+    /// The list's header: "Recent ⌄" or "Projects ⌄", a click switches
+    /// between them; the + for a new agent shows while the pointer is over
+    /// the header, so at rest it is just a label like the others.
+    fn render_view_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("view-head")
+            .group("view-head")
+            .flex()
+            .items_center()
+            .h(u(30.))
+            .mt(u(16.))
+            .pl(u(theme::ROW_PAD))
+            .pr(u(ROW_END))
+            .text_size(u(HEAD_TEXT))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(theme::dim()))
+            .child(
+                div()
+                    .id("view-toggle")
+                    .flex()
+                    .items_center()
+                    .gap(u(4.))
+                    .h(u(22.))
+                    .px(u(6.))
+                    .ml(u(-6.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text_2())))
+                    .child(if self.recent { "Recent" } else { "Projects" })
+                    .child(icon(Icon::ChevronDown, 9., theme::dim()))
+                    .on_click(cx.listener(|ws, _, _, cx| {
+                        let recent = !ws.recent;
+                        if recent {
+                            ws.settled.clear();
+                            ws.settle(cx);
+                        }
+                        ws.recent = recent;
+                        cx.notify();
+                    })),
+            )
+            .child(div().flex_1())
+            .child(
+                icon_button("agents-plus", Icon::Plus)
+                    .size(u(22.))
+                    .opacity(0.)
+                    .group_hover("view-head", |s| s.opacity(1.))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        ws.open_agent_menu(ev.position, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    #[allow(dead_code)]
+    fn render_view_switch(&self, cx: &mut Context<Self>) -> AnyElement {
+        let seg = |id: &'static str, glyph: Icon, recent: bool| {
+            let on = self.recent == recent;
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(u(20.))
+                .rounded(u(5.))
+                .border_1()
+                .cursor_pointer()
+                .when(on, |d| d.bg(rgb(theme::row_active())).border_color(rgba(theme::hairline())))
+                .when(!on, |d| {
+                    d.border_color(gpui::transparent_black())
+                        .hover(|s| s.bg(rgb(theme::row_hover())))
+                })
+                .child(icon(glyph, 12., if on { theme::text() } else { theme::dim() }))
+                .on_click(cx.listener(move |ws, _, _, cx| {
+                    if recent && !ws.recent {
+                        ws.settled.clear();
+                        ws.settle(cx);
+                    }
+                    ws.recent = recent;
+                    cx.notify();
+                }))
+        };
+        let projects = seg("view-projects", Icon::Folder, false);
+        let recent = seg("view-recent", Icon::Clock, true);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(1.))
+            .p(u(1.))
+            .mr(u(2.))
+            .rounded(u(6.))
+            .bg(rgba(theme::tint()))
+            .child(projects)
+            .child(recent)
+            .into_any_element()
+    }
+
+    /// The sidebar by time: each row under the day it last did something,
+    /// newest first. Its place is fixed once shown (see `settle`), so an
+    /// agent starting or finishing changes its row, never where it is.
+    fn render_recent(&self, groups: &[ProjectGroup], cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (_, (h, m, sec)) = crate::retry::now();
+        let since_midnight = u64::from(h * 3600 + m * 60 + sec);
+        let now = crate::local::now();
+        let mut rows: Vec<(Bucket, i64, usize, bool, &str)> = Vec::new();
+        for g in groups {
+            for ix in g.tabs() {
+                let Some(tab) = self.tabs.get(ix) else { continue };
+                let at = self.settled_at(tab, cx);
+                let bucket = Bucket::of((now - at).max(0) as u64, since_midnight);
+                let thread = g.threads.iter().any(|t| t.0 == ix);
+                rows.push((bucket, at, ix, thread, g.name.as_str()));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        let mut out = Vec::new();
+        let mut last = None;
+        for &(bucket, _, ix, thread, project) in &rows {
+            if last != Some(bucket) {
+                let first = last.is_none();
+                last = Some(bucket);
+                let n = rows.iter().filter(|r| r.0 == bucket).count();
+                // The first day sits right under "Recent ⌄", not a header
+                // after a header.
+                out.push(
+                    sidebar_header(bucket.label())
+                        .mt(u(if first { 2. } else { 16. }))
+                        .child(header_count(n))
+                        .into_any_element(),
+                );
+            }
+            out.push(if thread {
+                self.render_thread_row(ix, Some(project), cx)
+            } else {
+                self.render_tab_row(ix, &self.tabs[ix], Some(project), cx)
+            });
+        }
+        out
+    }
+
+    /// The rows you pinned, above every project, in the order they opened.
+    fn render_pinned(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let pins: Vec<usize> = (0..self.tabs.len()).filter(|&ix| self.tabs[ix].on_top).collect();
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![sidebar_header("Pinned").into_any_element()];
+        for ix in pins {
+            let tab = &self.tabs[ix];
+            let project = self.tab_project(tab, cx).0;
+            out.push(if self.group(tab) == Group::Threads {
+                self.render_thread_row(ix, Some(&project), cx)
+            } else {
+                self.render_tab_row(ix, tab, Some(&project), cx)
+            });
+        }
+        out
+    }
+
     fn render_project_header(&self, g: &ProjectGroup, gi: usize, gap: f32, cx: &mut Context<Self>) -> AnyElement {
         let name = g.name.clone();
         let loose = name.is_empty();
@@ -6682,11 +9455,48 @@ impl Workspace {
         Some((title.into(), sub.into()))
     }
 
-    fn last_active(&self, id: PaneId, cx: &App) -> Instant {
+    /// When a pane last did something, in seconds since the epoch.
+    fn last_active(&self, id: PaneId, cx: &App) -> i64 {
+        let touched = self.touched.get(&id).copied();
         match self.panes.get(&id).map(|p| &p.kind) {
-            Some(PaneKind::Chat(c)) => c.read(cx).last_activity,
-            Some(PaneKind::Terminal(t)) => t.read(cx).last_output,
-            _ => Instant::now(),
+            Some(PaneKind::Chat(c)) => touched.unwrap_or(0).max(c.read(cx).updated / 1000),
+            _ => touched.unwrap_or_else(crate::local::now),
+        }
+    }
+
+    /// When a tab last did something: the latest of its panes.
+    fn tab_touched(&self, tab: &Tab, cx: &App) -> i64 {
+        tab.leaves()
+            .into_iter()
+            .map(|id| self.last_active(id, cx))
+            .max()
+            .unwrap_or_else(crate::local::now)
+    }
+
+    /// Where a tab sits in the sidebar's Recent view: the time it had when
+    /// the list first showed it, or its own while it is that new.
+    fn settled_at(&self, tab: &Tab, cx: &App) -> i64 {
+        self.settled
+            .get(&tab.leaves()[0])
+            .copied()
+            .unwrap_or_else(|| self.tab_touched(tab, cx))
+    }
+
+    /// Fix each new tab's place in the Recent view, and forget closed ones.
+    /// A row never moves on its own: an agent starting or finishing, or
+    /// you looking at it, leaves it where it is. Choosing Recent again
+    /// sorts afresh.
+    fn settle(&mut self, cx: &mut Context<Self>) {
+        let firsts: Vec<(PaneId, i64)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.leaves()[0], self.settled_at(tab, cx)))
+            .collect();
+        let changed = firsts.len() != self.settled.len()
+            || firsts.iter().any(|(id, _)| !self.settled.contains_key(id));
+        if changed {
+            self.settled = firsts.into_iter().collect();
+            cx.notify();
         }
     }
 
@@ -6712,122 +9522,27 @@ impl Workspace {
         }
     }
 
-    /// The control plane's entry: always first, always there.
-    fn render_control_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let ix = self.control_tab();
-        let active = ix == Some(self.active);
-        let pane = ix.and_then(|i| self.tabs.get(i)).map(|t| t.leaves()[0]);
-        let agent = pane.and_then(|id| match &self.panes.get(&id)?.kind {
-            PaneKind::Chat(c) => {
-                let c = c.read(cx);
-                Some((Icon::agent(c.agent.as_str()), c.agent_name()))
+    /// + in the titlebar: a new chat with the default agent in the focused
+    /// folder, or the agent menu when none can start.
+    fn new_chat_button(&self, id: &'static str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        icon_button(id, Icon::Plus).on_click(cx.listener(|ws, _, window, cx| {
+            let what = Open::Chat { agent: None, cwd: ws.focused_cwd(cx) };
+            if ws.new_tab(what, None, window, cx).is_err() {
+                let at = ws.agent_menu_at();
+                ws.open_agent_menu(at, window, cx);
+                cx.notify();
             }
-            _ => None,
-        });
-        let (glyph, subtitle): (Icon, SharedString) = match agent {
-            Some((g, name)) => (g, name),
-            None if !self.probed => (Icon::GenericAgent, "Starting agents…".into()),
-            None => (Icon::GenericAgent, "No agent CLI found".into()),
-        };
-        let state = pane.map(|id| self.thread_state(id, cx));
-        let working = pane.and_then(|id| self.status(id, cx)) == Some(Status::Working);
-        let wants = pane.and_then(|id| self.status(id, cx)) == Some(Status::Attention);
-        // Closed: the row stays, and a click starts a fresh conversation.
-        let subtitle: SharedString = if ix.is_none() && self.probed {
-            "Closed · click to start a new conversation".into()
-        } else {
-            subtitle
-        };
-        sidebar_row(div().id("control"), 0., active, !working && !wants)
-            .group("control-row")
-            .h(u(ROW_TWO_LINE))
-            .child(lead(if working {
-                thinking("control-think", glyph, 15., live(glyph))
-            } else {
-                icon(
-                    glyph,
-                    15.,
-                    if wants {
-                        live(glyph)
-                    } else if active {
-                        theme::text()
-                    } else {
-                        theme::text_2()
-                    },
-                )
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_size(u(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(theme::text()))
-                            .child("Control"),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .one_line()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(subtitle),
-                    ),
-            )
-            .when_some(state.filter(|(_, loud)| *loud), |d, (label, _)| {
-                d.child(if working {
-                    div()
-                        .text_size(u(11.))
-                        .child(shimmer("control-shimmer", label))
-                        .into_any_element()
-                } else if wants {
-                    alert_pill().into_any_element()
-                } else {
-                    pill(label).into_any_element()
-                })
-            })
-            // Close, as on every other row, while hovered.
-            .when(ix.is_some(), |d| {
-                d.child(
-                    icon_button("close-control", Icon::Close)
-                        .size(u(22.))
-                        .opacity(0.)
-                        .group_hover("control-row", |s| s.opacity(1.))
-                        .on_click(cx.listener(|ws, _, window, cx| {
-                            cx.stop_propagation();
-                            if let Some(ix) = ws.control_tab() {
-                                ws.close_tab(ix, window, cx);
-                            }
-                        })),
-                )
-            })
-            .on_click(
-                cx.listener(move |ws, _, window, cx| match ws.control_tab() {
-                    Some(i) => ws.activate(i, window, cx),
-                    None => {
-                        ws.open_control(Vec::new(), window, cx);
-                        if let Some(i) = ws.control_tab() {
-                            ws.activate(i, window, cx);
-                        }
-                    }
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
-                    ws.open_control_menu(ev.position, window, cx)
-                }),
-            )
-            .into_any_element()
+        }))
     }
 
     /// A thread: its title, then who is doing it and what it needs from you.
-    fn render_thread_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let indent = ROW_INDENT;
+    /// A chat or agent's row. `place` is its project, for the Recent view,
+    /// where rows stand flush and say which project they are in.
+    fn render_thread_row(&self, ix: usize, place: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        if !self.row_matches(ix, cx) {
+            return div().into_any_element();
+        }
+        let indent = if place.is_some() { 0. } else { ROW_INDENT };
         let Some(tab) = self.tabs.get(ix) else {
             return div().into_any_element();
         };
@@ -6856,7 +9571,7 @@ impl Workspace {
             Some(doing) => doing.into(),
             None => who,
         };
-        let (state, loud) = self.thread_state(first, cx);
+        let (_, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
         sidebar_row(
             div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
@@ -6864,8 +9579,9 @@ impl Workspace {
             active,
             !loud,
         )
+        .when(self.row_picked(ix), picked_row)
         .group(group.clone())
-        .h(u(ROW_TWO_LINE))
+        .h(u(ROW_H))
             .child(lead(if working {
                 thinking(
                     ElementId::NamedInteger("thread-think".into(), ix as u64),
@@ -6892,11 +9608,16 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(u(6.))
                     .child(
                         div()
-                            .w_full()
+                            .flex_shrink()
+                            .min_w_0()
                             .one_line()
-                            .text_size(u(13.))
+                            .text_size(u(ROW_TEXT))
+                            .when(loud && !working && !wants, |d| d.font_weight(FontWeight::SEMIBOLD))
                             .text_color(rgb(if active || loud {
                                 theme::text()
                             } else {
@@ -6904,13 +9625,14 @@ impl Workspace {
                             }))
                             .child(self.pane_title(tab.focused, cx)),
                     )
-                    .child(
-                        div()
-                            .w_full()
-                            .one_line()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(who),
+                    // A quiet tag: what it is doing while it works or waits;
+                    // else, in Recent where no header names it, the project.
+                    .children(
+                        if working || wants { Some(who.to_string()) } else { place.map(str::to_string) }
+                            .filter(|p| !p.is_empty())
+                            .map(|p| {
+                                div().flex_shrink().min_w_0().max_w(u(150.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p)
+                            }),
                     ),
             )
             .child(
@@ -6919,27 +9641,17 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
+                    .justify_end()
+                    .min_w(u(TRAIL_W))
                     .relative()
                     .child(
                         div()
                             .group_hover(group.clone(), |s| s.opacity(0.))
-                            .text_size(u(11.))
-                            .child(if working {
-                                shimmer(
-                                    ElementId::NamedInteger("thread-shimmer".into(), ix as u64),
-                                    state,
-                                )
-                            } else if wants {
-                                alert_pill().into_any_element()
-                            } else if loud {
-                                pill(state).into_any_element()
-                            } else {
-                                div()
-                                    .text_size(u(11.))
-                                    .text_color(rgb(theme::dim()))
-                                    .child(state)
-                                    .into_any_element()
-                            }),
+                            .child(row_trailer(
+                                ElementId::NamedInteger("thread-mark".into(), ix as u64),
+                                if working { RowState::Working } else if wants { RowState::Wants } else if loud { RowState::Done } else { RowState::Idle },
+                                ago(self.last_active(first, cx)),
+                            )),
                     )
                     .child(
                         icon_button(
@@ -6957,7 +9669,7 @@ impl Workspace {
                         })),
                     ),
             )
-            .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+            .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, window, cx| ws.row_click(ix, ev.modifiers(), window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
@@ -7037,8 +9749,11 @@ impl Workspace {
         gpui::point(px(theme::GUTTER * z), px(theme::TITLEBAR_PX * z + 44. * z))
     }
 
-    fn render_tab_row(&self, ix: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
-        let indent = ROW_INDENT;
+    fn render_tab_row(&self, ix: usize, tab: &Tab, place: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+        if !self.row_matches(ix, cx) {
+            return div().into_any_element();
+        }
+        let indent = if place.is_some() { 0. } else { ROW_INDENT };
         let active = ix == self.active;
         let first = tab.leaves()[0];
         let (glyph, tint) = self.tab_icon(first, cx);
@@ -7051,6 +9766,12 @@ impl Workspace {
             Some((_, sub)) => sub.clone(),
             None => self.row_detail(tab.focused, cx).unwrap_or_else(|| self.kind_label(tab.focused)),
         });
+        // A split says so on its second line, not as one more thing on the
+        // row's edge, where the time and close button line up.
+        let _subtitle: Option<SharedString> = match (subtitle, count) {
+            (Some(s), n) if n > 1 => Some(format!("{s} · {n} panes").into()),
+            (s, _) => s,
+        };
         let row_title = shell.map(|(t, _)| t).unwrap_or_else(|| self.pane_title(tab.focused, cx));
         let is_page = matches!(
             self.panes.get(&first).map(|p| &p.kind),
@@ -7074,6 +9795,24 @@ impl Workspace {
             .get(&first)
             .and_then(|p| p.agent.as_ref())
             .map(|(cmd, _)| Icon::agent(cmd));
+        // An agent you have not looked at since it finished says so; any
+        // row in the Recent view, and an agent's anywhere, says how long
+        // ago it last did something.
+        let when = if busy || wants {
+            None
+        } else if self.unseen.contains(&first) {
+            Some(pill("Done".into()))
+        } else if place.is_some() || agent.is_some() {
+            Some(
+                div()
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child(ago(self.tab_touched(tab, cx))),
+            )
+        } else {
+            None
+        };
+        let timed = when.is_some();
         // Activity always shows in the icon's place: the agent's mark turns,
         // a busy command or a loading page spins.
         let mark = match (loading, busy, agent, self.tab_favicon(first, cx)) {
@@ -7104,9 +9843,10 @@ impl Workspace {
             active,
             !busy && !wants,
         )
+        .when(self.row_picked(ix), picked_row)
         .group(group.clone())
-        .h(u(ROW_TWO_LINE))
-        .text_size(u(13.))
+        .h(u(ROW_H))
+        .text_size(u(ROW_TEXT))
         .text_color(rgb(if active || busy || wants {
             theme::text()
         } else {
@@ -7120,44 +9860,47 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(div().w_full().one_line().child(row_title))
-                    .children(subtitle.map(|sub| {
-                        div()
-                            .w_full()
-                            .one_line()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(sub)
+                    .flex_row()
+                    .items_baseline()
+                    .gap(u(6.))
+                    .child(div().flex_shrink().min_w_0().one_line().child(row_title))
+                    .children(place.filter(|p| !p.is_empty()).map(|p| {
+                        div().flex_none().max_w(u(90.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p.to_string())
                     })),
             )
-            .when(count > 1, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(u(3.))
-                        .text_size(u(11.))
-                        .text_color(rgb(theme::dim()))
-                        .child(icon(Icon::Split, 11., theme::dim()))
-                        .child(format!("{count}")),
-                )
-            })
-            // Something wants you: the bell. Idle needs no mark.
-            .when(wants, |d| d.child(alert_pill()))
             .child(
-                icon_button(
-                    ElementId::NamedInteger("close".into(), ix as u64),
-                    Icon::Close,
-                )
-                .size(u(22.))
-                .opacity(0.)
-                .group_hover(group, |s| s.opacity(1.))
-                .on_click(cx.listener(move |ws, _, window, cx| {
-                    cx.stop_propagation();
-                    ws.close_tab(ix, window, cx);
-                })),
+                // Done or how long ago, swapped for the close button while
+                // hovered. One width for every row, so times line up.
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .min_w(u(TRAIL_W))
+                    .relative()
+                    .when_some(when, |d, _| {
+                        d.child(div().group_hover(group.clone(), |s| s.opacity(0.)).child(row_trailer(
+                            ElementId::NamedInteger("tab-mark".into(), ix as u64),
+                            if busy { RowState::Working } else if wants { RowState::Wants } else { RowState::Idle },
+                            ago(self.last_active(first, cx)),
+                        )))
+                    })
+                    .child(
+                        icon_button(
+                            ElementId::NamedInteger("close".into(), ix as u64),
+                            Icon::Close,
+                        )
+                        .when(timed, |b| b.absolute().right_0())
+                        .size(u(22.))
+                        .opacity(0.)
+                        .group_hover(group, |s| s.opacity(1.))
+                        .on_click(cx.listener(move |ws, _, window, cx| {
+                            cx.stop_propagation();
+                            ws.close_tab(ix, window, cx);
+                        })),
+                    ),
             )
-            .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+            .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, window, cx| ws.row_click(ix, ev.modifiers(), window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
@@ -7307,34 +10050,92 @@ impl Workspace {
             })
             .collect();
 
-        let place = self.bar_git.clone().map(|(project, branch)| {
+        // Two targets: the branch switches branches, the project opens
+        // its changes in Git.
+        let chip = |id: &'static str| {
             div()
-                .id("bar-git")
+                .id(id)
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap(u(5.))
                 .h(u(20.))
                 .px(u(6.))
-                .rounded(u(5.))
+                .rounded(u(6.))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+        };
+        let place = self.bar_git.clone().map(|(project, branch)| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(2.))
                 .children(branch.map(|b| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(u(5.))
+                    chip("bar-branch")
+                        .when(self.branch_picker.is_some(), |d| d.bg(rgb(theme::surface())))
                         .child(icon(Icon::Git, 12., theme::text_2()))
                         .child(div().max_w(u(160.)).one_line().text_color(rgb(theme::text())).child(b))
+                        .child(icon(Icon::ChevronUp, 9., theme::dim()))
+                        .on_click(cx.listener(|ws, _, w, cx| {
+                            if let Some(root) = ws.focused_cwd(cx).map(|c| crate::inspect::project_root(&c)) {
+                                let at = gpui::point(px(8.), w.viewport_size().height - px(30.));
+                                ws.open_branch_picker(root, at, w, cx);
+                            }
+                        }))
                 }))
-                .child(icon(Icon::Folder, 12., theme::dim()))
-                .child(div().max_w(u(160.)).one_line().child(project))
-                .on_click(cx.listener(|ws, _, w, cx| {
-                    if let Err(e) = ws.open_editor("changes", None, None, w, cx) {
-                        tracing::warn!("could not open the editor: {e}");
-                    }
-                }))
+                .child(
+                    chip("bar-project")
+                        .child(icon(Icon::Folder, 12., theme::dim()))
+                        .child(div().max_w(u(160.)).one_line().child(project))
+                        .on_click(cx.listener(|ws, _, w, cx| {
+                            if let Err(e) = ws.open_editor("changes", None, None, w, cx) {
+                                tracing::warn!("could not open the editor: {e}");
+                            }
+                        })),
+                )
         });
+        // The chats in this window as one item: their marks, how many, what
+        // they spent. Hovering opens the list, busiest first, a click from
+        // each.
+        let chats: Option<AnyElement> = self.render_bar_chats(cx);
+        // Background jobs and pages: a tab each, opening the drawer above the
+        // bar. A few show inline, in their order (the open one always among
+        // them); the rest fold into "+N", whose list holds every one.
+        let rows: Vec<BgRow> = self.jobs.iter().filter_map(|&id| self.bg_row(id, &names, cx)).collect();
+        let shown: Vec<usize> = if rows.len() <= BG_INLINE + 1 {
+            (0..rows.len()).collect()
+        } else {
+            let mut v: Vec<usize> = (0..BG_INLINE).collect();
+            if let Some(i) = rows.iter().position(|r| r.open).filter(|&i| i >= BG_INLINE) {
+                v[BG_INLINE - 1] = i;
+            }
+            v
+        };
+        let hidden: Vec<usize> = (0..rows.len()).filter(|i| !shown.contains(i)).collect();
+        let mut bg: Vec<AnyElement> = shown
+            .iter()
+            .map(|&i| {
+                let r = &rows[i];
+                let id = r.id;
+                item(ElementId::NamedInteger("bar-job".into(), id), r.open)
+                    .child(self.bg_mark(id, 12., cx))
+                    .child(div().max_w(u(120.)).one_line().child(r.label.clone()))
+                    .child(dot(r.state))
+                    .on_click(cx.listener(move |ws, _, w, cx| {
+                        if ws.job_open == Some(id) {
+                            ws.job_open = None;
+                            cx.notify();
+                        } else {
+                            ws.show_job(id, w, cx);
+                        }
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        if !hidden.is_empty() {
+            bg.push(self.render_bar_more(&rows, &hidden, cx));
+        }
         let meter = self.render_usage_meter(cx);
         div()
             .flex()
@@ -7345,10 +10146,12 @@ impl Workspace {
             .px(u(6.))
             .border_t_1()
             .border_color(rgba(theme::hairline()))
-            .bg(rgb(theme::sidebar()))
+            .bg(theme::ground())
             .text_size(u(11.5))
             .text_color(rgb(theme::text_2()))
             .children(place)
+            .when(chats.is_some(), |d| d.child(sep()).children(chats))
+            .when(!bg.is_empty(), |d| d.child(sep()).children(bg))
             .child(div().flex_1().min_w(u(12.)))
             .child(
                 div()
@@ -7363,6 +10166,556 @@ impl Workspace {
             )
             .when(!ports.is_empty(), |d| d.child(sep()).children(ports))
             .children(meter.map(|m| div().flex().flex_none().items_center().child(sep()).child(m)))
+            .into_any_element()
+    }
+
+    fn render_bar_chats(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let spend = self.chat_spend(cx);
+        if spend.is_empty() {
+            return None;
+        }
+        let focused = self.focused();
+        let working = spend.iter().filter(|c| self.status(c.pane, cx) == Some(Status::Working)).count();
+        let cost: f64 = spend.iter().filter_map(|c| c.usage.cost_usd).sum();
+        let tokens_all: u64 = spend.iter().map(|c| c.usage.tokens()).sum();
+        let figure = if cost >= 0.01 { format!("${cost:.2}") } else { tokens(tokens_all) };
+        // Up to three marks, overlapping a little, like a stack.
+        let mut marks = div().flex().items_center();
+        let mut seen: Vec<Icon> = Vec::new();
+        for c in &spend {
+            if !seen.contains(&c.mark) && seen.len() < 3 {
+                seen.push(c.mark);
+                let tone = c.mark.brand().unwrap_or(theme::text_2());
+                marks = marks.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(u(16.))
+                        .when(seen.len() > 1, |d| d.ml(u(-4.)))
+                        .rounded_full()
+                        .bg(rgb(theme::sidebar()))
+                        .child(icon(c.mark, 11., tone)),
+                );
+            }
+        }
+        let label = match (spend.len(), working) {
+            (1, 0) => "1 chat".to_string(),
+            (n, 0) => format!("{n} chats"),
+            (n, w) => format!("{n} chats · {w} working"),
+        };
+        let open = self.bar_chats_open;
+        let mut list = div()
+            .id("bar-chats-list")
+            .absolute()
+            .bottom(u(32.))
+            .left_0()
+            .w(u(340.))
+            .p(u(4.))
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .occlude()
+            .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                ws.bar_chats_over_list = *on;
+                ws.bar_chats_close_soon(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(26.))
+                    .px(u(8.))
+                    .text_size(u(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child(div().flex_1().child("Chats in this window"))
+                    .child(div().font_weight(FontWeight::NORMAL).child("by spend")),
+            );
+        // The conversation you are in comes first, marked: a chat here, or
+        // the agent in the focused terminal (read from its own transcript).
+        let mut spend = spend;
+        if let Some(i) = spend.iter().position(|c| Some(c.pane) == focused) {
+            let c = spend.remove(i);
+            spend.insert(0, c);
+        }
+        let here_terminal = focused
+            .filter(|id| !spend.iter().any(|c| c.pane == *id))
+            .and(self.usage.session.as_ref());
+        if let Some((title, su)) = here_terminal {
+            let figure = su.cost_usd.map_or_else(|| tokens(su.input + su.output + su.cache_read), |c| format!("${c:.2}"));
+            let pct = su.context_used as f32 / su.context_window.max(1) as f32 * 100.;
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(10.))
+                    .h(u(40.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .bg(rgb(theme::surface()))
+                    .text_size(u(12.5))
+                    .child(icon(Icon::Claude, 13., Icon::Claude.brand().unwrap_or(theme::text_2())))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(u(1.))
+                            .child(div().w_full().one_line().line_height(u(16.)).text_color(rgb(theme::text())).child(title.clone()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .one_line()
+                                    .line_height(u(14.))
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(format!("This terminal · context {}", pct_text(pct))),
+                            ),
+                    )
+                    .child(current_tag())
+                    .child(div().flex_none().min_w(u(48.)).flex().justify_end().text_size(u(12.)).text_color(rgb(theme::text_2())).child(figure)),
+            );
+        }
+        for c in spend.iter().take(10) {
+            let pane = c.pane;
+            let busy = self.status(pane, cx) == Some(Status::Working);
+            let figure = match c.usage.cost_usd.filter(|v| *v >= 0.01) {
+                Some(v) => format!("${v:.2}"),
+                None => tokens(c.usage.tokens()),
+            };
+            list = list.child(
+                div()
+                    .id(ElementId::NamedInteger("bar-chat".into(), pane))
+                    .flex()
+                    .items_center()
+                    .gap(u(10.))
+                    .h(u(40.))
+                    .px(u(8.))
+                    // Concentric: the list's 10 radius less its 4 padding.
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .text_size(u(12.5))
+                    .when(focused == Some(pane), |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(if busy {
+                        thinking(ElementId::NamedInteger("bar-chat-think".into(), pane), c.mark, 13., live(c.mark))
+                    } else {
+                        icon(c.mark, 13., theme::text_2())
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(u(1.))
+                            .child(div().w_full().one_line().line_height(u(16.)).text_color(rgb(theme::text())).child(c.title.clone()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .one_line()
+                                    .line_height(u(14.))
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(match &c.model {
+                                        Some(m) => format!("{} · {m}", c.agent),
+                                        None => c.agent.to_string(),
+                                    }),
+                            ),
+                    )
+                    .when(focused == Some(pane), |d| d.child(current_tag()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_w(u(48.))
+                            .flex()
+                            .justify_end()
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::text_2()))
+                            .child(figure),
+                    )
+                    .on_click(cx.listener(move |ws, _, w, cx| {
+                        ws.bar_chats_open = false;
+                        ws.focus_pane(pane, w, cx);
+                    })),
+            );
+        }
+        Some(
+            div()
+                .relative()
+                .flex()
+                .flex_none()
+                .child(
+                    div()
+                        .id("bar-chats")
+                        .flex()
+                        .items_center()
+                        .gap(u(6.))
+                        .h(u(20.))
+                        .px(u(6.))
+                        .rounded(u(5.))
+                        .cursor_pointer()
+                        .text_color(rgb(if open { theme::text() } else { theme::text_2() }))
+                        .when(open, |d| d.bg(rgb(theme::surface())))
+                        .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                        .child(marks)
+                        .child(label)
+                        .child(div().text_color(rgb(theme::dim())).child(figure))
+                        .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                            ws.bar_chats_over_item = *on;
+                            if *on {
+                                ws.bar_chats_open = true;
+                                cx.notify();
+                            } else {
+                                ws.bar_chats_close_soon(cx);
+                            }
+                        }))
+                        .on_click(cx.listener(|ws, _, _, cx| {
+                            ws.bar_chats_open = !ws.bar_chats_open;
+                            cx.notify();
+                        })),
+                )
+                .when(open, |d| {
+                    d.child(gpui::deferred(list.with_animation(
+                        "bar-chats-in",
+                        Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                        |d, t| d.opacity(t).bottom(u(28. + 4. * t)),
+                    )))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// A background job or page as the status bar shows it.
+    fn bg_row(&self, id: PaneId, names: &HashMap<PaneId, &str>, cx: &App) -> Option<BgRow> {
+        let label = names.get(&id).map_or_else(|| format!("job {id}"), |n| n.to_string());
+        let open = self.job_open == Some(id);
+        let (detail, state, failed) = match &self.panes.get(&id)?.kind {
+            PaneKind::Terminal(_) => {
+                let j = self.daemon_job(id);
+                let running = j.is_some_and(|j| j.running);
+                let failed = j.is_some_and(|j| !j.running && j.exit.is_some_and(|c| c != 0));
+                let state = if running { theme::palette().ansi[2] } else if failed { theme::DANGER } else { theme::dim() };
+                (j.map(|j| j.cmd.lines().next().unwrap_or("").to_string()).unwrap_or_default(), state, failed)
+            }
+            PaneKind::Browser(b) => {
+                let b = b.read(cx);
+                let state = if b.loading { theme::accent() } else { theme::dim() };
+                (crate::history::host(&b.url).to_string(), state, false)
+            }
+            _ => return None,
+        };
+        Some(BgRow { id, label, detail, state, failed, open })
+    }
+
+    /// A background job's mark (its agent's, or a terminal) or a page's
+    /// favicon.
+    fn bg_mark(&self, id: PaneId, size: f32, cx: &App) -> AnyElement {
+        match self.panes.get(&id).map(|p| &p.kind) {
+            Some(PaneKind::Browser(b)) => match b.read(cx).favicon() {
+                Some(img) => crate::browser::site_image(img, size),
+                None => icon(Icon::Globe, size, theme::dim()),
+            },
+            _ => match self.daemon_job(id).and_then(|j| j.agent.as_deref()) {
+                Some(a) => icon(Icon::agent(a), size, theme::text_2()),
+                None => icon(Icon::Terminal, size, theme::dim()),
+            },
+        }
+    }
+
+    /// "+N": the background items past the inline ones, as stacked marks
+    /// and a count (red when one of them failed). Hovering opens the list
+    /// of every job and page, a click on a row opens it in the drawer.
+    fn render_bar_more(&self, rows: &[BgRow], hidden: &[usize], cx: &mut Context<Self>) -> AnyElement {
+        let open = self.bar_more_open;
+        let failed = hidden.iter().any(|&i| rows[i].failed);
+        let mut marks = div().flex().items_center();
+        for (n, &i) in hidden.iter().take(3).enumerate() {
+            marks = marks.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(u(16.))
+                    .when(n > 0, |d| d.ml(u(-5.)))
+                    .rounded_full()
+                    .bg(theme::ground())
+                    .child(self.bg_mark(rows[i].id, 11., cx)),
+            );
+        }
+        let mut list = div()
+            .id("bar-more-scroll")
+            .flex()
+            .flex_col()
+            .gap(u(1.))
+            .max_h(u(360.))
+            .overflow_y_scroll();
+        for r in rows {
+            let id = r.id;
+            list = list.child(
+                div()
+                    .id(ElementId::NamedInteger("bar-more-row".into(), id))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(u(10.))
+                    .h(u(34.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .text_size(u(12.5))
+                    .when(r.open, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(div().flex_none().flex().justify_center().w(u(14.)).child(self.bg_mark(id, 13., cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().w_full().one_line().line_height(u(15.)).text_color(rgb(theme::text())).child(r.label.clone()))
+                            .when(!r.detail.is_empty() && r.detail != r.label, |d| {
+                                d.child(
+                                    div()
+                                        .w_full()
+                                        .one_line()
+                                        .line_height(u(13.))
+                                        .text_size(u(11.))
+                                        .text_color(rgb(theme::dim()))
+                                        .child(r.detail.clone()),
+                                )
+                            }),
+                    )
+                    .child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(r.state)))
+                    .on_click(cx.listener(move |ws, _, w, cx| {
+                        ws.bar_more_open = false;
+                        ws.show_job(id, w, cx);
+                    })),
+            );
+        }
+        let panel = div()
+            .id("bar-more-list")
+            .absolute()
+            .bottom(u(32.))
+            .left_0()
+            .w(u(300.))
+            .p(u(4.))
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .occlude()
+            .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                ws.bar_more_over_list = *on;
+                ws.bar_more_close_soon(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(26.))
+                    .px(u(8.))
+                    .text_size(u(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child(div().flex_1().child("In the background"))
+                    .child(div().font_weight(FontWeight::NORMAL).child(rows.len().to_string())),
+            )
+            .child(list);
+        div()
+            .relative()
+            .flex()
+            .flex_none()
+            .child(
+                div()
+                    .id("bar-more")
+                    .flex()
+                    .items_center()
+                    .gap(u(5.))
+                    .h(u(20.))
+                    .px(u(6.))
+                    .rounded(u(5.))
+                    .cursor_pointer()
+                    .text_color(rgb(if open { theme::text() } else { theme::text_2() }))
+                    .when(open, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                    .child(marks)
+                    .child(format!("+{}", hidden.len()))
+                    .when(failed, |d| d.child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(theme::DANGER))))
+                    .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                        ws.bar_more_over_item = *on;
+                        if *on {
+                            ws.bar_more_open = true;
+                            cx.notify();
+                        } else {
+                            ws.bar_more_close_soon(cx);
+                        }
+                    }))
+                    .on_click(cx.listener(|ws, _, _, cx| {
+                        ws.bar_more_open = !ws.bar_more_open;
+                        cx.notify();
+                    })),
+            )
+            .when(open, |d| {
+                d.child(gpui::deferred(panel.with_animation(
+                    "bar-more-in",
+                    Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                    |d, t| d.opacity(t).bottom(u(28. + 4. * t)),
+                )))
+            })
+            .into_any_element()
+    }
+
+    fn bar_more_close_soon(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(220)).await;
+            let _ = this.update(cx, |ws, cx| {
+                if !ws.bar_more_over_item && !ws.bar_more_over_list && ws.bar_more_open {
+                    ws.bar_more_open = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The chats list shuts a moment after the pointer leaves both the
+    /// item and the list, so moving from one to the other keeps it open.
+    fn bar_chats_close_soon(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(220)).await;
+            let _ = this.update(cx, |ws, cx| {
+                if !ws.bar_chats_over_item && !ws.bar_chats_over_list && ws.bar_chats_open {
+                    ws.bar_chats_open = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The open background job's terminal, docked above the status bar:
+    /// its name and command, open as a tab, restart, stop, hide.
+    fn render_job_drawer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.job_open?;
+        if let PaneKind::Browser(b) = &self.panes.get(&id)?.kind {
+            return Some(self.render_page_drawer(id, b.clone(), cx));
+        }
+        let PaneKind::Terminal(t) = &self.panes.get(&id)?.kind else { return None };
+        let name = self.named.iter().find(|(_, v)| **v == id).map(|(n, _)| n.clone());
+        let dj = self.daemon_job(id).cloned();
+        let cmd = dj.as_ref().map(|j| j.cmd.clone()).unwrap_or_default();
+        let status = match dj.as_ref() {
+            Some(j) if j.running => "running · keeps going when Deck quits".to_string(),
+            Some(crate::daemon::JobInfo { exit: Some(c), .. }) => format!("exited {c}"),
+            _ => "starting".to_string(),
+        };
+        let restart_name = dj.as_ref().map(|j| j.name.clone());
+        let button = |id: &'static str, glyph: Icon| icon_button(id, glyph).size(u(22.));
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .h(u(300.))
+                .mx(u(theme::GUTTER))
+                .mb(u(theme::GUTTER))
+                .rounded(u(theme::CARD_RADIUS))
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgba(theme::hairline()))
+                .bg(rgb(theme::pane()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(u(8.))
+                        .h(u(32.))
+                        .pl(u(12.))
+                        .pr(u(4.))
+                        .border_b_1()
+                        .border_color(rgba(theme::hairline()))
+                        .text_size(u(12.))
+                        .child(icon(Icon::Terminal, 13., theme::text_2()))
+                        .child(div().font_weight(FontWeight::MEDIUM).child(name.unwrap_or_else(|| format!("job {id}"))))
+                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::dim())).child(cmd))
+                        .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(status))
+                        .child(
+                            button("job-restart", Icon::Refresh)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    if let Some(n) = restart_name.clone() {
+                                        cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
+                                    }
+                                })),
+                        )
+                        .child(
+                            button("job-tab", Icon::Maximize)
+                                .on_click(cx.listener(move |ws, _, w, cx| ws.job_to_tab(id, w, cx))),
+                        )
+                        .child(
+                            button("job-stop", Icon::Stop)
+                                .on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))),
+                        )
+                        .child(button("job-hide", Icon::ChevronDown).on_click(cx.listener(|ws, _, _, cx| {
+                            ws.job_open = None;
+                            cx.notify();
+                        }))),
+                )
+                .child(div().flex_1().min_h_0().child(t.clone()))
+                .into_any_element(),
+        )
+    }
+
+    /// A background page in the drawer: the page itself, taller than a
+    /// job's terminal, to see what the agent is reading.
+    fn render_page_drawer(&self, id: PaneId, b: Entity<BrowserPane>, cx: &mut Context<Self>) -> AnyElement {
+        let name = self.named.iter().find(|(_, v)| **v == id).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("page {id}"));
+        let button = |eid: &'static str, glyph: Icon| icon_button(eid, glyph).size(u(22.));
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .h(u(440.))
+            .mx(u(theme::GUTTER))
+            .mb(u(theme::GUTTER))
+            .rounded(u(theme::CARD_RADIUS))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgba(theme::hairline()))
+            .bg(rgb(theme::pane()))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(32.))
+                    .pl(u(12.))
+                    .pr(u(4.))
+                    .border_b_1()
+                    .border_color(rgba(theme::hairline()))
+                    .text_size(u(12.))
+                    .child(icon(Icon::Globe, 13., theme::text_2()))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                    .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::dim())).child("Background page, read by your agents"))
+                    .child(button("page-tab", Icon::Maximize).on_click(cx.listener(move |ws, _, w, cx| ws.job_to_tab(id, w, cx))))
+                    .child(button("page-close", Icon::Close).on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))))
+                    .child(button("page-hide", Icon::ChevronDown).on_click(cx.listener(|ws, _, _, cx| {
+                        ws.job_open = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(div().flex_1().min_h_0().child(b))
             .into_any_element()
     }
 
@@ -7494,7 +10847,18 @@ struct Resize {
 /// Sidebar rows share their edges: the leading mark sits in one slot at the
 /// row inset, every title starts on the same column after it, and trailing
 /// buttons end on one edge, headers' included.
+/// Presses of ⌃Tab this close together walk further back.
+const MRU_WALK: Duration = Duration::from_millis(1200);
+
+/// How far back a relaunch brings tabs and threads: three days.
+const RESTORE_SECS: i64 = 3 * 86_400;
 const ROW_SLOT: f32 = 16.;
+/// The trailing column of every row (time, state, close), right-aligned.
+const TRAIL_W: f32 = 30.;
+/// Every list row: one line, this tall, titles this size.
+const ROW_H: f32 = 34.;
+const ROW_TEXT: f32 = 14.;
+const HEAD_TEXT: f32 = 12.5;
 const ROW_GAP: f32 = 10.;
 const ROW_END: f32 = 4.;
 /// A project's rows sit one step in from its header: their icons on the
@@ -7560,6 +10924,17 @@ fn short_limit(label: &str) -> SharedString {
     } else {
         label.to_string().into()
     }
+}
+
+/// How long until `at`, compactly: "42m", "2h 14m", "3d 4h"; `None` once
+/// it has passed.
+fn until(at: std::time::SystemTime) -> Option<String> {
+    let s = at.duration_since(std::time::SystemTime::now()).ok()?.as_secs();
+    Some(match s {
+        0..=3599 => format!("{}m", s.div_ceil(60).max(1)),
+        3600..=86_399 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d {}h", s / 86_400, (s % 86_400) / 3600),
+    })
 }
 
 /// "resets in 2h 14m", or in days past a day.
@@ -7672,6 +11047,83 @@ fn git_head(root: &std::path::Path) -> Option<String> {
 /// too, only transparent, so picking a row moves nothing by a pixel. An
 /// idle row (`faded`) steps back until the pointer is on it. `indent` moves
 /// a project's rows in under its header.
+/// A small heading in the sidebar's list, with room after the label for
+/// its own controls.
+/// A group's header: its name, a step down from the rows, in semibold,
+/// the same for days, projects and the view switch.
+fn sidebar_header(label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(u(6.))
+        .h(u(30.))
+        .mt(u(16.))
+        .pl(u(theme::ROW_PAD))
+        .pr(u(ROW_END))
+        .text_size(u(HEAD_TEXT))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(theme::dim()))
+        .child(div().flex_none().child(label))
+}
+
+/// How many rows a header stands over, beside its name.
+fn header_count(n: usize) -> gpui::Div {
+    div().flex_1().font_weight(FontWeight::NORMAL).text_color(rgb(theme::dim())).opacity(0.8).child(n.to_string())
+}
+
+/// A row's second line. In the Recent view no header says the project, so
+/// the line leads with it.
+#[allow(dead_code)]
+fn second_line(place: Option<&str>, text: SharedString) -> gpui::Div {
+    let line = div().w_full().text_size(u(11.)).text_color(rgb(theme::dim()));
+    let Some(project) = place.filter(|p| !p.is_empty()) else {
+        return line.one_line().child(text);
+    };
+    let text: SharedString = if text.is_empty() {
+        project.to_string().into()
+    } else if text.starts_with(project) {
+        text
+    } else {
+        format!("{project} · {text}").into()
+    };
+    line.flex()
+        .items_center()
+        .gap(u(4.))
+        .child(div().flex_none().child(icon(Icon::Folder, 10., theme::dim())))
+        .child(div().flex_1().min_w_0().one_line().child(text))
+}
+
+/// Where a row sits in the sidebar's Recent view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Bucket {
+    Today,
+    Yesterday,
+    Week,
+    Earlier,
+}
+
+impl Bucket {
+    /// By how long ago it was against how far into today it is, both in
+    /// seconds: Yesterday is the calendar day, not the last 24 hours.
+    fn of(age: u64, since_midnight: u64) -> Bucket {
+        match age.saturating_sub(since_midnight) {
+            0 => Bucket::Today,
+            1..=86_400 => Bucket::Yesterday,
+            86_401..=518_400 => Bucket::Week,
+            _ => Bucket::Earlier,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Bucket::Today => "Today",
+            Bucket::Yesterday => "Yesterday",
+            Bucket::Week => "This week",
+            Bucket::Earlier => "Earlier",
+        }
+    }
+}
+
 fn sidebar_row(
     row: gpui::Stateful<gpui::Div>,
     indent: f32,
@@ -7687,17 +11139,10 @@ fn sidebar_row(
         .rounded(u(theme::ROW_RADIUS))
         .border_1()
         .cursor_pointer()
+        // The open row: a faint fill inside a hairline, flat (no shadow).
         .when(active, |d| {
-            d.bg(rgb(theme::row_active()))
+            d.bg(rgba(theme::alpha(theme::text(), 0x0a)))
                 .border_color(rgba(theme::hairline()))
-                .when(!theme::is_dark(), |d| {
-                    d.shadow(vec![gpui::BoxShadow {
-                        color: gpui::hsla(0., 0., 0., 0.06),
-                        offset: gpui::point(px(0.), px(1.)),
-                        blur_radius: px(2.),
-                        spread_radius: px(0.),
-                    }])
-                })
         })
         .when(!active, |d| {
             d.border_color(gpui::transparent_black())
@@ -7800,7 +11245,12 @@ impl PlaceJob {
                     }
                 }
                 let cwd = inspect::cwd(front.0).or_else(|| inspect::cwd(shell)).or(said)?;
+                let session = agent
+                    .as_ref()
+                    .filter(|(a, _)| a.cmd == "claude")
+                    .and_then(|(_, argv)| crate::session::claude_live_session(front.0, argv));
                 Some(Place {
+                    session,
                     agent: agent.map(|(a, argv)| (a.cmd, argv)),
                     front: Some(front.1),
                     ..place_of(&cwd)
@@ -7822,6 +11272,9 @@ struct Place {
     front: Option<String>,
     /// An agent CLI in front, and the arguments it was started with.
     agent: Option<(&'static str, Vec<String>)>,
+    /// The Claude Code conversation that process holds, as Claude Code
+    /// itself records it: exact, where guessing from transcripts is not.
+    session: Option<String>,
 }
 
 impl Place {
@@ -7935,12 +11388,30 @@ impl Render for Workspace {
         // IDE does, rather than the inspector silently not appearing.
         let inspector_shown =
             self.inspector.open && width - self.inspector_px >= MIN_NARROW_PX;
+        // A glass theme blurs what is behind the window; the others paint
+        // it solid. Told to the window only when it changes.
+        let glass = theme::glass();
+        if self.glass_on != Some(glass) {
+            self.glass_on = Some(glass);
+            window.set_background_appearance(if glass {
+                gpui::WindowBackgroundAppearance::Blurred
+            } else {
+                gpui::WindowBackgroundAppearance::Opaque
+            });
+        }
         let sidebar_shown = self.sidebar
             && (!inspector_shown
                 || width - self.sidebar_px - self.inspector_px >= MIN_CONTENT_PX);
         let code_shown = self
             .focused_browser_pane()
             .is_some_and(|b| b.read(cx).is_editor());
+        // Background pages show only in the drawer.
+        for &id in &self.jobs {
+            if let Some(PaneKind::Browser(b)) = self.panes.get(&id).map(|p| &p.kind) {
+                let open = self.job_open == Some(id);
+                b.update(cx, |b, _| b.set_visible(open));
+            }
+        }
         // Native webviews in hidden tabs must be hidden explicitly.
         for (ix, tab) in self.tabs.iter().enumerate() {
             for id in tab.leaves() {
@@ -7958,16 +11429,25 @@ impl Render for Workspace {
             .focused()
             .map(|id| self.pane_title(id, cx))
             .unwrap_or_default();
-        let multi = self
-            .tabs
-            .get(self.active)
-            .is_some_and(|t| matches!(t.root, Node::Split(..)));
-        let content = match self.tabs.get(self.active) {
-            Some(tab) => {
+        let project: Option<String> = self
+            .focused()
+            .and_then(|id| self.places.get(&id))
+            .map(|p| p.project.clone())
+            .filter(|p| !p.is_empty() && *p != title.as_ref());
+        // One pane of a split zoomed to fill its tab (⇧⌘↩).
+        let zoomed = self.zoomed.filter(|z| self.tabs.get(self.active).is_some_and(|t| t.root.contains(*z)));
+        let multi = zoomed.is_none()
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| matches!(t.root, Node::Split(..)));
+        let content = match (self.tabs.get(self.active), zoomed) {
+            (Some(_), Some(z)) => self.render_node(&Node::Leaf(z), false, cx),
+            (Some(tab), None) => {
                 let root = tab.root.clone();
                 self.render_node(&root, multi, cx)
             }
-            None => self.render_empty(cx),
+            (None, _) => self.render_empty(cx),
         };
 
         let left = if sidebar_shown { 0. } else { theme::GUTTER };
@@ -7988,7 +11468,7 @@ impl Render for Workspace {
                 }
             })
             .when(!sidebar_shown, |d| {
-                d.child(
+                d.child(self.new_chat_button("new-chat-bar", cx)).child(
                     icon_button("show-sidebar", Icon::Sidebar)
                         .mr(u(6.))
                         .on_click(cx.listener(|ws, _, w, cx| {
@@ -8003,15 +11483,34 @@ impl Render for Workspace {
                 )
             })
             .child(
-                div().flex_1().min_w_0().child(
-                    div()
-                        .w_full()
-                        .one_line()
-                        .text_size(u(13.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(theme::text()))
-                        .child(title.clone()),
-                ),
+                // project / title: where you are, then what.
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(u(6.))
+                    .text_size(u(13.))
+                    .children(project.map(|p| {
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(u(6.))
+                            .text_color(rgb(theme::text_2()))
+                            .child(icon(Icon::Folder, 13., theme::dim()))
+                            .child(div().max_w(u(180.)).one_line().child(p))
+                            .child(div().text_color(rgb(theme::dim())).child("/"))
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .one_line()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::text()))
+                            .child(title.clone()),
+                    ),
             )
             .child(
                 icon_button("split-right", Icon::Split).on_click(cx.listener(|ws, _, w, cx| {
@@ -8064,7 +11563,7 @@ impl Render for Workspace {
                             .overflow_hidden()
                             .border_1()
                             .border_color(rgba(theme::hairline()))
-                            .bg(rgb(theme::pane()))
+                            .bg(theme::card())
                     })
                     .child(content),
             );
@@ -8104,7 +11603,7 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::sidebar()))
+            .bg(theme::ground())
             .font_family(theme::UI)
             .on_mouse_move(cx.listener(Self::drag_divider))
             .on_mouse_move(cx.listener(Self::drag_side))
@@ -8118,11 +11617,17 @@ impl Render for Workspace {
             )
             .text_color(rgb(theme::text()))
             .on_action(cx.listener(|ws, _: &CommandPalette, w, cx| ws.toggle_palette(false, w, cx)))
+            .on_action(cx.listener(|ws, _: &ActionPalette, w, cx| {
+                ws.toggle_scoped_palette(crate::palette::Scope::Actions, w, cx)
+            }))
+            .on_action(cx.listener(|ws, _: &TabSwitcher, w, cx| {
+                ws.toggle_scoped_palette(crate::palette::Scope::Tabs, w, cx)
+            }))
             .on_action(cx.listener(|ws, _: &QuickOpen, w, cx| {
                 // In the editor ⌘P is its own Quick Open; ⌘K is still Deck's.
                 match ws.focused_browser_pane().filter(|b| b.read(cx).is_editor()) {
                     Some(b) => b.read(cx).editor_key("quickopen"),
-                    None => ws.toggle_palette(false, w, cx),
+                    None => ws.toggle_scoped_palette(crate::palette::Scope::Tabs, w, cx),
                 }
             }))
             .on_action(cx.listener(|ws, _: &LockDeck, _, cx| ws.lock(cx)))
@@ -8177,6 +11682,25 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|ws, _: &OpenSettings, w, cx| ws.open_settings(w, cx)))
+            .on_action(cx.listener(|ws, _: &OpenUsage, w, cx| ws.open_page(PageKind::Usage, w, cx)))
+            .on_action(cx.listener(|ws, _: &CloseIdleTabs, w, cx| ws.close_idle_tabs(w, cx)))
+            .on_action(cx.listener(|ws, _: &NextNeedsYou, w, cx| ws.next_needs_you(w, cx)))
+            .on_action(cx.listener(|ws, _: &ZoomPane, _, cx| {
+                ws.zoomed = match (ws.zoomed, ws.focused()) {
+                    (Some(_), _) => None,
+                    (None, f) => f,
+                };
+                cx.notify();
+            }))
+            .on_action(cx.listener(|ws, _: &FilterSidebar, w, cx| ws.open_filter(w, cx)))
+            .on_key_down(cx.listener(|ws, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && !ws.picked.is_empty() {
+                    ws.picked.clear();
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|ws, _: &OpenPackages, w, cx| ws.open_page(PageKind::Packages, w, cx)))
+            .on_action(cx.listener(|ws, _: &ImportBrowserData, w, cx| ws.open_settings_at(crate::settings_pane::Page::Browser, w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleAgents, w, cx| {
                 ws.sidebar = true;
                 let at = ws.agent_menu_at();
@@ -8200,6 +11724,11 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|ws, _: &NextTab, w, cx| ws.cycle_tab(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &RecentTab, w, cx| ws.recent_tab(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &MoveToTab, w, cx| ws.move_to_tab(w, cx)))
+            .on_action(cx.listener(|ws, _: &ConnectHost, w, cx| ws.open_remote_picker(w, cx)))
+            .on_action(cx.listener(|ws, _: &ShowTurnDiff, w, cx| ws.show_turn_diff(w, cx)))
+            .on_action(cx.listener(|ws, _: &RecentTabBack, w, cx| ws.recent_tab(-1, w, cx)))
             .on_action(cx.listener(|ws, _: &PrevTab, w, cx| ws.cycle_tab(-1, w, cx)))
             .on_action(cx.listener(|ws, _: &NextPane, w, cx| ws.cycle_pane(1, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusLeft, w, cx| ws.focus_toward(Axis::Row, false, w, cx)))
@@ -8245,6 +11774,11 @@ impl Render for Workspace {
                 ws.sidebar = !ws.sidebar;
                 cx.notify();
             }))
+            .on_action(cx.listener(|ws, _: &ToggleSidebarView, _, cx| {
+                ws.recent = !ws.recent;
+                ws.sidebar = true;
+                cx.notify();
+            }))
             .on_action(cx.listener(|ws, _: &ToggleInspector, w, cx| ws.toggle_inspector(w, cx)))
             .on_action(cx.listener(|ws, _: &ZoomIn, w, cx| ws.zoom(1, w, cx)))
             .on_action(cx.listener(|ws, _: &ZoomOut, w, cx| ws.zoom(-1, w, cx)))
@@ -8271,6 +11805,7 @@ impl Render for Workspace {
             // The side panels' edges (in `body`): drag to size them,
             // double-click for the usual width.
             .child(body)
+            .children(self.render_job_drawer(cx))
             .children(bar)
             .children(self.menu.as_ref().map(crate::menu::Open::render))
             // The palette floats over everything, a little above centre,
@@ -8303,6 +11838,8 @@ impl Render for Workspace {
                     )
             }))
             .when(self.usage_open, |d| d.child(self.render_usage_panel(cx)))
+            .children(self.render_branch_picker(window, cx))
+            .children(self.render_remote_picker(cx))
             .children(self.notice.as_ref().map(|n| self.render_notice(n, cx)))
             .children(self.toast.as_ref().map(|(text, _)| {
                 div()
@@ -8320,8 +11857,7 @@ impl Render for Workspace {
                             .rounded(u(10.))
                             .bg(rgb(theme::menu()))
                             .border_1()
-                            .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
-                            .shadow_lg()
+                            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
                             .text_size(u(12.))
                             .text_color(rgb(theme::text()))
                             .child(text.clone()),
@@ -8385,18 +11921,141 @@ fn alert_pill() -> gpui::Div {
 }
 
 /// A status in a quiet pill: what a thread needs, without colour.
-fn pill(label: SharedString) -> gpui::Div {
+/// The host picker: the folder to start in, the hosts (↑↓ to choose, ⏎ for
+/// a terminal there), and the selected one's agents.
+pub struct RemotePicker {
+    hosts: Vec<crate::remote::Host>,
+    field: Entity<crate::field::Field>,
+    sel: usize,
+    _sub: Subscription,
+}
+
+#[derive(Clone, Copy)]
+pub enum RemoteOpen {
+    Terminal,
+    /// An agent's own interface, in a terminal on the host.
+    Tui(&'static Agent),
+    /// A Deck chat with the agent (by registry id) running on the host.
+    Chat(&'static str),
+}
+
+pub struct BranchPicker {
+    field: Entity<crate::field::Field>,
+    _sub: Subscription,
+    /// (branch, when it last had a commit)
+    branches: Vec<(String, String)>,
+    current: Option<String>,
+    sel: usize,
+    root: PathBuf,
+    at: gpui::Point<gpui::Pixels>,
+}
+
+/// A row picked with ⌘-click: the accent's tint and edge, full strength.
+fn picked_row(d: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
+    d.relative()
+        .bg(rgba(theme::alpha(theme::accent(), 0x1f)))
+        .border_color(rgba(theme::alpha(theme::accent(), 0x59)))
+        .opacity(1.)
+        // A check on the row's leading edge: picked, not just open.
+        .child(
+            div()
+                .absolute()
+                .left(u(-3.))
+                .top(u(-3.))
+                .size(u(14.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(theme::accent()))
+                .child(icon(Icon::Check, 9., theme::pane())),
+        )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RowState {
+    Working,
+    Wants,
+    Done,
+    Idle,
+}
+
+/// A row's end: how long ago, then a small mark for its state: a turning
+/// ring while it works, a bell when it needs you, a filled check when it
+/// finished and you haven't looked.
+fn row_trailer(id: ElementId, state: RowState, when: String) -> AnyElement {
+    let mark: Option<AnyElement> = match state {
+        RowState::Working => Some(spinner(id, 13., theme::text_2())),
+        RowState::Wants => Some(icon(Icon::Bell, 13., theme::accent())),
+        RowState::Done => Some(
+            div()
+                .size(u(14.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(theme::text()))
+                .child(icon(Icon::Check, 9., theme::pane()))
+                .into_any_element(),
+        ),
+        RowState::Idle => None,
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(u(8.))
+        .child(div().text_size(u(12.5)).text_color(rgb(theme::dim())).child(when))
+        .children(mark)
+        .into_any_element()
+}
+
+/// "Current", on the row you are in.
+/// Background jobs and pages shown inline in the status bar before the
+/// rest fold into "+N".
+const BG_INLINE: usize = 4;
+
+/// How long a background page may sit unused before it closes. A later
+/// `deck browser open --bg --name N` opens it again.
+const BG_PAGE_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// A background job or page, as the status bar shows it.
+struct BgRow {
+    id: PaneId,
+    label: String,
+    /// The command a job runs, or the page's host.
+    detail: String,
+    state: u32,
+    failed: bool,
+    open: bool,
+}
+
+fn current_tag() -> gpui::Div {
     div()
         .flex_none()
-        .px(u(7.))
+        .h(u(18.))
+        .px(u(6.))
+        .flex()
+        .items_center()
+        .rounded(u(4.))
+        .bg(rgba(theme::alpha(theme::accent(), 0x26)))
+        .text_size(u(10.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(theme::accent()))
+        .child("Current")
+}
+
+fn pill(label: SharedString) -> gpui::Div {
+    let green = theme::palette().ansi[2];
+    div()
+        .flex_none()
         .h(u(20.))
         .flex()
         .items_center()
-        .rounded(u(10.))
-        .bg(rgb(theme::surface_hover()))
+        .gap(u(3.))
         .text_size(u(11.))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(theme::text()))
+        .text_color(rgb(theme::text_2()))
+        .when(label.as_ref() == "Done", |d| d.child(icon(Icon::Check, 11., green)))
         .child(label)
 }
 
@@ -8408,15 +12067,91 @@ fn short_secs(s: u64) -> String {
     }
 }
 
-/// "now", "5m", "2h", "3d": how long since something happened.
-fn ago(t: Instant) -> String {
-    let s = t.elapsed().as_secs();
+/// "now", "5m", "2h", "3d": how long since something happened, given
+/// in seconds since the epoch.
+fn ago(at: i64) -> String {
+    let s = (crate::local::now() - at).max(0);
     match s {
         0..=59 => "now".into(),
         60..=3599 => format!("{}m", s / 60),
         3600..=86_399 => format!("{}h", s / 3600),
         _ => format!("{}d", s / 86_400),
     }
+}
+
+/// The bytes a terminal gets for a named key: `enter`, `escape`, `tab`,
+/// `up`, `ctrl+c`, `alt+b`, or a single character.
+fn key_bytes(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    let (mods, key) = match lower.rsplit_once('+') {
+        Some((m, k)) if !k.is_empty() => (m.to_string(), k.to_string()),
+        _ => (String::new(), lower.clone()),
+    };
+    let base = match key.as_str() {
+        "enter" | "return" => "\r".to_string(),
+        "escape" | "esc" => "\u{1b}".to_string(),
+        "tab" => "\t".to_string(),
+        "backspace" => "\u{7f}".to_string(),
+        "space" => " ".to_string(),
+        "up" => "\u{1b}[A".to_string(),
+        "down" => "\u{1b}[B".to_string(),
+        "right" => "\u{1b}[C".to_string(),
+        "left" => "\u{1b}[D".to_string(),
+        "home" => "\u{1b}[H".to_string(),
+        "end" => "\u{1b}[F".to_string(),
+        "delete" => "\u{1b}[3~".to_string(),
+        "pageup" => "\u{1b}[5~".to_string(),
+        "pagedown" => "\u{1b}[6~".to_string(),
+        k if k.chars().count() == 1 => k.to_string(),
+        _ => return None,
+    };
+    if mods.contains("ctrl") {
+        let c = base.chars().next().filter(|c| c.is_ascii_alphabetic() && base.len() == 1)?;
+        return Some(((c.to_ascii_lowercase() as u8 - b'a' + 1) as char).to_string());
+    }
+    if mods.contains("alt") || mods.contains("opt") {
+        return Some(format!("\u{1b}{base}"));
+    }
+    if mods.contains("shift") && key == "tab" {
+        return Some("\u{1b}[Z".to_string());
+    }
+    Some(base)
+}
+
+/// What a terminal agent's screen says it waits on you for, from the end
+/// of its output: Claude Code's permission prompts and numbered choices,
+/// Codex's approval, the others' yes/no questions. `None`: it doesn't.
+fn agent_blocked(agent: &str, screen: &str) -> Option<&'static str> {
+    // Only the bottom of the screen: a prompt answered long ago scrolls up.
+    let tail: String = screen.lines().rev().take(14).collect::<Vec<_>>().join("\n").to_lowercase();
+    let has = |s: &str| tail.contains(s);
+    match agent {
+        "claude" => {
+            if has("do you want to proceed?") || has("do you want to make this edit") || has("do you want to create") {
+                Some("Claude Code asks to go ahead")
+            } else if has("❯ 1. yes") || (has("1. yes") && has("esc to cancel")) {
+                Some("Claude Code is waiting for your choice")
+            } else {
+                None
+            }
+        }
+        "codex" => (has("allow command?") || has("approve") && has("(y)") || has("▌ yes") || has("would you like to run")).then_some("Codex asks to run a command"),
+        "gemini" => (has("allow execution") || has("apply this change?")).then_some("Gemini asks to go ahead"),
+        _ => (has("(y/n)") || has("[y/n]") || has("continue?")).then_some("Asks you to confirm"),
+    }
+}
+
+/// A job's name from its command: `npm run dev` → dev, `cargo watch -x
+/// test` → cargo, `python -m http.server` → python.
+fn job_name(cmd: &str) -> String {
+    let words: Vec<&str> = cmd.split_whitespace().filter(|w| !w.contains('=') && !w.starts_with('-')).collect();
+    let pick = match words.as_slice() {
+        [pm, "run", script, ..] if matches!(*pm, "npm" | "pnpm" | "yarn" | "bun") => *script,
+        [pm, script, ..] if matches!(*pm, "pnpm" | "yarn" | "bun") && !matches!(*script, "x" | "dlx") => *script,
+        [first, ..] => first.rsplit('/').next().unwrap_or(first),
+        [] => "job",
+    };
+    pick.to_string()
 }
 
 fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
@@ -8527,8 +12262,7 @@ impl Workspace {
             .rounded(u(12.))
             .bg(rgb(theme::menu()))
             .border_1()
-            .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
-            .shadow_lg()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
             .occlude()
             .child(
                 div()
@@ -9210,6 +12944,44 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_agents_are_read_off_the_screen() {
+        let claude = "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n";
+        assert!(agent_blocked("claude", claude).is_some());
+        assert!(agent_blocked("claude", "✻ Thinking…\n> ").is_none());
+        assert!(agent_blocked("codex", "Allow command?\n▌ Yes  No").is_some());
+        assert!(agent_blocked("aider", "Create new file? (Y)es/(N)o [y/n]").is_some());
+    }
+
+    #[test]
+    fn job_names_and_keys() {
+        assert_eq!(job_name("npm run dev"), "dev");
+        assert_eq!(job_name("pnpm dev --port 3001"), "dev");
+        assert_eq!(job_name("PORT=3000 cargo watch -x test"), "cargo");
+        assert_eq!(job_name("/usr/bin/python3 -m http.server"), "python3");
+        assert_eq!(key_bytes("ctrl+c").as_deref(), Some("\u{3}"));
+        assert_eq!(key_bytes("enter").as_deref(), Some("\r"));
+        assert_eq!(key_bytes("up").as_deref(), Some("\u{1b}[A"));
+        assert_eq!(key_bytes("alt+b").as_deref(), Some("\u{1b}b"));
+        assert_eq!(key_bytes("shift+tab").as_deref(), Some("\u{1b}[Z"));
+        assert_eq!(key_bytes("nonsense"), None);
+    }
+
+    #[test]
+    fn recent_buckets_follow_the_calendar_not_rolling_days() {
+        let ten_am = 10 * 3600;
+        assert_eq!(Bucket::of(60, ten_am), Bucket::Today);
+        assert_eq!(Bucket::of(ten_am, ten_am), Bucket::Today);
+        // A minute before midnight, seen at 10:00, is yesterday.
+        assert_eq!(Bucket::of(ten_am + 60, ten_am), Bucket::Yesterday);
+        assert_eq!(Bucket::of(ten_am + 86_400, ten_am), Bucket::Yesterday);
+        assert_eq!(Bucket::of(ten_am + 86_401, ten_am), Bucket::Week);
+        assert_eq!(Bucket::of(ten_am + 6 * 86_400, ten_am), Bucket::Week);
+        assert_eq!(Bucket::of(ten_am + 6 * 86_400 + 1, ten_am), Bucket::Earlier);
+        // Just after midnight, an hour ago is already yesterday.
+        assert_eq!(Bucket::of(3600, 60), Bucket::Yesterday);
+    }
 
     #[test]
     fn only_ports_that_answer_http_are_web_servers() {

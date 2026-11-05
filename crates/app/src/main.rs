@@ -4,17 +4,22 @@
 //! `deck pane list` (and friends), run from a terminal inside it, drives it.
 
 mod account;
+mod adblock;
 mod browse;
 mod browser;
+mod browser_import;
 mod chat;
 mod checkpoint;
 mod cli;
 mod code;
 mod complete;
 mod control;
+mod daemon;
+mod daemon_menu;
 mod favicon;
 mod field;
 mod fuzzy;
+mod global;
 mod handler;
 mod history;
 mod icon;
@@ -26,6 +31,8 @@ mod launcher;
 mod local;
 mod lock;
 mod markdown;
+mod memory;
+mod host_mcp;
 mod mcp;
 mod menu;
 mod net;
@@ -35,6 +42,7 @@ mod pasteboard;
 mod privacy;
 mod preview;
 mod refine;
+mod remote;
 mod retry;
 mod review;
 mod select;
@@ -53,6 +61,8 @@ mod threads;
 mod thumb;
 mod updates;
 mod usage;
+mod usage_page;
+mod packages;
 mod workspace;
 
 use gpui::prelude::*;
@@ -61,12 +71,46 @@ use gpui::{
 };
 use std::path::PathBuf;
 
+/// A panic's message, where and the backtrace, appended to `crash.log` in
+/// deck's data folder before the process goes: macOS's crash report says
+/// only "abort", not why.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let trace = std::backtrace::Backtrace::force_capture();
+        let dir = control::socket_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "\n== {} deck {} panicked: {info}\n{trace}",
+                local::now(),
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        default(info);
+    }));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Started from inside an agent's session (a relaunch an agent ran, a
+    // `deck daemon` it kicked off), Deck would pass that session's markers
+    // to every terminal and job it starts. It drops them first. (Not for a
+    // plain CLI call, which runs and ends inside that session.)
+    if args.is_empty() || args.first().map(String::as_str) == Some("daemon") {
+        let markers: Vec<String> = std::env::vars().map(|(k, _)| k).filter(|k| daemon::inherited_agent_marker(k)).collect();
+        for k in markers {
+            // SAFETY: before any other thread starts.
+            unsafe { std::env::remove_var(k) };
+        }
+    }
     if !args.is_empty() {
         std::process::exit(cli::run(&args));
     }
     adopt_shell_path();
+    log_panics();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -85,11 +129,27 @@ fn main() {
     // Scripts and terminal links macOS hands deck (when it is the default
     // terminal) open in new tabs; the window picks them up when it exists.
     app.on_open_urls(handler::opened);
+    // Closing the window only hid it: the Dock icon brings it back, with
+    // every shell and agent still where it was.
+    app.on_reopen(|cx| cx.activate(true));
     app.run(move |cx: &mut App| {
         theme::add_fonts(cx);
         let skill = settings::load().agent_skill;
-        std::thread::spawn(move || shell::install_skill(skill));
+        std::thread::spawn(move || {
+            shell::install_skill(skill);
+            // Deck memory in every agent's sessions, put back each launch.
+            memory::install(skill);
+        });
+        // The background service (jobs that outlive Deck, the menu bar icon).
+        std::thread::spawn(|| {
+            if let Err(e) = daemon::ensure_running() {
+                tracing::warn!("background service: {e}");
+            }
+        });
         workspace::install(cx);
+        // Ads and trackers, compiled once for every page.
+        adblock::set_enabled(settings::load().block_ads);
+        adblock::prepare();
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -114,7 +174,15 @@ fn main() {
                 focus: !background,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx)),
+            |window, cx| {
+                // Closing the window hides deck rather than quitting it, so
+                // agents at work and running commands carry on; ⌘Q quits.
+                window.on_window_should_close(cx, |_, cx| {
+                    cx.hide();
+                    false
+                });
+                cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx))
+            },
         )
         .expect("failed to open window");
         if !background {

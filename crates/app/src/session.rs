@@ -23,6 +23,19 @@ pub struct Session {
     /// The side panels' widths, as last dragged.
     pub sidebar_width: f32,
     pub inspector_width: f32,
+    /// The sidebar lists by time (Now, Today, …) rather than by project.
+    pub recent: bool,
+    /// Background jobs, started again at launch (Settings › Terminal).
+    pub jobs: Vec<JobState>,
+}
+
+/// A background job: what `deck job start` ran, under its name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobState {
+    pub name: String,
+    pub cmd: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 impl Default for Session {
@@ -34,6 +47,8 @@ impl Default for Session {
             inspector: false,
             sidebar_width: crate::theme::SIDEBAR_PX,
             inspector_width: crate::theme::INSPECTOR_PX,
+            recent: false,
+            jobs: Vec::new(),
         }
     }
 }
@@ -46,6 +61,13 @@ pub struct TabState {
     #[serde(default)]
     pub focused: usize,
     pub root: NodeState,
+    /// Pinned by you to the top of the sidebar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_top: bool,
+    /// When it last did something, in seconds since the epoch, so the
+    /// sidebar's Recent view keeps its age across a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touched: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +95,12 @@ pub enum PaneState {
         /// the new shell (see `scrollback_file`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scrollback: Option<String>,
+        /// Its session in the background service, to attach to again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// Its control token, kept so the shell's `deck` still answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     Browser {
         url: String,
@@ -235,7 +263,16 @@ pub fn resume_line(run: &AgentRun) -> String {
         "claude" => {
             words.extend(run.flags.iter().cloned());
             match &run.session {
-                Some(id) => words.extend(["--resume".into(), id.clone()]),
+                Some(id) => {
+                    words.extend(["--resume".into(), id.clone()]);
+                    // Claude Code keeps a session alive in the background
+                    // after its window goes, and then refuses to resume it:
+                    // open the live one if it is there (by the short id
+                    // `claude agents` shows), else resume it.
+                    let short: String = id.chars().take(8).collect();
+                    let resume = words.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ");
+                    return format!("claude attach {} 2>/dev/null || {resume}", quote(&short));
+                }
                 None => words.push("--continue".into()),
             }
         }
@@ -314,6 +351,34 @@ pub fn session_arg(argv: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The conversation the Claude Code process `pid` holds, from the file
+/// Claude Code keeps for each running one (`~/.claude/sessions/<pid>.json`).
+/// A `claude attach <id>` client has none of its own: it holds the
+/// background session whose id starts with the one it was given.
+pub fn claude_live_session(pid: u32, argv: &[String]) -> Option<String> {
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".claude/sessions");
+    let id_in = |path: &Path| -> Option<String> {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        v.get("sessionId")?.as_str().map(str::to_string)
+    };
+    if let Some(id) = id_in(&dir.join(format!("{pid}.json"))) {
+        return Some(id);
+    }
+    let short = attach_target(argv)?;
+    std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| id_in(&e.path()))
+        .find(|id| id.starts_with(short))
+}
+
+/// `claude attach 9e66de16` → `9e66de16`.
+fn attach_target(argv: &[String]) -> Option<&str> {
+    let at = argv.iter().position(|a| a == "attach")?;
+    argv.get(at + 1).map(String::as_str).filter(|s| s.len() >= 6 && !s.starts_with('-'))
 }
 
 /// What a Claude Code conversation has been called: the titles Claude Code
@@ -401,6 +466,14 @@ mod tests {
     }
 
     #[test]
+    fn an_attach_client_names_its_session_by_prefix() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(attach_target(&argv("claude attach 9e66de16")), Some("9e66de16"));
+        assert_eq!(attach_target(&argv("claude attach")), None);
+        assert_eq!(attach_target(&argv("claude --resume 9e66de16-72a7")), None);
+    }
+
+    #[test]
     fn a_conversation_is_named_by_its_own_titles_or_first_ask() {
         assert_eq!(session_arg(&argv("claude --model opus --resume ab-1 fix")).as_deref(), Some("ab-1"));
         assert_eq!(session_arg(&argv("claude --session-id=x9")).as_deref(), Some("x9"));
@@ -460,7 +533,7 @@ mod tests {
         };
         assert_eq!(
             resume_line(&run("claude", "--model opus", Some("1f2e-33"))),
-            "claude --model opus --resume 1f2e-33"
+            "claude attach 1f2e-33 2>/dev/null || claude --model opus --resume 1f2e-33"
         );
         assert_eq!(resume_line(&run("claude", "", None)), "claude --continue");
         assert_eq!(
@@ -507,12 +580,16 @@ mod tests {
                                 tab: true,
                             }),
                             scrollback: None,
+                            session: Some("tab-abc".into()),
+                            token: None,
                         }),
                         NodeState::Pane(PaneState::Browser {
                             url: "https://example.com".into(),
                         }),
                     ],
                 },
+                on_top: true,
+                touched: Some(1_761_600_000),
             }],
             active: 0,
             sidebar: false,
@@ -524,5 +601,7 @@ mod tests {
         let old: Session =
             serde_json::from_str(r#"{"tabs":[{"root":{"pane":{"kind":"settings"}}}]}"#).unwrap();
         assert!(old.sidebar && old.tabs.len() == 1);
+        assert_eq!(old.tabs[0].touched, None);
+        assert!(!old.tabs[0].on_top);
     }
 }

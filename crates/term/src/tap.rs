@@ -42,6 +42,9 @@ pub enum Signal {
     /// Deck's own (OSC 6973;ask): "# …" typed at the prompt, a request for
     /// a command.
     Ask(String),
+    /// Deck's own (OSC 6973;report;STATE;MESSAGE): a program says how it
+    /// is doing: working, blocked (on you), done, error, or clear.
+    Report(String, String),
     /// Deck's own (OSC 6973;line): the line being edited at the prompt and
     /// where the cursor is in it, in characters; `None` once it is done.
     Line(Option<(usize, String)>),
@@ -288,6 +291,12 @@ fn parse(osc: &str) -> Option<Mark> {
     if let Some(ask) = osc.strip_prefix("6973;ask;") {
         let ask = ask.trim();
         return (!ask.is_empty()).then(|| Mark::Signal(Signal::Ask(ask.to_string())));
+    }
+    if let Some(rest) = osc.strip_prefix("6973;report;") {
+        let (state, msg) = rest.split_once(';').unwrap_or((rest, ""));
+        let state = state.trim().to_lowercase();
+        return matches!(state.as_str(), "working" | "blocked" | "done" | "error" | "clear")
+            .then(|| Mark::Signal(Signal::Report(state, msg.trim().to_string())));
     }
     if let Some(line) = osc.strip_prefix("6973;line;") {
         let (cursor, text) = line.split_once(';')?;

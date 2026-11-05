@@ -99,6 +99,10 @@ impl ClaudeAdapter {
             a.push("--allowedTools".into());
             a.push(ctx.allowed_tools.join(","));
         }
+        if !ctx.disallowed_tools.is_empty() {
+            a.push("--disallowedTools".into());
+            a.push(ctx.disallowed_tools.join(","));
+        }
         a.push("--permission-mode".into());
         a.push(
             match ctx.permission_mode {
@@ -206,13 +210,15 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     async fn spawn(&self, ctx: SessionCtx) -> Result<Box<dyn AgentSession>, AgentError> {
-        let mcp_config = self.write_mcp_config(&ctx).await?;
+        // A file on this Mac means nothing to an agent on another host.
+        let mcp_config = if ctx.remote.is_some() { None } else { self.write_mcp_config(&ctx).await? };
         let args = self.args(&ctx, mcp_config.as_ref());
+        let (program, args, dir) = agent_core::adapter::launch(&ctx, &self.bin.to_string_lossy(), &args);
 
-        let mut child = Command::new(&self.bin)
+        let mut child = Command::new(&program)
             .args(&args)
             .envs(ctx.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(&ctx.cwd)
+            .current_dir(&dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -229,6 +235,10 @@ impl AgentAdapter for ClaudeAdapter {
         // Decode stdout on its own task. The decoder lives here, so `Decoder`'s
         // state never needs a lock.
         let session_tx = tx.clone();
+        // Keep the last few stderr lines; they are the only diagnostic when the
+        // CLI refuses to start or quits.
+        let stderr_tail = std::sync::Arc::new(Slot::default());
+        let stderr_seen = stderr_tail.clone();
         let native_id = std::sync::Arc::new(Slot::default());
         let native_id_writer = native_id.clone();
         let asks: Asks = Default::default();
@@ -268,19 +278,17 @@ impl AgentAdapter for ClaudeAdapter {
                     }
                 }
             }
-            // Stdout closed: the CLI exited. Report it so the supervisor can
-            // decide whether to restart.
-            let _ = session_tx
-                .send(AgentEvent::Fatal {
-                    message: "claude exited".into(),
-                    retryable: true,
-                })
-                .await;
+            // Stdout closed: the CLI exited. Report it, with what it last said
+            // on stderr (given a moment to arrive), so the supervisor can
+            // decide whether to restart and the user sees why.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let message = match stderr_seen.get().filter(|l| !l.trim().is_empty()) {
+                Some(why) => format!("claude exited: {}", why.trim()),
+                None => "claude exited".into(),
+            };
+            let _ = session_tx.send(AgentEvent::Fatal { message, retryable: true }).await;
         });
 
-        // Keep the last few stderr lines; they are the only diagnostic when the
-        // CLI refuses to start.
-        let stderr_tail = std::sync::Arc::new(Slot::default());
         let stderr_writer = stderr_tail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -581,6 +589,9 @@ mod tests {
             permission_mode: PermissionMode::Ask,
             env: Vec::new(),
             allowed_tools: Vec::new(),
+            remote: None,
+            disallowed_tools: Vec::new(),
+            host_only: false,
         }
     }
 

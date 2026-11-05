@@ -11,11 +11,17 @@ use std::time::Duration;
 
 impl SettingsPane {
     pub(super) fn page_permissions(&self, cx: &mut Context<Self>) -> Vec<Section> {
-        let manual = Permission::MANUAL
+        let mut manual: Vec<_> = Permission::MANUAL
             .iter()
             .enumerate()
             .map(|(ix, p)| row(p.name(), self.permission_control(ix, *p, cx)).about(p.why()))
             .collect();
+        manual.insert(
+            1,
+            row("Full Disk Access for the background service", self.service_control(cx)).about(
+                "Terminals kept open across restarts and Deck's agents run under deckd, which macOS counts as its own program. Without this, they cannot read Downloads, Desktop or Documents (an SSH key in Downloads fails with \"Operation not permitted\").",
+            ),
+        );
         let asked = Permission::ASKED
             .iter()
             .enumerate()
@@ -26,12 +32,38 @@ impl SettingsPane {
                 "Turn on in System Settings",
                 manual,
                 Some(
-                    "macOS lets no app turn these on by itself. Programs in Deck's terminals and its agents run as Deck, so they get what Deck has. Quit and reopen Deck after switching one on if it does not take."
+                    "macOS lets no app turn these on by itself. Quit and reopen Deck after switching one on if it does not take; for the background service, reopen the terminals that need it."
                         .into(),
                 ),
             ),
             group("Asked when needed", asked, None),
         ]
+    }
+
+    /// The service's Full Disk Access: whether it has it, and Open, which
+    /// shows the pane and the service's program in Finder to drag in.
+    fn service_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let _ = cx;
+        let state = crate::privacy::service_full_disk();
+        let mut control = div().flex().items_center().gap(u(12.));
+        if state != State::Unknown {
+            let on = state == State::On;
+            let dot = div().flex_none().size(u(7.)).rounded_full();
+            let dot = if on { dot.bg(rgb(theme::palette().ansi[2])) } else { dot.border_1().border_color(rgba(theme::input_edge())) };
+            control = control.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::text_2()))
+                    .child(dot)
+                    .child(if on { "On" } else { "Off" }),
+            );
+        }
+        control
+            .child(button("perm-service", "Open").on_click(|_, _, _| crate::privacy::grant_service()))
+            .into_any_element()
     }
 
     /// Whether it is on, where macOS says, and the way to change it.

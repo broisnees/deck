@@ -237,6 +237,19 @@ impl Field {
         self.buf.mention_token().map(|(at, q)| (at, q.to_string()))
     }
 
+    /// `/command` at the start, or `$skill`: (sigil, start, query).
+    pub fn command_token(&self) -> Option<(char, usize, String)> {
+        self.buf
+            .slash_token()
+            .map(|(a, q)| ('/', a, q.to_string()))
+            .or_else(|| self.buf.dollar_token().map(|(a, q)| ('$', a, q.to_string())))
+    }
+
+    pub fn complete_token(&mut self, start: usize, with: &str, cx: &mut Context<Self>) {
+        let with = with.to_string();
+        self.edit(Run::Other, cx, |b| b.replace_token(start, &with));
+    }
+
     pub fn complete_mention(&mut self, start: usize, path: &str, cx: &mut Context<Self>) {
         let path = path.to_string();
         self.edit(Run::Other, cx, |b| b.replace_mention(start, &path));
@@ -762,6 +775,7 @@ impl Render for Field {
                 ));
             }
             highlights.sort_by_key(|(r, _)| r.start);
+            let highlights = theme::safe_highlights(&text, highlights);
             let styled = StyledText::new(text).with_highlights(highlights);
             let layout = styled.layout().clone();
             let cursor = self.buf.cursor();

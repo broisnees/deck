@@ -623,6 +623,87 @@ const WAIT: &str = r#"(a) => {
   return res;
 }"#;
 
+/// The page as Markdown for a model to read: its main content (an
+/// article, main, or the largest block of text), headings, paragraphs,
+/// lists, quotes, code and links kept, menus, footers and hidden parts
+/// left out. Open shadow roots are read too. Capped at `max` characters.
+const READ: &str = r#"(a) => {
+  const max = a.max || 40000;
+  const skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG|CANVAS|IFRAME|NAV|FOOTER|ASIDE|FORM|BUTTON|SELECT|OPTION|DIALOG)$/;
+  const hiddenEl = (el) => {
+    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+    const cs = W.getComputedStyle(el);
+    return cs.display === 'none' || cs.visibility === 'hidden';
+  };
+  const textLen = (el) => (el.innerText || el.textContent || '').length;
+  let root = D.querySelector('article, main, [role=main], shreddit-post, #content') || D.body;
+  // A page with several articles (a feed): their common parent.
+  const arts = D.querySelectorAll('article, shreddit-post');
+  if (arts.length > 1) root = D.querySelector('main, [role=main]') || D.body;
+  if (root && textLen(root) < 400) root = D.body;
+  const abs = (h) => { try { return new URL(h, location.href).href; } catch (e) { return h; } };
+  let out = '';
+  const block = (s) => { s = s.replace(/[ \t]+\n/g, '\n').trim(); if (s) out += (out ? '\n\n' : '') + s; };
+  // Inline text of `el`: links as [text](href), code in backticks.
+  const inline = (el) => {
+    let s = '';
+    const kids = el.shadowRoot ? [...el.shadowRoot.childNodes, ...el.childNodes] : el.childNodes;
+    for (const n of kids) {
+      if (n.nodeType === 3) { s += n.data.replace(/\s+/g, ' '); continue; }
+      if (n.nodeType !== 1 || skip.test(n.tagName) || hiddenEl(n)) continue;
+      const t = n.tagName;
+      if (t === 'BR') s += '\n';
+      else if (t === 'A' && n.getAttribute('href') && !n.getAttribute('href').startsWith('javascript')) {
+        const txt = inline(n).trim();
+        s += txt ? `[${txt}](${abs(n.getAttribute('href'))})` : '';
+      } else if (t === 'CODE') s += '`' + n.textContent + '`';
+      else if (t === 'STRONG' || t === 'B') { const x = inline(n).trim(); s += x ? `**${x}**` : ''; }
+      else if (t === 'EM' || t === 'I') { const x = inline(n).trim(); s += x ? `*${x}*` : ''; }
+      else if (t === 'IMG') { const alt = (n.getAttribute('alt') || '').trim(); if (alt) s += `[image: ${alt}]`; }
+      else s += inline(n);
+    }
+    return s;
+  };
+  const BLOCK = /^(P|DIV|SECTION|ARTICLE|MAIN|HEADER|UL|OL|LI|H[1-6]|PRE|BLOCKQUOTE|TABLE|THEAD|TBODY|TFOOT|TR|DL|DT|DD|FIGURE|FIGCAPTION|DETAILS|SUMMARY|HR)$/;
+  const hasBlock = (el) => [...el.children, ...(el.shadowRoot ? el.shadowRoot.children : [])].some((c) => BLOCK.test(c.tagName) || c.tagName.includes('-'));
+  const walk = (el, depth) => {
+    if (out.length > max) return;
+    if (el.nodeType !== 1 || skip.test(el.tagName) || hiddenEl(el)) return;
+    const t = el.tagName;
+    if (/^H[1-6]$/.test(t)) { block('#'.repeat(+t[1]) + ' ' + inline(el).trim()); return; }
+    if (t === 'PRE') { block('```\n' + el.innerText.replace(/\n+$/, '') + '\n```'); return; }
+    if (t === 'HR') { block('---'); return; }
+    if (t === 'BLOCKQUOTE') { block(inline(el).trim().split('\n').map((l) => '> ' + l).join('\n')); return; }
+    if (t === 'LI') {
+      const mark = el.parentElement && el.parentElement.tagName === 'OL' ? '1.' : '-';
+      if (!hasBlock(el)) { block('  '.repeat(Math.max(0, depth)) + mark + ' ' + inline(el).trim()); return; }
+    }
+    if (t === 'TR') { block('| ' + [...el.children].map((c) => inline(c).trim().replace(/\|/g, '/')).join(' | ') + ' |'); return; }
+    if (!hasBlock(el)) { const x = inline(el).trim(); if (x) block(x); return; }
+    const kids = el.shadowRoot ? [...el.shadowRoot.children, ...el.children] : [...el.children];
+    const nd = (t === 'UL' || t === 'OL') ? depth + 1 : depth;
+    for (const c of kids) {
+      if (c.tagName === 'SLOT') { for (const s of c.assignedElements()) walk(s, nd); continue; }
+      walk(c, nd);
+    }
+    // Text sitting directly in a block that also has blocks.
+    for (const n of el.childNodes) if (n.nodeType === 3 && n.data.trim().length > 30) block(n.data.trim());
+  };
+  walk(root, -1);
+  out = out.replace(/\n{3,}/g, '\n\n');
+  const cut = out.length > max;
+  return { url: location.href, title: D.title, ready: D.readyState, chars: out.length,
+           truncated: cut, markdown: cut ? out.slice(0, max) + '\n\n[… cut at ' + max + ' characters]' : out };
+}"#;
+
+/// How far the page has got: for `deck read`'s wait.
+const READY: &str = r#"(a) => ({ ready: D.readyState, url: location.href, title: D.title,
+  text: D.body ? (D.body.innerText || '').length : 0 })"#;
+
+/// One step down an endless page, so the next batch loads.
+const MORE: &str = r#"(a) => { const h = D.scrollingElement || D.body; const before = h.scrollHeight;
+  W.scrollTo(0, h.scrollHeight); return { height: before }; }"#;
+
 /// Where an action's navigation, if it started one, has got to.
 const SETTLE: &str = r#"(a) => {
   const act = W.__deckAct && W.__deckAct.tok === a.tok ? W.__deckAct : null;
@@ -644,6 +725,9 @@ pub fn script(verb: &str, args: &Value) -> Result<String, String> {
         "back" | "forward" | "reload" => NAV,
         "wait" => WAIT,
         "settle" => SETTLE,
+        "read" => READ,
+        "ready" => READY,
+        "more" => MORE,
         v => return Err(format!("no browser action {v:?}")),
     };
     let args = serde_json::to_string(args).map_err(|e| e.to_string())?;
@@ -691,6 +775,9 @@ pub fn run(verb: &str, args: Value) -> Result<Value, String> {
     let target = target(&args);
     if verb == "wait" {
         return wait(&target, &args);
+    }
+    if verb == "read" {
+        return read_here(&target, &args);
     }
     let mut a = args.clone();
     let tok = token();
@@ -859,4 +946,58 @@ mod tests {
             std::fs::write(dir.join(format!("{name}.js")), body).unwrap();
         }
     }
+}
+
+/// The page in `target` as Markdown, after scrolling `scroll` times to load
+/// more of an endless page.
+fn read_here(target: &Value, args: &Value) -> Result<Value, String> {
+    let num = |k: &str| args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
+    for _ in 0..num("scroll").unwrap_or(0).min(30) {
+        eval(target, &script("more", &json!({}))?)?;
+        std::thread::sleep(Duration::from_millis(1200));
+    }
+    let v = eval(target, &script("read", &json!({ "max": num("max").unwrap_or(40_000) }))?)?;
+    if v.is_null() {
+        return Err("the page gave no answer".into());
+    }
+    Ok(v)
+}
+
+/// `deck read URL`: open URL in a background page (a real WebKit page with
+/// Deck's user agent and your sign-ins, out of sight), wait for it to load
+/// and settle, and return it as Markdown. The page stays open under its
+/// name, so `deck browser click --name …` and friends can go on from there.
+pub fn read_url(args: &Value) -> Result<Value, String> {
+    let url = args.get("url").and_then(Value::as_str).ok_or("read needs a URL")?;
+    let name = args.get("name").and_then(Value::as_str).unwrap_or("reader").to_string();
+    let opened = control::call("browser.open", json!({ "url": url, "name": name, "bg": true }))?;
+    let target = json!({ "pane": opened["pane"] });
+    let timeout = args
+        .get("timeout")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        .unwrap_or(30);
+    let start = Instant::now();
+    let ready_js = script("ready", &json!({}))?;
+    // Past the old document (a reused page) and loaded; a page that keeps
+    // loading counts once it has text and four seconds have gone.
+    std::thread::sleep(Duration::from_millis(400));
+    loop {
+        if let Ok(v) = eval(&target, &ready_js) {
+            let loaded = v["ready"] == "complete" || (v["ready"] == "interactive" && start.elapsed() > Duration::from_secs(4));
+            let real = v["url"].as_str().is_some_and(|u| u != "about:blank");
+            if loaded && real && v["text"].as_u64().unwrap_or(0) > 0 {
+                break;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(timeout) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Client-side apps render after load.
+    std::thread::sleep(Duration::from_millis(1200));
+    let mut v = read_here(&target, args)?;
+    v["pane"] = opened["pane"].clone();
+    v["name"] = name.into();
+    Ok(v)
 }

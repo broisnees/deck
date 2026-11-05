@@ -114,6 +114,156 @@ pub struct SessionCtx {
     /// Tools pre-approved regardless of `permission_mode`, in the backend's own
     /// syntax (Claude: `Bash(deck:*)`). Lets a gated session still drive the host.
     pub allowed_tools: Vec<String>,
+    /// Run the agent on this SSH host (a host alias or `user@host`) instead
+    /// of here; `cwd` is then a folder on that host.
+    pub remote: Option<String>,
+    /// Built-in tools the agent must not have, in its own naming (Claude:
+    /// `Bash`, `Edit`). A chat on a host turns off the local file and shell
+    /// tools so its host-bound MCP tools are the only way to act.
+    pub disallowed_tools: Vec<String>,
+    /// The agent runs here but works on another machine through an MCP
+    /// server bound to it (`mcp`): every built-in tool that would read,
+    /// change or run anything on this Mac must be off, by whatever means the
+    /// backend has. Claude's are named in `disallowed_tools`; the CLI
+    /// backends read this.
+    pub host_only: bool,
+}
+
+/// Deck's own SSH config: the hosts added in Deck (each with its user, key
+/// and port), then the user's `~/.ssh/config` and the system's, included.
+/// Kept beside Deck's other data (`DECK_DATA_DIR`, else Application
+/// Support) and written by the app; here so every `ssh` Deck starts, an
+/// agent's included, reads the same hosts.
+pub fn ssh_config() -> std::path::PathBuf {
+    std::env::var_os("DECK_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("Library/Application Support/deck")
+        })
+        .join("ssh_config")
+}
+
+/// `-F` and Deck's SSH config, once there is one; nothing before any host
+/// is added in Deck, so `ssh` reads only the user's own config as usual.
+pub fn ssh_config_flags() -> Vec<String> {
+    let p = ssh_config();
+    if p.is_file() {
+        vec!["-F".into(), p.to_string_lossy().into_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// How to start `bin` with `args` for `ctx`: as is, or on `ctx.remote`
+/// through `ssh`, in its login shell (so its PATH finds the agent), in the
+/// remote folder, with the session's environment except what only means
+/// something here (Deck's socket and token). Returns the program, its
+/// arguments and the local folder to start it in.
+pub fn launch(ctx: &SessionCtx, bin: &str, args: &[String]) -> (String, Vec<String>, std::path::PathBuf) {
+    let Some(host) = ctx.remote.as_deref() else {
+        return (bin.to_string(), args.to_vec(), ctx.cwd.clone());
+    };
+    fn q(s: &str) -> String {
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c)) {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+    }
+    // The agent by name: a path from this Mac means nothing there.
+    let name = std::path::Path::new(bin)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bin.to_string());
+    let env: Vec<String> = ctx
+        .env
+        .iter()
+        .filter(|(k, _)| !k.starts_with("DECK_"))
+        .map(|(k, v)| format!("{k}={}", q(v)))
+        .collect();
+    let dir = ctx.cwd.to_string_lossy();
+    // `~` and `~/x` as the user wrote them: the remote shell expands them.
+    let dir = match dir.strip_prefix('~') {
+        Some(rest) if rest.is_empty() => "\"$HOME\"".to_string(),
+        Some(rest) => format!("\"$HOME\"{}", q(rest)),
+        None => q(&dir),
+    };
+    // Missing there: say so plainly, not as `env: …: No such file`.
+    let mut inner = format!(
+        "command -v {n} >/dev/null 2>&1 || {{ echo {msg} >&2; exit 127; }}; cd {dir} && exec",
+        n = q(&name),
+        msg = q(&format!("{name} is not installed on {host} (not on its PATH)")),
+    );
+    if !env.is_empty() {
+        inner.push_str(" env ");
+        inner.push_str(&env.join(" "));
+    }
+    inner.push(' ');
+    inner.push_str(&q(&name));
+    for a in args {
+        inner.push(' ');
+        inner.push_str(&q(a));
+    }
+    let line = format!("exec \"$SHELL\" -lc {}", q(&inner));
+    // LogLevel=ERROR: SSH's own notices (an old server's post-quantum
+    // warning) would otherwise land in the agent's output.
+    let mut ssh_args: Vec<String> = vec![
+        "-T".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+    ];
+    ssh_args.extend(ssh_config_flags());
+    ssh_args.extend([host.to_string(), "--".into(), line]);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/".into());
+    ("ssh".into(), ssh_args, home)
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    fn ctx(remote: Option<&str>, cwd: &str) -> SessionCtx {
+        SessionCtx {
+            session_id: crate::SessionId::new(),
+            cwd: cwd.into(),
+            system_prompt: "".into(),
+            model: None,
+            mcp: Default::default(),
+            skills_dir: None,
+            runtime_dir: "/tmp".into(),
+            resume: None,
+            permission_mode: PermissionMode::Ask,
+            env: vec![("DECK_TOKEN".into(), "x".into()), ("FOO".into(), "a b".into())],
+            allowed_tools: Vec::new(),
+            remote: remote.map(str::to_string),
+            disallowed_tools: Vec::new(),
+            host_only: false,
+        }
+    }
+
+    #[test]
+    fn local_runs_as_is_remote_goes_through_ssh() {
+        let args = vec!["-p".to_string(), "it's".to_string()];
+        let (p, a, cwd) = launch(&ctx(None, "/w"), "/usr/local/bin/claude", &args);
+        assert_eq!((p.as_str(), a, cwd.to_str()), ("/usr/local/bin/claude", args.clone(), Some("/w")));
+        let (p, a, _) = launch(&ctx(Some("box"), "~/proj"), "/usr/local/bin/claude", &args);
+        assert_eq!(p, "ssh");
+        let dash = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(a[dash - 1], "box");
+        let line = a.last().unwrap();
+        assert!(line.starts_with("exec \"$SHELL\" -lc "));
+        assert!(line.contains("$HOME"), "{line}");
+        assert!(line.contains("FOO="), "{line}");
+        assert!(!line.contains("DECK_TOKEN"), "{line}");
+        assert!(line.contains("claude -p"), "{line}");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -120,6 +120,11 @@ pub enum ChatEvent {
     OpenUrl(String),
     /// "Open in editor" on a changed file: its path, with its changes shown.
     OpenFile(PathBuf),
+    /// A new thread was pointed at another folder.
+    Moved,
+    /// The first message of a thread set to work on its own branch: start
+    /// a task (its own branch and worktree) with this brief and agent.
+    StartTask { brief: String, agent: String, cwd: PathBuf },
 }
 
 /// An attached image's square thumbnail: being made, made, or not
@@ -218,12 +223,68 @@ const PERMISSION_CHOICES: [(Decision, &str, &str); 3] = [
     (Decision::Deny, "No", "esc"),
 ];
 
-/// The `@` file picker above the composer.
+/// The picker above the composer: `@` files, `/` commands, `$` skills.
 struct Mention {
-    /// Byte offset of the `@` in the composer.
+    /// Byte offset of the sigil in the composer.
     start: usize,
+    /// '@', '/' or '$'.
+    kind: char,
     matches: Vec<String>,
+    /// For commands and skills: what each does, and what goes in the box.
+    notes: Vec<String>,
+    inserts: Vec<String>,
     selected: usize,
+}
+
+/// The agent's slash commands and the user's skills, as (shown name, what
+/// it does, what to type). Built-ins first, then the user's own from
+/// `~/.claude/commands`, the project's `.claude/commands` and the skills
+/// folders, each described by its file's `description:`.
+fn commands_for(agent: &str, cwd: &std::path::Path, sigil: char) -> Vec<(String, String, String)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let describe = |path: &std::path::Path| -> String {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.lines().take(20).find_map(|l| l.strip_prefix("description:").map(|d| d.trim().trim_matches('"').to_string())))
+            .unwrap_or_default()
+    };
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    if sigil == '/' {
+        let builtins: &[(&str, &str)] = if agent == "codex" {
+            &[("compact", "Summarise the conversation to free context"), ("model", "Choose the model"), ("init", "Write an AGENTS.md for this project"), ("review", "Review the current changes"), ("diff", "Show the changes"), ("status", "Session and limits"), ("new", "Start a new conversation")]
+        } else {
+            &[("compact", "Summarise the conversation to free context"), ("clear", "Start over with an empty context"), ("context", "What fills the context"), ("cost", "What this session has cost"), ("init", "Write a CLAUDE.md for this project"), ("memory", "Edit Claude's memory files"), ("model", "Choose the model"), ("review", "Review a pull request"), ("agents", "Manage subagents"), ("mcp", "MCP servers")]
+        };
+        out.extend(builtins.iter().map(|(n, d)| (format!("/{n}"), d.to_string(), format!("/{n}"))));
+        let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
+        for dir in [claude.join("commands"), cwd.join(".claude/commands")] {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "md") {
+                    if let Some(stem) = p.file_stem() {
+                        let n = stem.to_string_lossy().into_owned();
+                        out.push((format!("/{n}"), describe(&p), format!("/{n}")));
+                    }
+                }
+            }
+        }
+    }
+    // Skills: Claude Code runs them as `/name`; other agents read `$name`.
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
+    for dir in [claude.join("skills"), cwd.join(".claude/skills"), home.join(".agents/skills")] {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let skill = e.path().join("SKILL.md");
+            if skill.exists() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let insert = if agent == "claude" { format!("/{n}") } else { format!("${n}") };
+                let shown = if sigil == '$' { format!("${n}") } else { format!("/{n}") };
+                out.push((shown, describe(&skill), insert));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    out.retain(|(n, ..)| seen.insert(n.clone()));
+    out
 }
 
 pub struct ChatPane {
@@ -238,6 +299,10 @@ pub struct ChatPane {
     error: Option<SharedString>,
     pub composer: Entity<Field>,
     list: ListState,
+    /// Scrolled up off the end: new content no longer pulls the view down.
+    paused: bool,
+    /// Messages that arrived while paused.
+    unread: usize,
     expanded: HashSet<String>,
     /// Work logs showing every step while the agent works (else the newest
     /// few), by (message, group).
@@ -251,9 +316,8 @@ pub struct ChatPane {
     collapsed: HashSet<String>,
     /// When each tool started and, once done, how long it took.
     tool_times: HashMap<String, (Instant, Option<Duration>)>,
-    switching: bool,
-    /// The model picker is open.
-    picking_model: bool,
+    /// The agent and model menu is open, on this agent's models.
+    model_menu: Option<AgentId>,
     /// The model asked for, an id from the agent's own list; `None` runs
     /// the CLI's default.
     model: Option<smol_str::SmolStr>,
@@ -262,10 +326,18 @@ pub struct ChatPane {
     warmed: bool,
     mode: PermissionMode,
     cwd: PathBuf,
+    /// The SSH host the agent runs on; `cwd` is a folder there. `None`:
+    /// this Mac.
+    pub remote: Option<String>,
+    /// "Work on its own branch": the first message starts a task instead.
+    own_branch: bool,
     /// `DECK_*` credentials so the agent can drive this window.
     agent_env: Vec<(String, String)>,
     pub title: SharedString,
     pub last_activity: Instant,
+    /// When it last did something, in milliseconds since the epoch: what
+    /// the sidebar shows and sorts by, kept across restarts.
+    pub updated: i64,
     /// Messages sent while a turn runs, for agents that cannot take input
     /// mid-turn: deck holds them and sends each when the turn ends.
     queued: std::collections::VecDeque<Outgoing>,
@@ -462,24 +534,46 @@ impl ChatPane {
             status: ChatStatus::Idle,
             error: None,
             composer,
-            list: ListState::new(0, ListAlignment::Bottom, px(800.)),
+            list: {
+                // Following: the list sticks to its end until you scroll
+                // up; it tells us so, for the "Jump to latest" pill.
+                let list = ListState::new(0, ListAlignment::Bottom, px(800.));
+                let me = cx.entity().downgrade();
+                list.set_scroll_handler(move |ev, _, cx| {
+                    let paused = ev.is_scrolled;
+                    let _ = me.update(cx, |c, cx| {
+                        if c.paused != paused {
+                            c.paused = paused;
+                            if !paused {
+                                c.unread = 0;
+                            }
+                            cx.notify();
+                        }
+                    });
+                });
+                list
+            },
+            paused: false,
+            unread: 0,
             expanded: HashSet::new(),
             log_all: HashSet::new(),
             reveal: HashMap::new(),
             revealing: Cell::new(false),
             collapsed: HashSet::new(),
             tool_times: HashMap::new(),
-            switching: false,
-            picking_model: false,
+            model_menu: None,
             model: None,
             warmed: false,
             // Edits flow; shell commands stay gated, except `deck …`, which is
             // pre-approved so the agent can always drive this window.
             mode: PermissionMode::Edit,
             cwd,
+            remote: None,
+            own_branch: false,
             agent_env,
             title: SharedString::default(),
             last_activity: Instant::now(),
+            updated: now(),
             queued: Default::default(),
             inflight: Vec::new(),
             interrupting: false,
@@ -547,8 +641,10 @@ impl ChatPane {
         c.list.reset(transcript.messages.len());
         c.transcript = transcript;
         c.thread_id = saved.id;
+        c.remote = saved.remote;
         c.control = saved.control;
         c.title = saved.title.into();
+        c.updated = saved.updated;
         c.mode = if saved.full_access {
             PermissionMode::Yolo
         } else if saved.ask_first {
@@ -596,6 +692,7 @@ impl ChatPane {
             control: self.control,
             agent: self.agent.as_str().to_string(),
             cwd: self.cwd.clone(),
+            remote: self.remote.clone(),
             full_access: self.mode == PermissionMode::Yolo,
             model: self.model.as_ref().map(|m| m.to_string()),
             ask_first: self.mode == PermissionMode::Ask,
@@ -615,7 +712,9 @@ impl ChatPane {
                 .iter()
                 .map(|(ix, c)| (*ix, c.clone()))
                 .collect(),
-            updated: now(),
+            // When it last did something, not when it was written: a
+            // restored thread keeps its age.
+            updated: self.updated,
         }
     }
 
@@ -1033,6 +1132,7 @@ impl ChatPane {
             resume,
         );
         ctx.env = self.agent_env.clone();
+        ctx.remote = self.remote.clone();
         // deck's own tools, acting for this chat, allowed without asking
         // like the `deck` command is.
         if let Some(deck) = crate::mcp::server_for(&self.agent_env) {
@@ -1041,6 +1141,39 @@ impl ChatPane {
             ctx.mcp = Arc::new(servers);
         }
         ctx.allowed_tools = vec!["Bash(deck:*)".into(), "mcp__deck".into()];
+        // An agent on a host runs here, on this Mac, signed in as you, and
+        // acts on the host through Deck's tools bound to it: nothing to
+        // install there, and the login never leaves the Mac. Its own shell
+        // and file tools would act on this Mac, so they are off (`host_only`).
+        // Agents that cannot turn them off still start over SSH, on the host.
+        if let Some(host) = self.remote.clone().filter(|_| crate::host_mcp::bridged(self.agent.as_str())) {
+            let dir = self.cwd.to_string_lossy().into_owned();
+            if let Some(spec) = crate::host_mcp::server_for(&host, &dir, &self.agent_env) {
+                let mut servers = (*ctx.mcp).clone();
+                servers.push(spec);
+                ctx.mcp = Arc::new(servers);
+            }
+            ctx.remote = None;
+            // A folder of its own per host, the same each time, so the
+            // conversation resumes (Claude keeps sessions by folder).
+            let safe: String = host.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect();
+            let local = crate::control::socket_dir().join("remote-work").join(safe);
+            let _ = std::fs::create_dir_all(&local);
+            ctx.cwd = local;
+            ctx.host_only = true;
+            if self.agent.as_str() == "claude" {
+                ctx.disallowed_tools = crate::host_mcp::LOCAL_TOOLS.iter().map(|t| t.to_string()).collect();
+                // Looking needs no asking; changing the host still does,
+                // unless the chat has full access.
+                ctx.allowed_tools.extend(["mcp__host__read", "mcp__host__glob", "mcp__host__grep"].map(String::from));
+            }
+            ctx.system_prompt = format!(
+                "{}\n\nYou are working on the remote machine `{host}`, in the folder `{dir}` there. You run on the user's Mac, but your own shell and file tools are turned off: act on `{host}` only through the `host` MCP server's tools (run, read, write, edit, glob, grep), which run there over SSH. Paths are on `{host}`, relative to `{dir}` unless absolute.",
+                ctx.system_prompt
+            )
+            .trim_start()
+            .into();
+        }
         let mut conn = session::spawn(
             self.env.backend.handle(),
             entry.adapter.clone(),
@@ -1116,6 +1249,13 @@ impl ChatPane {
             self.composer.update(cx, |f, cx| f.set_text("", cx));
             return;
         }
+        // On its own branch: the message becomes a task's brief, worked on
+        // in a fresh worktree; this empty thread gives way to it.
+        if self.own_branch && self.transcript.messages.is_empty() && !text.is_empty() && self.remote.is_none() {
+            self.composer.update(cx, |f, cx| f.set_text("", cx));
+            cx.emit(ChatEvent::StartTask { brief: text, agent: self.agent.as_str().to_string(), cwd: self.cwd.clone() });
+            return;
+        }
         let mode = crate::refine::mode();
         if self.refining.is_some() {
             if mode != crate::refine::Mode::Off {
@@ -1176,6 +1316,10 @@ impl ChatPane {
     }
 
     fn send_turn(&mut self, out: Outgoing, cx: &mut Context<Self>) {
+        // Sending is reading the end: follow again.
+        if self.paused {
+            self.jump_to_latest(cx);
+        }
         if matches!(self.status, ChatStatus::Working | ChatStatus::Waiting) && self.conn.is_some() {
             // An agent that queues input gets the message now and reads it
             // when its current step ends, inside the same turn, as in Claude
@@ -1234,6 +1378,7 @@ impl ChatPane {
             Some(conn) if conn.send(turn) => {
                 self.status = ChatStatus::Working;
                 self.last_activity = Instant::now();
+                self.updated = now();
                 self.turn_started = Some(Instant::now());
             }
             _ => self.fail("the session is no longer accepting input".into(), cx),
@@ -1289,6 +1434,56 @@ impl ChatPane {
                 .detach();
             }
         }
+    }
+
+    /// Choose the folder a new thread works in. Only before the first
+    /// message: the agent was started in the old one, so it starts again.
+    fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Work here".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = rx.await {
+                if let Some(dir) = paths.pop() {
+                    let _ = this.update(cx, |c, cx| c.set_cwd(dir, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Run this thread's agent on `host` (an SSH host), in `dir` there.
+    /// Before the first message only, as for the folder.
+    pub fn set_remote(&mut self, host: String, dir: PathBuf, cx: &mut Context<Self>) {
+        if !self.transcript.messages.is_empty() {
+            return;
+        }
+        self.remote = Some(host);
+        self.cwd = dir;
+        if let Some(old) = self.conn.take() {
+            old.shutdown();
+        }
+        self.warmed = false;
+        self.schedule_save(cx);
+        cx.emit(ChatEvent::Moved);
+        cx.notify();
+    }
+
+    pub fn set_cwd(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !self.transcript.messages.is_empty() || dir == self.cwd || !dir.is_dir() {
+            return;
+        }
+        self.cwd = dir;
+        if let Some(old) = self.conn.take() {
+            old.shutdown();
+        }
+        self.warmed = false;
+        self.schedule_save(cx);
+        cx.emit(ChatEvent::Moved);
+        cx.notify();
     }
 
     fn pick_files(&mut self, cx: &mut Context<Self>) {
@@ -1372,6 +1567,37 @@ impl ChatPane {
     // -- @ mentions -------------------------------------------------------------
 
     fn update_mention(&mut self, cx: &mut Context<Self>) {
+        // `/command` at the start or `$skill`: the agent's commands and the
+        // user's skills, ranked by name.
+        if let Some((sigil, start, query)) = self.composer.read(cx).command_token() {
+            if self.mention_dismissed == Some(start) {
+                self.mention = None;
+            } else {
+                let q = query.to_lowercase();
+                let mut found: Vec<(i32, (String, String, String))> = commands_for(self.agent.as_str(), &self.cwd, sigil)
+                    .into_iter()
+                    .filter_map(|c| {
+                        let name = c.0[1..].to_lowercase();
+                        let score = if name.starts_with(&q) { 2 } else if name.contains(&q) { 1 } else { return None };
+                        Some((score, c))
+                    })
+                    .collect();
+                found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.len().cmp(&b.1 .0.len())));
+                found.truncate(8);
+                let selected = self.mention.as_ref().filter(|m| m.start == start && m.kind == sigil).map_or(0, |m| m.selected).min(found.len().saturating_sub(1));
+                self.mention = Some(Mention {
+                    start,
+                    kind: sigil,
+                    matches: found.iter().map(|(_, c)| c.0.clone()).collect(),
+                    notes: found.iter().map(|(_, c)| c.1.clone()).collect(),
+                    inserts: found.iter().map(|(_, c)| c.2.clone()).collect(),
+                    selected,
+                });
+            }
+            self.sync_popup(cx);
+            cx.notify();
+            return;
+        }
         let token = self.composer.read(cx).mention();
         if token.as_ref().map(|t| t.0) != self.mention_dismissed {
             self.mention_dismissed = None;
@@ -1396,7 +1622,10 @@ impl ChatPane {
                     let selected = selected.min(matches.len().saturating_sub(1));
                     Some(Mention {
                         start,
+                        kind: '@',
                         matches,
+                        notes: Vec::new(),
+                        inserts: Vec::new(),
                         selected,
                     })
                 }
@@ -1404,7 +1633,10 @@ impl ChatPane {
                     self.list_files(cx);
                     Some(Mention {
                         start,
+                        kind: '@',
                         matches: Vec::new(),
+                        notes: Vec::new(),
+                        inserts: Vec::new(),
                         selected: 0,
                     })
                 }
@@ -1448,12 +1680,17 @@ impl ChatPane {
             "up" => m.selected = (m.selected + n - 1) % n,
             "down" => m.selected = (m.selected + 1) % n,
             "enter" | "tab" => {
-                if let Some(path) = m.matches.get(m.selected).cloned() {
-                    let start = m.start;
+                let (start, kind) = (m.start, m.kind);
+                let chosen = if kind == '@' { m.matches.get(m.selected).cloned() } else { m.inserts.get(m.selected).cloned() };
+                if let Some(text) = chosen {
                     self.mention = None;
                     self.composer.update(cx, |f, cx| {
                         f.popup = false;
-                        f.complete_mention(start, &path, cx);
+                        if kind == '@' {
+                            f.complete_mention(start, &text, cx);
+                        } else {
+                            f.complete_token(start, &text, cx);
+                        }
                     });
                 }
             }
@@ -1563,6 +1800,39 @@ impl ChatPane {
                 self.ask_choice = 0;
                 self.finish_question(cx);
             }
+        }
+    }
+
+    /// What the card on top asks: `Some(true)` an approval, `Some(false)`
+    /// a question, `None` nothing.
+    pub fn ask_is_permission(&self) -> Option<bool> {
+        self.asks.first().map(|a| matches!(a, Ask::Permission { .. }))
+    }
+
+    /// Approve the request on top, from outside the chat (a notification's
+    /// button); `always` also stops asking for the same in this chat.
+    pub fn approve(&mut self, always: bool, cx: &mut Context<Self>) {
+        if let Some(Ask::Permission { id, .. }) = self.asks.first() {
+            let id = *id;
+            let decision = if always { Decision::AllowAlways } else { Decision::Allow };
+            self.settle_ask(id, cx, |conn| conn.decide(id, decision));
+        }
+    }
+
+    pub fn deny(&mut self, cx: &mut Context<Self>) {
+        if self.asks.first().is_some() {
+            self.decline(cx);
+        }
+    }
+
+    /// An answer typed in a notification: the reply to a question, or for
+    /// an approval, what to do instead. Without a card up, a message.
+    pub fn reply(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if !self.answer_in_words(text.clone(), cx) {
+            self.send(text, cx);
         }
     }
 
@@ -1830,8 +2100,8 @@ impl ChatPane {
         Some(card.into_any_element())
     }
 
-    fn switch_agent(&mut self, to: AgentId, cx: &mut Context<Self>) {
-        self.switching = false;
+    fn switch_agent(&mut self, to: AgentId, model: Option<smol_str::SmolStr>, cx: &mut Context<Self>) {
+        self.model_menu = None;
         if to == self.agent {
             cx.notify();
             return;
@@ -1839,9 +2109,8 @@ impl ChatPane {
         self.agent = to;
         // The old agent's session id and model mean nothing to the new one.
         self.native_id = None;
-        self.model = None;
+        self.model = model;
         self.ran_model = None;
-        self.picking_model = false;
         // A fresh backend that is handed our transcript, so the new agent
         // picks up the thread; the handoff row says how faithfully.
         if !self.transcript.messages.is_empty() {
@@ -1868,7 +2137,7 @@ impl ChatPane {
     /// Run on `model` from here on. It is a launch flag, so a running
     /// session restarts, resuming the agent's own conversation.
     fn choose_model(&mut self, model: Option<smol_str::SmolStr>, cx: &mut Context<Self>) {
-        self.picking_model = false;
+        self.model_menu = None;
         if model == self.model {
             cx.notify();
             return;
@@ -1903,8 +2172,7 @@ impl ChatPane {
     /// Open the access menu on the current mode, or shut it.
     fn toggle_access_menu(&mut self, cx: &mut Context<Self>) {
         // One popup above the composer at a time.
-        self.switching = false;
-        self.picking_model = false;
+        self.model_menu = None;
         self.access_menu = match self.access_menu {
             Some(_) => None,
             None => Access::ALL
@@ -1957,11 +2225,10 @@ impl ChatPane {
             .flex()
             .flex_col()
             .gap(u(2.))
-            .rounded(u(12.))
-            .bg(rgb(theme::raised()))
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
             .border_1()
-            .border_color(rgba(theme::hairline()))
-            .shadow_lg()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
             .occlude()
             .cursor_pointer();
         for (i, a) in Access::ALL.iter().copied().enumerate() {
@@ -1974,7 +2241,7 @@ impl ChatPane {
                     .gap(u(10.))
                     .px(u(10.))
                     .py(u(7.))
-                    .rounded(u(8.))
+                    .rounded(u(6.))
                     .when(i == lit, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::surface())))
                     .child(icon(
@@ -2013,7 +2280,7 @@ impl ChatPane {
                     ),
             );
         }
-        Some(menu.into_any_element())
+        Some(gpui::deferred(menu).with_priority(1).into_any_element())
     }
 
     fn apply(&mut self, sid: SessionId, batch: Vec<DriverEvent>, cx: &mut Context<Self>) {
@@ -2221,6 +2488,7 @@ impl ChatPane {
         }
         self.sync_popup(cx);
         self.last_activity = Instant::now();
+        self.updated = now();
         self.sync_list(before, &touched, cx);
         // The turn is over: the next queued message goes now.
         if self.status == ChatStatus::Idle {
@@ -2287,8 +2555,144 @@ impl ChatPane {
         }
         if now_len > before {
             self.list.splice(before..before, now_len - before);
+            if self.paused {
+                self.unread += now_len - before;
+            }
         }
         cx.notify();
+    }
+
+    /// Scrolled down into a reply: a slim bar over the thread with the
+    /// message it answers; a click goes back up to that message.
+    fn render_sticky_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let msgs = &self.transcript.messages;
+        if msgs.len() < 3 {
+            return None;
+        }
+        let raw = self.list.logical_scroll_top().item_ix;
+        if raw >= msgs.len() {
+            return None;
+        }
+        let top = raw;
+        let asked = msgs[..=top].iter().rposition(|m| m.role == Role::User)?;
+        // The question itself is on screen: nothing to remind of.
+        if asked == top {
+            return None;
+        }
+        // The next row comes in under where the bar sits (a message
+        // arriving at the top as you scroll): the bar would cover it, and
+        // when it is the question itself, say it twice.
+        let band = self.list.viewport_bounds().top() + px(48.);
+        if self.list.bounds_for_item(top + 1).is_some_and(|b| b.top() < band) {
+            return None;
+        }
+        let text = message_text(&msgs[asked]);
+        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+        if first.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .px(u(16.))
+                .pt(u(8.))
+                .child(
+                    div()
+                        .id("sticky-prompt")
+                        .flex()
+                        .items_center()
+                        .gap(u(8.))
+                        .max_w(u(720.))
+                        .w_full()
+                        .h(u(32.))
+                        .px(u(12.))
+                        .rounded(u(8.))
+                        .bg(rgb(theme::raised()))
+                        .border_1()
+                        .border_color(rgba(theme::hairline()))
+                        .text_size(u(12.5))
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(rgba(theme::input_edge())))
+                        .child(icon(Icon::ArrowUp, 12., theme::dim()))
+                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text_2())).child(first))
+                        .on_click(cx.listener(move |c, _, _, cx| {
+                            c.list.scroll_to(gpui::ListOffset { item_ix: asked, offset_in_item: px(0.) });
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Something you clicked is about to open or fold: keep what you are
+    /// reading where it is. The list is pinned to the bottom while it
+    /// follows, so a log opening grew upward and slid the row from under
+    /// the pointer; anchored at the top, it grows downward instead.
+    fn hold_place(&mut self) {
+        let top = self.list.logical_scroll_top();
+        self.paused = true;
+        self.list.scroll_to(top);
+    }
+
+    /// Back to the end of the thread, following again.
+    fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.list.reset(self.transcript.messages.len());
+        self.paused = false;
+        self.unread = 0;
+        cx.notify();
+    }
+
+    /// While scrolled up: a pill over the composer with what is new, a
+    /// click from the end.
+    fn render_jump(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.paused {
+            return None;
+        }
+        let label = match self.unread {
+            0 => "Jump to latest".to_string(),
+            1 => "1 new message".to_string(),
+            n => format!("{n} new messages"),
+        };
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(u(-40.))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("jump-latest")
+                        .flex()
+                        .items_center()
+                        .gap(u(6.))
+                        .h(u(28.))
+                        .px(u(12.))
+                        .rounded_full()
+                        .bg(rgb(theme::menu()))
+                        .border_1()
+                        .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                        .text_size(u(12.))
+                        .text_color(rgb(if self.unread > 0 { theme::text() } else { theme::text_2() }))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(theme::text())))
+                        .child(icon(Icon::ArrowUp, 12., theme::text_2()).into_any_element())
+                        .child(label)
+                        .on_click(cx.listener(|c, _, _, cx| c.jump_to_latest(cx)))
+                        .with_animation(
+                            "jump-in",
+                            Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                            |d, t| d.opacity(t),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     // -- rendering ----------------------------------------------------------
@@ -2823,6 +3227,7 @@ impl ChatPane {
                             format!("{hidden} earlier steps")
                         })
                         .on_click(cx.listener(move |c, _, _, cx| {
+                            c.hold_place();
                             c.log_all.insert(key);
                             cx.notify();
                         })),
@@ -3059,6 +3464,7 @@ impl ChatPane {
                 ))
             })
             .on_click(cx.listener(move |c, _, _, cx| {
+                c.hold_place();
                 if expanded {
                     c.expanded.remove(&k);
                     c.collapsed.insert(k.clone());
@@ -3469,7 +3875,6 @@ impl ChatPane {
                         .bg(rgb(theme::pane()))
                         .border_1()
                         .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
-                        .shadow_lg()
                         .overflow_hidden()
                         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(header)
@@ -3497,8 +3902,43 @@ impl ChatPane {
             .bg(rgb(theme::raised()))
             .border_1()
             .border_color(rgba(theme::input_edge()))
-            .shadow_lg()
             .occlude();
+        if m.kind != '@' {
+            for (i, name) in m.matches.iter().enumerate() {
+                let selected = i == m.selected;
+                let (start, insert) = (m.start, m.inserts.get(i).cloned().unwrap_or_default());
+                let note = m.notes.get(i).cloned().unwrap_or_default();
+                let skill = !insert.is_empty() && (m.kind == '$' || !matches!(name.as_str(), "/compact" | "/clear" | "/context" | "/cost" | "/init" | "/memory" | "/model" | "/review" | "/agents" | "/mcp" | "/diff" | "/status" | "/new"));
+                list = list.child(
+                    div()
+                        .id(ElementId::NamedInteger("command".into(), i as u64))
+                        .flex()
+                        .items_center()
+                        .gap(u(10.))
+                        .h(u(32.))
+                        .px(u(8.))
+                        .rounded(u(8.))
+                        .text_size(u(13.))
+                        .cursor_pointer()
+                        .when(selected, |d| d.bg(rgb(theme::surface())))
+                        .hover(|s| s.bg(rgb(theme::surface())))
+                        .child(icon(if skill { Icon::Snippet } else { Icon::Terminal }, 13., theme::dim()))
+                        .child(div().flex_none().text_color(rgb(theme::text())).child(name.clone()))
+                        .child(div().flex_1().min_w_0().one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(note))
+                        .on_click(cx.listener(move |c, _, window, cx| {
+                            c.mention = None;
+                            let text = insert.clone();
+                            c.composer.update(cx, |f, cx| {
+                                f.popup = false;
+                                f.complete_token(start, &text, cx);
+                            });
+                            window.focus(&c.composer.read(cx).focus);
+                            cx.notify();
+                        })),
+                );
+            }
+            return Some(list.into_any_element());
+        }
         for (i, path) in m.matches.iter().enumerate() {
             let dir = path.ends_with('/');
             let trimmed = path.trim_end_matches('/');
@@ -3590,21 +4030,9 @@ impl ChatPane {
                     .child(icon(Icon::Plus, 14., theme::text_2()))
                     .on_click(cx.listener(|c, _, _, cx| c.pick_files(cx))),
             )
-            .child(
-                chip("agent")
-                    .text_color(rgb(theme::text_2()))
-                    .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
-                    .child(icon(Icon::agent(self.agent.as_str()), 13., theme::text_2()))
-                    .child(self.agent_name())
-                    .child(icon(Icon::ChevronDown, 11., theme::dim()))
-                    .on_click(cx.listener(|c, _, _, cx| {
-                        c.switching = !c.switching;
-                        c.picking_model = false;
-                        c.close_access_menu(cx);
-                        cx.notify();
-                    })),
-            )
-            .when(!self.models().is_empty(), |d| {
+            .child({
+                // One chip for who answers: the agent's mark and the model.
+                // Its menu lists the agents, each opening onto its models.
                 let label: SharedString = match &self.model {
                     Some(id) => self
                         .models()
@@ -3612,21 +4040,39 @@ impl ChatPane {
                         .find(|m| m.id == id.as_str())
                         .map_or_else(|| id.to_string(), |m| m.label.to_string())
                         .into(),
-                    None => "Default model".into(),
+                    None if self.models().is_empty() => self.agent_name().into(),
+                    None => format!("{} · Default", self.agent_name()).into(),
                 };
-                d.child(
-                    chip("model")
-                        .text_color(rgb(theme::text_2()))
-                        .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
-                        .child(label)
-                        .child(icon(Icon::ChevronDown, 11., theme::dim()))
-                        .on_click(cx.listener(|c, _, _, cx| {
-                            c.picking_model = !c.picking_model;
-                            c.switching = false;
-                            c.close_access_menu(cx);
+                div()
+                    .relative()
+                    .flex_shrink()
+                    .min_w_0()
+                    .on_mouse_down_out(cx.listener(|c, _, _, cx| {
+                        if c.model_menu.take().is_some() {
                             cx.notify();
-                        })),
-                )
+                        }
+                    }))
+                    .child(
+                        chip("agent")
+                            .min_w_0()
+                            .text_color(rgb(theme::text_2()))
+                            .when(self.model_menu.is_some(), |d| {
+                                d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                            })
+                            .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                            .child(icon(Icon::agent(self.agent.as_str()), 13., theme::text_2()))
+                            .child(div().min_w_0().one_line().child(label))
+                            .child(icon(Icon::ChevronDown, 11., theme::dim()))
+                            .on_click(cx.listener(|c, _, _, cx| {
+                                c.model_menu = match c.model_menu {
+                                    Some(_) => None,
+                                    None => Some(c.agent.clone()),
+                                };
+                                c.close_access_menu(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .children(self.render_model_menu(cx))
             })
             .child({
                 // A chip like the agent's beside it, a menu like it too: a
@@ -3656,26 +4102,6 @@ impl ChatPane {
                     .children(self.render_access_menu(cx))
             })
             .child(div().flex_1())
-            .when_some(
-                (self.transcript.usage.input + self.transcript.usage.output > 0)
-                    .then_some(self.transcript.usage),
-                |d, u_| {
-                    let cost = u_
-                        .cost_usd
-                        .map(|c| format!(" · ${c:.2}"))
-                        .unwrap_or_default();
-                    d.child(
-                        div()
-                            .mr(u(6.))
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(format!(
-                                "{} tokens{cost}",
-                                compact_count(u_.input + u_.output + u_.cache_read)
-                            )),
-                    )
-                },
-            )
             .child(
                 div()
                     .id("send")
@@ -3683,8 +4109,8 @@ impl ChatPane {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(u(30.))
-                    .rounded(u(15.))
+                    .size(u(28.))
+                    .rounded(u(14.))
                     .when(can_send, |d| {
                         d.bg(rgb(theme::text()))
                             .cursor_pointer()
@@ -3722,12 +4148,6 @@ impl ChatPane {
             );
 
         let mut stack = div().w_full().flex().flex_col().gap(u(8.));
-        if self.switching {
-            stack = stack.child(self.render_switcher(cx));
-        }
-        if self.picking_model {
-            stack = stack.child(self.render_model_picker(cx));
-        }
         // Queued messages, oldest first: those already with the agent (it
         // reads them when its current step ends), then those deck holds.
         let rows = self
@@ -3756,8 +4176,8 @@ impl ChatPane {
                     .gap(u(8.))
                     .pl(u(12.))
                     .pr(u(if with_agent { 12. } else { 4. }))
-                    .h(u(30.))
-                    .rounded(u(10.))
+                    .h(u(32.))
+                    .rounded(u(8.))
                     .border_1()
                     .border_color(rgba(theme::hairline()))
                     .text_size(u(12.))
@@ -3805,16 +4225,45 @@ impl ChatPane {
             );
         }
         if let Some(e) = self.error.clone() {
+            // A slim notice, not a card: what happened, and the one thing
+            // to do about it.
             stack = stack.child(
                 div()
-                    .px(u(12.))
-                    .py(u(8.))
-                    .rounded(u(10.))
-                    .border_1()
-                    .border_color(rgba(theme::strong_edge()))
-                    .text_size(u(12.))
-                    .text_color(rgb(theme::text()))
-                    .child(e),
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(32.))
+                    .pl(u(10.))
+                    .pr(u(4.))
+                    .rounded(u(8.))
+                    .bg(rgba(theme::alpha(theme::DANGER, 0x1a)))
+                    .text_size(u(12.5))
+                    .child(icon(Icon::Info, 13., theme::DANGER))
+                    .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text_2())).child(e))
+                    .child(
+                        div()
+                            .id("try-again")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(u(24.))
+                            .px(u(8.))
+                            .rounded(u(6.))
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::text()))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::row_hover())))
+                            .child("Try again")
+                            .on_click(cx.listener(|c, _, _, cx| {
+                                c.error = None;
+                                c.warmed = false;
+                                if let Some(old) = c.conn.take() {
+                                    old.shutdown();
+                                }
+                                c.warm(cx);
+                                cx.notify();
+                            })),
+                    ),
             );
         }
         if let Some(card) = self.render_ask(cx) {
@@ -3870,6 +4319,11 @@ impl ChatPane {
             )
             .into()
         };
+        let u_ = self.transcript.usage;
+        let spent = (u_.input + u_.output > 0).then(|| {
+            let cost = u_.cost_usd.filter(|c| *c > 0.).map(|c| format!(" · ${c:.2}")).unwrap_or_default();
+            format!("{}{cost}", compact_count(u_.input + u_.output + u_.cache_read))
+        });
         // Concentric: 8px chips sit 8px inside the composer's 16px card.
         stack
             .child(
@@ -3917,6 +4371,7 @@ impl ChatPane {
             )
             .child(
                 div()
+                    .relative()
                     .flex()
                     .justify_center()
                     .text_size(u(11.))
@@ -3925,94 +4380,176 @@ impl ChatPane {
                         crate::icon::shimmer("refining", hint)
                     } else {
                         crate::kbd::hints(&hint).justify_center().into_any_element()
+                    })
+                    // What the thread has spent, under the send button: it
+                    // used to sit in the toolbar and push send out of a
+                    // narrow composer.
+                    .when_some(spent, |d, s| {
+                        d.child(div().absolute().right(u(10.)).top_0().bottom_0().flex().items_center().child(s))
                     }),
             )
             .into_any_element()
     }
 
-    /// The agent's models as a row of choices, the default first.
-    fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div().w_full().flex().flex_wrap().gap(u(6.));
-        let choices = std::iter::once((None, "Default".to_string(), "what the CLI picks"))
-            .chain(self.models().iter().map(|m| (Some(smol_str::SmolStr::new(m.id)), m.label.to_string(), m.note)));
-        for (i, (id, label, note)) in choices.enumerate() {
-            let current = id == self.model;
-            let pick = id.clone();
-            row = row.child(
-                div()
-                    .id(ElementId::NamedInteger("model-pick".into(), i as u64))
-                    .flex()
-                    .items_center()
-                    .gap(u(6.))
-                    .h(u(30.))
-                    .px(u(10.))
-                    .rounded(u(9.))
-                    .text_size(u(12.))
-                    .border_1()
-                    .cursor_pointer()
-                    .when(current, |d| {
-                        d.bg(rgb(theme::surface()))
-                            .border_color(rgba(theme::strong_edge()))
-                            .text_color(rgb(theme::text()))
-                    })
-                    .when(!current, |d| {
-                        d.border_color(rgba(theme::hairline()))
-                            .text_color(rgb(theme::text_2()))
-                            .hover(|s| s.bg(rgb(theme::surface())))
-                    })
-                    .child(label)
-                    .child(div().text_color(rgb(theme::dim())).child(note))
-                    .on_click(cx.listener(move |c, _, _, cx| c.choose_model(pick.clone(), cx))),
-            );
+    /// Pick an agent and a model in one go: picking another agent's model
+    /// switches agent and starts it on that model.
+    fn pick_model(&mut self, agent: AgentId, model: Option<smol_str::SmolStr>, cx: &mut Context<Self>) {
+        if agent == self.agent {
+            self.choose_model(model, cx);
+        } else {
+            self.switch_agent(agent, model, cx);
         }
-        row.into_any_element()
     }
 
-    fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div().w_full().flex().flex_wrap().gap(u(6.));
-        for entry in self.env.registry.all() {
+    /// The agents down the left, the models of the one under the pointer
+    /// beside it, lined up with that agent's row, with a check on what
+    /// this thread runs. Both ease in; the models slide over as the
+    /// pointer moves between agents.
+    fn render_model_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const ROW: f32 = 28.;
+        const GAP: f32 = 1.;
+        const PAD: f32 = 4.;
+        let lit = self.model_menu.clone()?;
+        let panel = || {
+            div()
+                .flex()
+                .flex_col()
+                .gap(u(GAP))
+                .p(u(PAD))
+                .rounded(u(10.))
+                .bg(rgb(theme::menu()))
+                .border_1()
+                .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                .occlude()
+        };
+        let row = |id: ElementId| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(u(8.))
+                .h(u(ROW))
+                .px(u(8.))
+                .rounded(u(6.))
+                .text_size(u(12.5))
+        };
+        let entries = self.env.registry.all();
+        let n = entries.len();
+        let mut lit_ix = 0usize;
+        let mut agents = panel().w(u(184.));
+        for (ix, entry) in entries.into_iter().enumerate() {
             let id = entry.id();
             let ready = entry.is_ready();
+            let on = id == lit;
+            if on {
+                lit_ix = ix;
+            }
             let current = id == self.agent;
-            let to = id.clone();
-            row = row.child(
-                div()
-                    .id(ElementId::Name(format!("switch-{}", id.as_str()).into()))
-                    .flex()
-                    .items_center()
-                    .gap(u(6.))
-                    .h(u(30.))
-                    .px(u(10.))
-                    .rounded(u(9.))
-                    .text_size(u(12.))
-                    .border_1()
-                    .when(current, |d| {
-                        d.bg(rgb(theme::surface()))
-                            .border_color(rgba(theme::strong_edge()))
-                            .text_color(rgb(theme::text()))
-                    })
-                    .when(!current, |d| d.border_color(rgba(theme::hairline())))
-                    .when(!current && ready, |d| {
-                        d.text_color(rgb(theme::text_2()))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::surface())))
-                            .on_click(
-                                cx.listener(move |c, _, _, cx| c.switch_agent(to.clone(), cx)),
-                            )
-                    })
-                    .when(!ready, |d| d.text_color(rgb(theme::dim())))
+            let hover_to = id.clone();
+            let has_models = !entry.adapter.models().is_empty();
+            let pick_to = id.clone();
+            agents = agents.child(
+                row(ElementId::Name(format!("menu-agent-{}", id.as_str()).into()))
+                    .when(on && ready, |d| d.bg(rgb(theme::surface())))
+                    .text_color(rgb(if !ready { theme::dim() } else if on { theme::text() } else { theme::text_2() }))
+                    .when(ready, |d| d.cursor_pointer())
+                    .on_hover(cx.listener(move |c, hovered: &bool, _, cx| {
+                        if *hovered && c.model_menu.as_ref() != Some(&hover_to) {
+                            c.model_menu = Some(hover_to.clone());
+                            cx.notify();
+                        }
+                    }))
                     .child(icon(
                         Icon::agent(id.as_str()),
                         13.,
-                        if ready { theme::text_2() } else { theme::dim() },
+                        match (ready, current) {
+                            (false, _) => theme::dim(),
+                            (true, true) => Icon::agent(id.as_str()).brand().unwrap_or(theme::text()),
+                            (true, false) => theme::text_2(),
+                        },
                     ))
-                    .child(entry.display_name().to_string())
-                    .when(!ready, |d| {
-                        d.child(div().text_color(rgb(theme::dim())).child("not set up"))
+                    .child(div().flex_1().min_w_0().one_line().child(entry.display_name().to_string()))
+                    .when(!ready, |d| d.child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child("Not set up")))
+                    .when(ready && current && !has_models, |d| d.child(icon(Icon::Check, 11., theme::text())))
+                    .when(ready && has_models, |d| d.child(icon(Icon::ChevronRight, 10., theme::dim())))
+                    .when(ready && !has_models, |d| {
+                        d.on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |c, _, _, cx| c.pick_model(pick_to.clone(), None, cx)),
+                        )
                     }),
             );
         }
-        row.into_any_element()
+        let models = self
+            .env
+            .registry
+            .get(&lit)
+            .filter(|e| e.is_ready())
+            .map(|e| e.adapter.models())
+            .unwrap_or(&[]);
+        let mut menu = div()
+            .absolute()
+            .left_0()
+            .bottom(relative(1.))
+            .mb(u(6.))
+            .flex()
+            .items_end()
+            .gap(u(4.))
+            .child(agents);
+        if !models.is_empty() {
+            // At most nine rows tall; longer lists scroll inside it.
+            const MAX_ROWS: usize = 9;
+            let count = models.len() + 1;
+            let visible = count.min(MAX_ROWS);
+            // Its top on the hovered agent's row, unless it is taller than
+            // the room above; then it sits on the menu's floor.
+            let height = PAD * 2. + visible as f32 * ROW + (visible - 1) as f32 * GAP + 2.;
+            let row_top = (n - lit_ix) as f32 * (ROW + GAP) - GAP + PAD + 1.;
+            let lift = (row_top - height).max(0.);
+            let agent_label = lit.as_str().to_lowercase();
+            let mut col = panel()
+                .id("menu-models")
+                .w(u(264.))
+                .mb(u(lift))
+                .max_h(u(height))
+                .overflow_y_scroll();
+            let choices = std::iter::once((None, "Default".to_string(), "what the CLI picks"))
+                .chain(models.iter().map(|m| (Some(smol_str::SmolStr::new(m.id)), m.label.to_string(), m.note)));
+            for (i, (id, label, note)) in choices.enumerate() {
+                // A note that only repeats the agent's name says nothing.
+                let note = if note.to_lowercase() == agent_label { "" } else { note };
+                let current = lit == self.agent && id == self.model;
+                let to = lit.clone();
+                col = col.child(
+                    row(ElementId::NamedInteger("menu-model".into(), i as u64))
+                        .cursor_pointer()
+                        .text_color(rgb(if current { theme::text() } else { theme::text_2() }))
+                        .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                        .child(div().flex_shrink().min_w_0().one_line().child(label))
+                        .child(div().flex_1().min_w_0().one_line().text_size(u(11.)).text_color(rgb(theme::dim())).child(note))
+                        .when(current, |d| d.child(icon(Icon::Check, 11., theme::text())))
+                        // On press: the menu hangs outside the chip, so by
+                        // release the press outside has shut it.
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |c, _, _, cx| c.pick_model(to.clone(), id.clone(), cx)),
+                        ),
+                );
+            }
+            // Swapped at once as the pointer moves between agents.
+            menu = menu.child(col);
+        }
+        // Drawn after everything else, so nothing under it (the composer's
+        // edge, its placeholder) shows through.
+        Some(
+            gpui::deferred(menu.with_animation(
+                "model-menu",
+                Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                |d, t| d.opacity(t).mb(u(6. - 4. * (1. - t))),
+            ))
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     /// A new thread: the composer is the centre of the screen, with a few
@@ -4047,10 +4584,11 @@ impl ChatPane {
                     .text_size(u(13.))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::raised())))
-                    .child(icon(glyph, 14., theme::dim()))
+                    .child(div().w(u(16.)).flex_none().flex().justify_center().child(icon(glyph, 14., theme::dim())))
                     .child(
                         div()
                             .flex_none()
+                            .w(u(80.))
                             .text_color(rgb(theme::text_2()))
                             .group_hover(group.clone(), |s| s.text_color(rgb(theme::text())))
                             .child(title),
@@ -4103,8 +4641,48 @@ impl ChatPane {
                                     .child(icon(Icon::agent(self.agent.as_str()), 13., theme::text_2()))
                                     .child(self.agent_name())
                                     .child(div().text_color(rgb(theme::dim())).child("in"))
-                                    .child(icon(Icon::Folder, 13., theme::dim()))
-                                    .child(div().min_w_0().one_line().child(place)),
+                                    .child(
+                                        div()
+                                            .id("pick-folder")
+                                            .flex()
+                                            .items_center()
+                                            .gap(u(4.))
+                                            .min_w_0()
+                                            .h(u(24.))
+                                            .px(u(6.))
+                                            .ml(u(-2.))
+                                            .rounded(u(6.))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                                            .child(icon(Icon::Folder, 13., theme::dim()))
+                                            .child(div().min_w_0().one_line().child(place))
+                                            .child(icon(Icon::ChevronDown, 11., theme::dim()))
+                                            .on_click(cx.listener(|c, _, _, cx| c.pick_folder(cx))),
+                                    )
+                                    .when(self.remote.is_none(), |d| {
+                                        let on = self.own_branch;
+                                        d.child(
+                                            div()
+                                                .id("own-branch")
+                                                .flex()
+                                                .items_center()
+                                                .gap(u(5.))
+                                                .h(u(24.))
+                                                .px(u(8.))
+                                                .rounded(u(6.))
+                                                .border_1()
+                                                .border_color(rgba(if on { theme::alpha(theme::accent(), 0x66) } else { theme::hairline() }))
+                                                .when(on, |d| d.bg(rgba(theme::alpha(theme::accent(), 0x14))).text_color(rgb(theme::text())))
+                                                .cursor_pointer()
+                                                .hover(|s| s.text_color(rgb(theme::text())))
+                                                .child(icon(Icon::Git, 12., if on { theme::accent() } else { theme::dim() }))
+                                                .child(if on { "On its own branch" } else { "Own branch" })
+                                                .on_click(cx.listener(|c, _, _, cx| {
+                                                    c.own_branch = !c.own_branch;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    }),
                             ),
                     )
                     .child(self.render_composer(window, cx))
@@ -4173,6 +4751,7 @@ impl ChatPane {
             Some(r) => select::highlight(runs, r, rgb(theme::selection()).into()),
             None => runs,
         };
+        let runs = theme::safe_runs(&text, runs);
         let styled = StyledText::new(text).with_runs(runs);
         let layout = styled.layout().clone();
         let painted = self.painted.clone();
@@ -5385,6 +5964,9 @@ pub fn human_duration(d: Duration) -> String {
 /// parts after an ellipsis (`…/f3691f90/scratchpad`).
 fn tidy_place(p: &std::path::Path) -> String {
     let s = short_path(p);
+    if s == "~" {
+        return "Home".into();
+    }
     let parts: Vec<&str> = s.split('/').filter(|x| !x.is_empty()).collect();
     if s.chars().count() <= 32 || parts.len() <= 3 {
         return s;
@@ -5394,7 +5976,7 @@ fn tidy_place(p: &std::path::Path) -> String {
     format!("…/{tail}")
 }
 
-fn short_path(p: &std::path::Path) -> String {
+pub fn short_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     match std::env::var("HOME") {
         Ok(home) if s.starts_with(&home) => format!("~{}", &s[home.len()..]),
@@ -5484,7 +6066,7 @@ fn render_excerpt(key: &str, grammar: &'static crate::syntax::Grammar, text: &st
         col = col.child(
             div()
                 .whitespace_nowrap()
-                .child(StyledText::new(line.to_string()).with_runs(runs)),
+                .child(StyledText::new(line.to_string()).with_runs(theme::safe_runs(line, runs))),
         );
     }
     col.overflow_x_hidden().into_any_element()
@@ -5560,17 +6142,28 @@ impl Render for ChatPane {
             .when(empty, |d| d.child(self.render_empty(window, cx)))
             .when(!empty, |d| {
                 d.child(
-                    list(
-                        self.list.clone(),
-                        cx.processor(|c, ix, window, cx| c.render_message(ix, window, cx)),
-                    )
-                    .flex_1()
-                    .pb(u(16.)),
+                    div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            list(
+                                self.list.clone(),
+                                cx.processor(|c, ix, window, cx| c.render_message(ix, window, cx)),
+                            )
+                            .flex_1()
+                            .pb(u(16.)),
+                        )
+                        .children(self.render_sticky_prompt(cx)),
                 )
                 .child(
                     div()
+                        .relative()
                         .flex_none()
                         .pb(u(12.))
+                        .children(self.render_jump(cx))
                         .child(Self::column(self.render_composer(window, cx))),
                 )
             })
