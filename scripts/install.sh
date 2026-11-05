@@ -76,8 +76,12 @@ sign_bundle "$BUNDLE"
 
 # Quit a running copy first; replacing an app under a live process confuses
 # Launch Services.
-osascript -e 'tell application id "com.broisnischal.deck" to quit' >/dev/null 2>&1 || true
-pkill -f "$APP/Contents/MacOS/deck" 2>/dev/null || true
+# Not an AppleScript "quit": that goes to Deck's bundle id, which the
+# background service shares, and could stop it. Deck saves its layout
+# within a second of any change, so a signal to the app alone is enough.
+# Only the app: `deck daemon` (the background service, same binary) keeps
+# running, and with it every job, agent and terminal session it holds.
+pkill -f "$APP/Contents/MacOS/deck\$" 2>/dev/null || true
 
 rm -rf "$APP"
 mv "$BUNDLE" "$APP"
