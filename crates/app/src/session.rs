@@ -25,6 +25,17 @@ pub struct Session {
     pub inspector_width: f32,
     /// The sidebar lists by time (Now, Today, …) rather than by project.
     pub recent: bool,
+    /// Background jobs, started again at launch (Settings › Terminal).
+    pub jobs: Vec<JobState>,
+}
+
+/// A background job: what `deck job start` ran, under its name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobState {
+    pub name: String,
+    pub cmd: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 impl Default for Session {
@@ -37,6 +48,7 @@ impl Default for Session {
             sidebar_width: crate::theme::SIDEBAR_PX,
             inspector_width: crate::theme::INSPECTOR_PX,
             recent: false,
+            jobs: Vec::new(),
         }
     }
 }
@@ -83,6 +95,12 @@ pub enum PaneState {
         /// the new shell (see `scrollback_file`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scrollback: Option<String>,
+        /// Its session in the background service, to attach to again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// Its control token, kept so the shell's `deck` still answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     Browser {
         url: String,
@@ -562,6 +580,8 @@ mod tests {
                                 tab: true,
                             }),
                             scrollback: None,
+                            session: Some("tab-abc".into()),
+                            token: None,
                         }),
                         NodeState::Pane(PaneState::Browser {
                             url: "https://example.com".into(),
