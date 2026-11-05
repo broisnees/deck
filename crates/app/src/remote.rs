@@ -89,8 +89,7 @@ fn write_config(all: &[Host]) -> std::io::Result<()> {
         "# Written by Deck from remote-hosts.json; edits here are replaced.\nInclude ~/.ssh/config\nInclude /etc/ssh/ssh_config\n\n{}",
         blocks.join("\n")
     );
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    let mut f = crate::os::create_private(&path)?;
     std::io::Write::write_all(&mut f, text.as_bytes())
 }
 
@@ -160,14 +159,13 @@ pub fn add(spec: &str, name: Option<&str>, key: Option<&str>, dir: Option<String
     // is one: `ssh` there failed with "Load key: Operation not permitted".
     let key = match key {
         Some(src) => {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let dir = crate::control::socket_dir().join("keys");
             std::fs::create_dir_all(&dir)?;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            crate::os::private(&dir)?;
             let dest = dir.join(format!("{name}.pem"));
             let bytes = std::fs::read(&src).map_err(|e| bad(format!("could not read {}: {e}", src.display())))?;
             let tmp = dir.join(format!(".{name}.pem.new"));
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            let mut f = crate::os::create_private(&tmp)?;
             std::io::Write::write_all(&mut f, &bytes)?;
             std::fs::rename(&tmp, &dest)?;
             Some(dest.to_string_lossy().into_owned())
@@ -390,10 +388,13 @@ pub fn run_on(host: &str, line: &str, input: Option<&[u8]>, timeout: u64) -> Res
 /// Where the shared connections' sockets live: short (a socket path has
 /// ~104 bytes), private, and cleared on restart.
 fn control_dir() -> PathBuf {
+    #[cfg(unix)]
+    // SAFETY: getuid reads this process's user id.
     let dir = PathBuf::from(format!("/tmp/deck-{}", unsafe { libc::getuid() }));
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir().join("deck-ssh");
     if std::fs::create_dir_all(&dir).is_ok() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = crate::os::private(&dir);
     }
     dir
 }

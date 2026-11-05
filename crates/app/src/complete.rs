@@ -453,8 +453,7 @@ fn quote_path(dir: &str) -> String {
 }
 
 fn executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    crate::os::is_executable(p)
 }
 
 /// Programs on PATH and shell builtins, the ones run lately first.

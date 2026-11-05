@@ -193,7 +193,6 @@ pub fn running_app() -> Option<PathBuf> {
 /// Hand the swap to a script that waits for deck to quit, moves the new app
 /// into place and (when `reopen`) opens it. The caller quits right after.
 pub fn install_on_quit(new_app: &Path, reopen: bool) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let app = running_app().ok_or("deck is not running from an app bundle")?;
     let pid = std::process::id();
     let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
@@ -211,24 +210,8 @@ pub fn install_on_quit(new_app: &Path, reopen: bool) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // Its own session, so it outlives deck.
-    // SAFETY: setsid is async-signal-safe and touches nothing else.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc_setsid();
-            Ok(())
-        });
-    }
+    crate::os::detach(&mut cmd);
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
-}
-
-fn libc_setsid() {
-    extern "C" {
-        fn setsid() -> i32;
-    }
-    // SAFETY: no arguments, no memory.
-    unsafe {
-        setsid();
-    }
 }
 
 #[cfg(test)]

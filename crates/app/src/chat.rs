@@ -2745,7 +2745,6 @@ impl ChatPane {
             match m.role {
                 Role::User => out.push_str(&format!("me: {first}\n")),
                 Role::Assistant => out.push_str(&format!("agent: {first}\n")),
-                _ => {}
             }
         }
         out

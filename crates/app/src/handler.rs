@@ -173,8 +173,7 @@ pub fn command_for(url: &str) -> Option<(String, Option<PathBuf>)> {
 }
 
 fn is_executable(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    crate::os::is_executable(p)
 }
 
 /// `s` in single quotes for the shell, safe whatever it holds.

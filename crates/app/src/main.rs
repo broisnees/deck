@@ -45,6 +45,7 @@ mod menu;
 mod net;
 #[cfg_attr(not(target_os = "macos"), path = "other/notify.rs")]
 mod notify;
+mod os;
 mod palette;
 mod pasteboard;
 mod privacy;

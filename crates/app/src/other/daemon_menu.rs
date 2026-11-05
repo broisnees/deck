@@ -2,6 +2,9 @@
 //! StatusNotifierItem, Windows a tray icon), but a job that fails still
 //! plays its sound and posts a notification that opens it in Deck.
 
+// Windows has no background service yet, so nothing here runs there.
+#![cfg_attr(windows, allow(dead_code))]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DIRTY: AtomicBool = AtomicBool::new(true);

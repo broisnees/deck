@@ -170,6 +170,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "two-face",
+ "uds_windows",
  "ureq",
  "wry",
  "x11-dl",

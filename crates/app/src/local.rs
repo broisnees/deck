@@ -224,7 +224,6 @@ fn probe_8080() -> (Option<Option<String>>, bool) {
 /// itself updated), else `ollama serve` in its own process group, so it
 /// outlives Deck. Waits until it answers.
 pub fn start(kind: Kind) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     if kind != Kind::Ollama {
         return Err(format!("Deck can't start {} yet", kind.name()));
@@ -233,13 +232,14 @@ pub fn start(kind: Kind) -> Result<(), String> {
         Some(app) => Command::new("/usr/bin/open").arg("-a").arg(app).spawn(),
         None => {
             let bin = find_binary(kind.binary()).ok_or("Ollama isn't installed")?;
-            Command::new(bin)
-                .arg("serve")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
+            crate::os::detach(
+                Command::new(bin)
+                    .arg("serve")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .spawn()
         }
     };
     spawned.map_err(|e| format!("couldn't start Ollama: {e}"))?;

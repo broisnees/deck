@@ -16,11 +16,16 @@
 //! into the job's stream. Frames from an attached client: `0, len (u32 BE),
 //! bytes` for input, `1, rows (u16 BE), cols (u16 BE)` for a resize.
 
+// Off Unix only the client half runs (see the end of this file).
+#![cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables, unreachable_code))]
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use crate::os::UnixListener;
+use crate::os::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -197,19 +202,18 @@ pub fn ensure_running() -> Result<(), String> {
     }
     // No launchd (Linux, a test, a sandbox), or it would not run it: run it
     // ourselves, in its own session.
-    use std::os::unix::process::CommandExt;
-    let mut c = std::process::Command::new(&exe);
-    c.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    unsafe {
-        c.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    #[cfg(not(unix))]
+    return Err("the background service is not on this platform yet".into());
+    #[cfg(unix)]
+    {
+        let mut c = std::process::Command::new(&exe);
+        c.arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::os::detach(&mut c);
+        c.spawn().map_err(|e| e.to_string())?;
     }
-    c.spawn().map_err(|e| e.to_string())?;
     if until(Duration::from_secs(5), || ask(&json!({ "op": "ping" })).is_ok()) {
         Ok(())
     } else {
@@ -556,6 +560,7 @@ fn wait(name: &str, want: Option<String>, exit: bool, timeout: Duration) -> i32 
 
 /// `deck job attach NAME`: this terminal becomes the job's, until the
 /// connection closes. Keys go to the job raw; its output comes back.
+#[cfg(unix)]
 fn attach(name: &str) -> i32 {
     let (rows, cols) = winsize(0).unwrap_or((40, 120));
     let mut s = match UnixStream::connect(socket()) {
@@ -641,12 +646,14 @@ fn attach(name: &str) -> i32 {
     0
 }
 
+#[cfg(unix)]
 fn winsize(fd: i32) -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
     (ok && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col))
 }
 
+#[cfg(unix)]
 fn raw_mode(fd: i32) -> Option<libc::termios> {
     unsafe {
         if libc::isatty(fd) == 0 {
@@ -666,6 +673,7 @@ fn raw_mode(fd: i32) -> Option<libc::termios> {
 // ---------------------------------------------------------------------------
 // The daemon
 
+#[cfg(unix)]
 struct Job {
     info: JobInfo,
     env: HashMap<String, String>,
@@ -675,14 +683,18 @@ struct Job {
     size: (u16, u16),
 }
 
+#[cfg(unix)]
 type Jobs = Arc<Mutex<HashMap<String, Job>>>;
 
+#[cfg(unix)]
 static JOBS: LazyLock<Jobs> = LazyLock::new(Default::default);
 /// Jobs being stopped on purpose, so their exit is not told as a failure.
+#[cfg(unix)]
 static STOPPING: LazyLock<Mutex<std::collections::HashSet<String>>> = LazyLock::new(Default::default);
 
 /// `deck daemon`: serve jobs on the socket and show them in the menu bar.
 /// Returns only when told to quit.
+#[cfg(unix)]
 pub fn serve() -> i32 {
     // Started from inside Deck.app (`deck daemon` typed in a shell, whose
     // PATH finds the bundle's binary), macOS registers the service as a
@@ -729,10 +741,12 @@ pub fn serve() -> i32 {
     0
 }
 
+#[cfg(unix)]
 fn load_saved() -> Vec<Saved> {
     std::fs::read(state_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn save_state() {
     let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
     let saved: Vec<Saved> = jobs
@@ -756,6 +770,7 @@ fn save_state() {
 }
 
 /// Every job, newest first, for the menu and `list`.
+#[cfg(unix)]
 pub fn snapshot() -> Vec<JobInfo> {
     let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<JobInfo> = jobs.values().map(|j| j.info.clone()).collect();
@@ -763,6 +778,7 @@ pub fn snapshot() -> Vec<JobInfo> {
     out
 }
 
+#[cfg(unix)]
 fn handle(mut conn: UnixStream) {
     let mut reader = match conn.try_clone() {
         Ok(c) => BufReader::new(c),
@@ -824,6 +840,7 @@ fn handle(mut conn: UnixStream) {
     let _ = conn.write_all(format!("{v}\n").as_bytes());
 }
 
+#[cfg(unix)]
 fn agent_of(cmd: &str) -> Option<String> {
     let first = cmd.split_whitespace().find(|w| !w.contains('='))?;
     let prog = first.rsplit('/').next()?;
@@ -831,6 +848,7 @@ fn agent_of(cmd: &str) -> Option<String> {
 }
 
 /// Start `cmd` in a PTY under the user's shell, in `cwd`, with `env`.
+#[cfg(unix)]
 fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, tab: bool) -> Result<JobInfo, String> {
     let shell = env
         .get("SHELL")
@@ -959,6 +977,7 @@ fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, ta
 
 /// Stop a job's process group: TERM, then KILL if it lingers. With
 /// `forget`, it leaves the list and its clients are let go.
+#[cfg(unix)]
 fn kill_job(name: &str, forget: bool) -> bool {
     let (pid, running, master) = {
         let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
@@ -997,6 +1016,7 @@ fn kill_job(name: &str, forget: bool) -> bool {
     true
 }
 
+#[cfg(unix)]
 fn restart_job(name: &str) -> Result<JobInfo, String> {
     let (cmd, cwd, env, clients, tab) = {
         let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1014,6 +1034,7 @@ fn restart_job(name: &str) -> Result<JobInfo, String> {
     Ok(info)
 }
 
+#[cfg(unix)]
 fn quit_all() -> ! {
     let names: Vec<String> = JOBS.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
     for n in &names {
@@ -1033,20 +1054,24 @@ fn quit_all() -> ! {
 
 /// The menu bar icon's actions, which only macOS has yet.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(unix)]
 pub fn quit() -> ! {
     quit_all()
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(unix)]
 pub fn stop_named(name: &str) {
     kill_job(name, true);
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(unix)]
 pub fn restart_named(name: &str) {
     let _ = restart_job(name);
 }
 
+#[cfg(unix)]
 fn resize(master: i32, rows: u16, cols: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
@@ -1054,6 +1079,7 @@ fn resize(master: i32, rows: u16, cols: u16) {
 
 /// A client takes over the connection: what the job printed so far, then
 /// everything it prints; its keys and size go to the job.
+#[cfg(unix)]
 fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: &str, rows: u16, cols: u16) {
     let master = {
         let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1115,6 +1141,45 @@ fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: 
 }
 
 /// The last `lines` lines of a job's output, as plain text.
+// -- the service off Unix ---------------------------------------------------
+//
+// It runs jobs in PTYs of its own (forkpty) and signals their process
+// groups; Windows needs ConPTY and job objects for that, still to come.
+
+#[cfg(not(unix))]
+const ELSEWHERE: &str = "the background service is not on this platform yet";
+
+#[cfg(not(unix))]
+fn attach(_name: &str) -> i32 {
+    eprintln!("deck: {ELSEWHERE}");
+    1
+}
+
+#[cfg(not(unix))]
+pub fn serve() -> i32 {
+    eprintln!("deck: {ELSEWHERE}");
+    1
+}
+
+#[cfg(not(unix))]
+pub fn snapshot() -> Vec<JobInfo> {
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn quit() -> ! {
+    std::process::exit(0)
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn stop_named(_name: &str) {}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn restart_named(_name: &str) {}
+
 pub fn tail_text(name: &str, lines: usize) -> String {
     tail_log(name, lines)
 }

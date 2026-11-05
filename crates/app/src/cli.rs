@@ -265,7 +265,6 @@ fn remote(args: &[String]) -> i32 {
 }
 
 fn ssh_here(args: &[String]) -> i32 {
-    use std::os::unix::process::CommandExt;
     let flag = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
     let Some(host) = args.first().filter(|h| !h.starts_with("--")).cloned() else {
         eprintln!("usage: deck ssh HOST [--dir DIR] [--agent claude|codex|…]   (hosts: `deck remote list`)");
@@ -275,12 +274,13 @@ fn ssh_here(args: &[String]) -> i32 {
     let agent = flag("--agent");
     let line = crate::remote::remote_line(&dir, agent.as_deref());
     eprintln!("Connecting to {host}…");
-    let err = std::process::Command::new("ssh")
-        .args(["-t", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30"])
-        .args(crate::remote::ssh_flags())
-        .arg(&host)
-        .arg(line)
-        .exec();
+    let err = crate::os::exec(
+        std::process::Command::new("ssh")
+            .args(["-t", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30"])
+            .args(crate::remote::ssh_flags())
+            .arg(&host)
+            .arg(line),
+    );
     eprintln!("deck: could not run ssh: {err}");
     1
 }
