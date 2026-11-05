@@ -194,7 +194,7 @@ impl SettingsPane {
         });
         let _memory = cx.subscribe(&memory_field, |_: &mut Self, f, ev: &FieldEvent, cx| {
             if let FieldEvent::Submit(text) = ev {
-                if !text.trim().is_empty() && crate::memory::add(text, None).is_ok() {
+                if !text.trim().is_empty() && crate::memory::add(text, None, None).is_ok() {
                     f.update(cx, |f, cx| f.set_text("", cx));
                     cx.notify();
                 }
@@ -2349,8 +2349,9 @@ impl SettingsPane {
                 .into_any_element(),
         )];
         let mut all = crate::memory::load();
-        all.sort_by_key(|m| std::cmp::Reverse(m.created));
-        for (i, m) in all.into_iter().take(40).enumerate() {
+        // Last written or confirmed first.
+        all.sort_by_key(|m| std::cmp::Reverse(m.updated.unwrap_or(m.created)));
+        for (i, m) in all.into_iter().take(60).enumerate() {
             let scope = match &m.project {
                 Some(p) => p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
                 None => "every project".to_string(),
@@ -2366,7 +2367,10 @@ impl SettingsPane {
                         }))
                         .into_any_element(),
                 )
-                .about(format!("{scope} · {}", m.id)),
+                .about(match &m.kind {
+                    Some(k) => format!("{k} · {scope} · {}", m.id),
+                    None => format!("{scope} · {}", m.id),
+                }),
             );
         }
         rows

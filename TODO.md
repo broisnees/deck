@@ -329,6 +329,15 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [x] Windows: `cargo check` passes for the whole workspace (control socket over `uds_windows`, `os.rs` for permissions, exec and detach, `deckd`'s server Unix-only with Windows stand-ins)
 - [x] Done today: Ctrl+Shift shortcut scheme, Ctrl+Backspace by word, zoom keys, keyboard back from pages, rounded and inset pages, exit bar for finished jobs, sidebar selection (Ctrl-click, Ctrl+A), no repeated row labels, last command on idle shells, command suggestions with intent and typos, job viewers not kept as sessions, X11 window class, release build
 
+### Memory for agents (asked 2026-11-05)
+
+- [x] Kinds (preference, gotcha, decision, fact), twins confirmed instead of added, `deck memory edit`
+- [x] The session brief ranks (this project first, how to work first, newest first), keeps to ~3,500 characters and says how many more there are
+- [x] Recent work: the last five Deck chats in the project, from the newest thread files only
+- [x] MCP tools: `deck_memory`, `deck_memory_add`, `deck_memory_edit`, `deck_memory_forget`
+- [ ] Memory page of its own: search, edit in place, move between a project and everywhere (today: Settings › Agents › Deck memory lists and forgets)
+- [ ] Notes from a finished chat: offer the decisions and gotchas it found as memories, one click to keep
+
 ### Integrations (asked 2026-11-05)
 
 - [ ] Integrations page in Settings: switch each one on, sign in (OAuth or a token kept in the keychain / Secret Service), see what it can reach
