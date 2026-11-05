@@ -798,9 +798,13 @@ struct Scan {
     /// content block, each with the reply's usage so far, so a reply counts
     /// once, as its last line has it.
     recent: VecDeque<(String, Reply)>,
+    /// The settled replies again, split by model, for the usage page.
+    models: BTreeMap<i64, HashMap<String, Tally>>,
     last_main: Option<Reply>,
     /// A model id with `[1m]` in it.
     wide: bool,
+    /// The folder the conversation started in, from its first `cwd`.
+    cwd: Option<String>,
 }
 
 impl Scan {
@@ -843,9 +847,35 @@ impl Scan {
             .entry(r.bucket)
             .or_default()
             .add(r.model.as_deref(), &r.tokens);
+        self.models
+            .entry(r.bucket)
+            .or_default()
+            .entry(r.model.clone().unwrap_or_default())
+            .or_default()
+            .add(r.model.as_deref(), &r.tokens);
+    }
+
+    /// (bucket, model, tally) for every reply from `from_bucket` on.
+    fn by_model(&self, from_bucket: i64) -> Vec<(i64, String, Tally)> {
+        let mut out: Vec<(i64, String, Tally)> = self
+            .models
+            .range(from_bucket..)
+            .flat_map(|(b, m)| m.iter().map(move |(k, t)| (*b, k.clone(), *t)))
+            .collect();
+        for (_, r) in &self.recent {
+            if r.bucket >= from_bucket {
+                let mut t = Tally::default();
+                t.add(r.model.as_deref(), &r.tokens);
+                out.push((r.bucket, r.model.clone().unwrap_or_default(), t));
+            }
+        }
+        out
     }
 
     fn line(&mut self, line: &str) {
+        if self.cwd.is_none() {
+            self.cwd = json_str(line, "cwd").filter(|c| !c.is_empty());
+        }
         if line.contains("\"usage\"") && line.contains("\"assistant\"") {
             if let Some(p) = parse_reply(line) {
                 self.wide |= p.wide;
@@ -909,6 +939,23 @@ fn with_scan<R>(path: &Path, f: impl FnOnce(&Scan) -> R) -> Option<R> {
     }
     scans.insert(path.to_path_buf(), scan);
     Some(out)
+}
+
+/// The string value of the first `"key":"..."` in a JSON line, found
+/// without parsing the whole line.
+fn json_str(line: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let start = line.find(&pat)? + pat.len() - 1;
+    let rest = &line.as_bytes()[start + 1..];
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            b'\\' => i += 2,
+            b'"' => return serde_json::from_str(&line[start..start + i + 2]).ok(),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -1121,6 +1168,15 @@ fn window_for(model: Option<&str>, wide: bool, used: u64) -> u64 {
 /// tables of the claude-api skill bundled with Claude Code 2.1.301, which
 /// mirror platform.claude.com/docs/en/about-claude/pricing. Haiku 5.5's
 /// cache read is assumed at the usual 0.1x of input.
+/// OpenAI's list prices, for Codex's history on the usage page only: an
+/// estimate, as for Claude, since plans don't bill by the token.
+const OPENAI_PRICES: &[(&str, [f64; 3])] = &[
+    ("gpt-5-mini", [0.25, 2., 0.025]),
+    ("gpt-5-nano", [0.05, 0.4, 0.005]),
+    ("gpt-5", [1.25, 10., 0.125]),
+    ("codex-mini", [1.5, 6., 0.375]),
+];
+
 const PRICES: &[(&str, [f64; 3])] = &[
     ("fable-5-1", [10., 50., 0.25]),
     ("mythos-5-1", [10., 50., 0.25]),
@@ -1772,13 +1828,7 @@ mod tests {
 /// Every reply OpenCode stored today, from its own database. Read with the
 /// system's `sqlite3`, read-only, so a running OpenCode is never disturbed.
 pub fn opencode_today() -> Option<AgentDay> {
-    let db = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home().map(|h| h.join(".local/share")))?
-        .join("opencode/opencode.db");
-    if !db.exists() {
-        return None;
-    }
+    let db = opencode_db()?;
     let query = format!(
         "select json_extract(data,'$.modelID'), count(*), \
          coalesce(sum(json_extract(data,'$.tokens.total')),0), \
@@ -1836,25 +1886,91 @@ pub fn gemini_today() -> Option<AgentDay> {
     (day.replies > 0).then_some(day)
 }
 
-/// Count the replies in one chat (JSON lines, or one JSON document with a
-/// `messages` array) stamped at or after `midnight`.
+/// Count the replies in one chat stamped at or after `midnight`.
 fn gemini_replies(text: &str, midnight: i64, day: &mut AgentDay, models: &mut HashMap<String, u64>) {
-    let mut count = |m: &Value| {
-        let Some(total) = m.pointer("/tokens/total").and_then(Value::as_u64) else { return };
-        let at = m.get("timestamp").and_then(Value::as_str).and_then(iso_secs);
-        if at.is_none_or(|t| t < midnight) {
-            return;
+    for r in gemini_messages(text).iter().filter_map(gemini_reply) {
+        if r.secs < midnight {
+            continue;
         }
         day.replies += 1;
-        day.tokens += total;
-        if let Some(model) = m.get("model").and_then(Value::as_str) {
-            *models.entry(model.to_string()).or_default() += total;
+        day.tokens += r.total;
+        if let Some(model) = &r.model {
+            *models.entry(model.clone()).or_default() += r.total;
+        }
+    }
+}
+
+/// The messages of one chat: one JSON document with a `messages` array, or
+/// JSON lines where each message is a line and a `{"$set": {"messages":
+/// [...]}}` line replaces them all. A message written again under the same
+/// `id` counts once, as last written.
+fn gemini_messages(text: &str) -> Vec<Value> {
+    if let Ok(doc) = serde_json::from_str::<Value>(text) {
+        if let Some(all) = doc.get("messages").and_then(Value::as_array) {
+            return all.clone();
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let put = |out: &mut Vec<Value>, m: Value| {
+        let id = m.get("id").and_then(Value::as_str).map(str::to_string);
+        match id.and_then(|id| out.iter().position(|o| o.get("id").and_then(Value::as_str) == Some(&id))) {
+            Some(i) => out[i] = m,
+            None => out.push(m),
         }
     };
-    match serde_json::from_str::<Value>(text) {
-        Ok(doc) => doc.get("messages").and_then(Value::as_array).into_iter().flatten().for_each(&mut count),
-        Err(_) => text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).for_each(|m| count(&m)),
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if let Some(set) = v.get("$set") {
+            if let Some(all) = set.get("messages").and_then(Value::as_array) {
+                out.clear();
+                for m in all {
+                    put(&mut out, m.clone());
+                }
+            }
+        } else if v.get("type").is_some() {
+            put(&mut out, v);
+        }
     }
+    out
+}
+
+/// One Gemini CLI reply's tokens.
+#[derive(Clone, Debug, PartialEq)]
+struct GeminiReply {
+    secs: i64,
+    model: Option<String>,
+    /// Prompt tokens not read from the cache, tool prompts included.
+    input: u64,
+    /// Output and thinking.
+    output: u64,
+    cache_read: u64,
+    total: u64,
+}
+
+/// `{"timestamp", "model", "tokens": {"input", "output", "cached",
+/// "thoughts", "tool", "total"}}`; `input` counts the cached tokens too.
+fn gemini_reply(m: &Value) -> Option<GeminiReply> {
+    let t = m.get("tokens")?;
+    let n = |k: &str| t.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let secs = m.get("timestamp").and_then(Value::as_str).and_then(iso_secs)?;
+    let cache_read = n("cached");
+    let mut input = n("input").saturating_sub(cache_read) + n("tool");
+    let output = n("output") + n("thoughts");
+    let total = t.get("total").and_then(Value::as_u64).unwrap_or(input + output + cache_read);
+    if input + output + cache_read == 0 {
+        input = total;
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(GeminiReply {
+        secs,
+        model: m.get("model").and_then(Value::as_str).map(str::to_string),
+        input,
+        output,
+        cache_read,
+        total,
+    })
 }
 
 #[cfg(test)]
@@ -1888,5 +2004,737 @@ mod other_agents {
         gemini_replies(text, iso_secs("2026-10-16T00:00:00Z").unwrap(), &mut day, &mut models);
         assert_eq!((day.replies, day.tokens), (1, 15));
         assert_eq!(models.get("gemini-3-pro"), Some(&15));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The usage page: days and models over a range
+
+/// One model's use over the range.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelUse {
+    pub agent: &'static str,
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// At API prices, or what the agent itself recorded; 0 for a model
+    /// with neither.
+    pub cost: f64,
+    /// What reading from the cache saved against paying full input price.
+    pub saved: f64,
+}
+
+impl ModelUse {
+    pub fn tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
+
+/// One local day: its cost and tokens by agent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DayTotal {
+    /// Days from today: 0 today, -1 yesterday.
+    pub day: i64,
+    pub by_agent: Vec<(&'static str, f64, u64)>,
+}
+
+/// One project's use over the range, every agent together.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProjectUse {
+    /// The folder's own name, with its parent's when two share it.
+    pub name: String,
+    /// The folder the agent ran in; empty when it wasn't recorded.
+    pub path: String,
+    pub cost: f64,
+    pub tokens: u64,
+    /// Conversations with a reply in the range.
+    pub sessions: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Report {
+    /// How many days back, today included.
+    pub days: u32,
+    pub daily: Vec<DayTotal>,
+    pub models: Vec<ModelUse>,
+    /// Conversations with a reply in the range, by agent.
+    pub sessions: Vec<(&'static str, u32)>,
+    /// The most costly first.
+    pub projects: Vec<ProjectUse>,
+    /// Each day's use by agent and model, oldest day first: the CSV's rows.
+    pub rows: Vec<(i64, ModelUse)>,
+}
+
+impl Report {
+    pub fn cost(&self) -> f64 {
+        self.models.iter().map(|m| m.cost).sum()
+    }
+    pub fn tokens(&self) -> u64 {
+        self.models.iter().map(ModelUse::tokens).sum()
+    }
+}
+
+/// One stretch of replies to book: an agent's replies on one model in one
+/// conversation, at one time.
+struct Entry<'a> {
+    agent: &'static str,
+    session: &'a str,
+    /// The folder it ran in; may be empty.
+    project: &'a str,
+    secs: i64,
+    model: &'a str,
+    input: u64,
+    output: u64,
+    read: u64,
+    write: u64,
+    cost: f64,
+}
+
+/// Accumulates replies into days, models and projects.
+#[derive(Default)]
+struct Book {
+    midnight: i64,
+    days: BTreeMap<(i64, &'static str), (f64, u64)>,
+    models: HashMap<(&'static str, String), ModelUse>,
+    sessions: HashMap<&'static str, HashSet<String>>,
+    projects: HashMap<String, (f64, u64, HashSet<(&'static str, String)>)>,
+    rows: BTreeMap<(i64, &'static str, String), ModelUse>,
+}
+
+impl Book {
+    fn day_of(&self, secs: i64) -> i64 {
+        (secs - self.midnight).div_euclid(86_400)
+    }
+
+    fn add(&mut self, e: Entry) {
+        let day = self.day_of(e.secs);
+        let tokens = e.input + e.output + e.read + e.write;
+        let d = self.days.entry((day, e.agent)).or_default();
+        d.0 += e.cost;
+        d.1 += tokens;
+        let saved = PRICES
+            .iter()
+            .chain(OPENAI_PRICES)
+            .find(|(k, _)| e.model.contains(k))
+            .map_or(0., |(_, [inp, _, rd])| e.read as f64 * (inp - rd) / 1e6);
+        let fresh = || ModelUse { agent: e.agent, model: e.model.to_string(), ..Default::default() };
+        for m in [
+            self.models.entry((e.agent, e.model.to_string())).or_insert_with(fresh),
+            self.rows.entry((day, e.agent, e.model.to_string())).or_insert_with(fresh),
+        ] {
+            m.input += e.input;
+            m.output += e.output;
+            m.cache_read += e.read;
+            m.cache_write += e.write;
+            m.cost += e.cost;
+            m.saved += saved;
+        }
+        self.sessions.entry(e.agent).or_default().insert(e.session.to_string());
+        let p = self.projects.entry(e.project.trim_end_matches('/').to_string()).or_default();
+        p.0 += e.cost;
+        p.1 += tokens;
+        p.2.insert((e.agent, e.session.to_string()));
+    }
+
+    fn finish(self, days: u32) -> Report {
+        let first = -(days as i64 - 1);
+        let mut daily: Vec<DayTotal> = (first..=0).map(|day| DayTotal { day, by_agent: Vec::new() }).collect();
+        for ((day, agent), (cost, tokens)) in self.days {
+            if let Some(d) = daily.iter_mut().find(|d| d.day == day) {
+                d.by_agent.push((agent, cost, tokens));
+            }
+        }
+        let mut models: Vec<ModelUse> = self.models.into_values().filter(|m| m.tokens() > 0).collect();
+        models.sort_by(|a, b| b.cost.total_cmp(&a.cost).then(b.tokens().cmp(&a.tokens())));
+        let mut sessions: Vec<(&'static str, u32)> = self.sessions.into_iter().map(|(a, s)| (a, s.len() as u32)).collect();
+        sessions.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let mut projects: Vec<ProjectUse> = self
+            .projects
+            .into_iter()
+            .filter(|(_, (_, tokens, _))| *tokens > 0)
+            .map(|(path, (cost, tokens, s))| ProjectUse {
+                name: String::new(),
+                path,
+                cost,
+                tokens,
+                sessions: s.len() as u32,
+            })
+            .collect();
+        name_projects(&mut projects);
+        projects.sort_by(|a, b| b.cost.total_cmp(&a.cost).then(b.tokens.cmp(&a.tokens)).then(a.name.cmp(&b.name)));
+        let rows = self
+            .rows
+            .into_iter()
+            .filter(|((day, _, _), m)| *day >= first && *day <= 0 && m.tokens() > 0)
+            .map(|((day, _, _), m)| (day, m))
+            .collect();
+        Report { days, daily, models, sessions, projects, rows }
+    }
+}
+
+/// Each project by its folder's name, "parent/name" where two share it, and
+/// "Other" for replies whose folder wasn't recorded.
+fn name_projects(projects: &mut [ProjectUse]) {
+    let last = |p: &str, n: usize| -> String {
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return if p.is_empty() { "Other".into() } else { "/".into() };
+        }
+        parts[parts.len().saturating_sub(n)..].join("/")
+    };
+    let names: Vec<String> = projects.iter().map(|p| last(&p.path, 1)).collect();
+    for (i, p) in projects.iter_mut().enumerate() {
+        let shared = names.iter().filter(|n| **n == names[i]).count() > 1;
+        p.name = if shared && !p.path.is_empty() { last(&p.path, 2) } else { names[i].clone() };
+    }
+}
+
+/// Claude Code, Codex, OpenCode and Gemini CLI over the last `days` local
+/// days, today included. Reads every record written in the range; Claude's
+/// scans and Gemini's chats are kept, so asking again reads only what is
+/// new. Slow the first time: call it off the main thread.
+pub fn report(days: u32) -> Report {
+    let days = days.max(1);
+    let midnight = local_midnight();
+    let from = midnight - (days as i64 - 1) * 86_400;
+    let mut book = Book { midnight, ..Default::default() };
+    claude_range(&claude_home().join("projects"), from, &mut book);
+    if let Some(root) = codex_home().map(|h| h.join("sessions")) {
+        codex_range(&root, from, &mut book);
+    }
+    opencode_range(from, &mut book);
+    if let Some(root) = home().map(|h| h.join(".gemini")) {
+        gemini_range(&root, from, &mut book);
+    }
+    book.finish(days)
+}
+
+/// A project folder's name under `~/.claude/projects` back to a path:
+/// Claude Code writes each `/` (and `.`) as `-`, so this is a guess, used
+/// only when a transcript names no `cwd`.
+fn decode_project_dir(name: &str) -> String {
+    if name.starts_with('-') {
+        name.replace('-', "/")
+    } else {
+        name.to_string()
+    }
+}
+
+fn claude_range(projects: &Path, from: i64, book: &mut Book) {
+    let since = UNIX_EPOCH + Duration::from_secs(from.max(0) as u64);
+    let from_bucket = from.div_euclid(BUCKET);
+    let count = |path: &Path, key: &str, folder: &str, book: &mut Book| {
+        if let Some((rows, cwd)) = with_scan(path, |s| (s.by_model(from_bucket), s.cwd.clone())) {
+            let project = cwd.unwrap_or_else(|| decode_project_dir(folder));
+            for (bucket, model, t) in rows {
+                if model.is_empty() || t.messages == 0 {
+                    continue;
+                }
+                book.add(Entry {
+                    agent: "claude",
+                    session: key,
+                    project: &project,
+                    secs: bucket * BUCKET,
+                    model: &model,
+                    input: t.input,
+                    output: t.output,
+                    read: t.cache_read,
+                    write: t.cache_write,
+                    cost: t.cost,
+                });
+            }
+        }
+    };
+    for project in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+        let folder = project.file_name().to_string_lossy().into_owned();
+        for entry in std::fs::read_dir(project.path()).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if meta.is_file() {
+                if let Some(stem) = name.strip_suffix(".jsonl") {
+                    if meta.modified().is_ok_and(|m| m >= since) {
+                        count(&path, stem, &folder, book);
+                    }
+                }
+            } else if meta.is_dir() {
+                for (sub, modified) in jsonl_in(&path.join("subagents")) {
+                    if modified >= since {
+                        count(&sub, &name, &folder, book);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Codex logs under `sessions/YYYY/MM/DD/`.
+fn codex_range(root: &Path, from: i64, book: &mut Book) {
+    let since = UNIX_EPOCH + Duration::from_secs(from.max(0) as u64);
+    let mut files = Vec::new();
+    for year in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        for month in std::fs::read_dir(year.path()).into_iter().flatten().flatten() {
+            for day in std::fs::read_dir(month.path()).into_iter().flatten().flatten() {
+                files.extend(jsonl_in(&day.path()).into_iter().filter(|(_, m)| *m >= since).map(|(p, _)| p));
+            }
+        }
+    }
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let key = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        codex_log(&text, &key, from, book);
+    }
+}
+
+/// One Codex log: each `token_count` event's `last_token_usage`, on the
+/// model the turn ran, in the folder the session started in
+/// (`session_meta`, else the first `turn_context`). Its `input_tokens`
+/// include the cached ones.
+fn codex_log(text: &str, key: &str, from: i64, book: &mut Book) {
+    let mut model = String::from("codex");
+    let mut cwd = String::new();
+    for line in text.lines() {
+        let meta = line.contains("\"session_meta\"");
+        if meta || line.contains("\"turn_context\"") {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let p = &v["payload"];
+            if let Some(c) = p["cwd"].as_str().filter(|c| !c.is_empty()) {
+                if meta || cwd.is_empty() {
+                    cwd = c.to_string();
+                }
+            }
+            if let Some(m) = p["model"].as_str().filter(|_| !meta) {
+                model = m.to_string();
+            }
+            continue;
+        }
+        if !line.contains("\"token_count\"") || !line.contains("\"last_token_usage\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(secs) = v["timestamp"].as_str().and_then(iso_secs) else { continue };
+        if secs < from {
+            continue;
+        }
+        let u = &v["payload"]["info"]["last_token_usage"];
+        let n = |k: &str| u[k].as_u64().unwrap_or(0);
+        let read = n("cached_input_tokens");
+        let input = n("input_tokens").saturating_sub(read);
+        let output = n("output_tokens");
+        let write = n("cache_write_input_tokens");
+        let cost = OPENAI_PRICES
+            .iter()
+            .find(|(k, _)| model.contains(k))
+            .map_or(0., |(_, [i, o, r])| (input as f64 * i + output as f64 * o + read as f64 * r + write as f64 * i) / 1e6);
+        book.add(Entry {
+            agent: "codex",
+            session: key,
+            project: &cwd,
+            secs,
+            model: &model,
+            input,
+            output,
+            read,
+            write,
+            cost,
+        });
+    }
+}
+
+/// OpenCode's database: `$XDG_DATA_HOME/opencode/opencode.db`.
+fn opencode_db() -> Option<PathBuf> {
+    let db = std::env::var_os("XDG_DATA_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".local/share")))?
+        .join("opencode/opencode.db");
+    db.exists().then_some(db)
+}
+
+/// OpenCode's replies since `from`, summed by quarter hour, conversation,
+/// model and folder in one read-only query. Costs are OpenCode's own.
+fn opencode_range(from: i64, book: &mut Book) {
+    let Some(db) = opencode_db() else { return };
+    let query = format!(
+        "select min(m.time_created)/1000, m.session_id, \
+         coalesce(json_extract(m.data,'$.modelID'),''), \
+         sum(coalesce(json_extract(m.data,'$.tokens.input'),0)), \
+         sum(coalesce(json_extract(m.data,'$.tokens.output'),0)+coalesce(json_extract(m.data,'$.tokens.reasoning'),0)), \
+         sum(coalesce(json_extract(m.data,'$.tokens.cache.read'),0)), \
+         sum(coalesce(json_extract(m.data,'$.tokens.cache.write'),0)), \
+         sum(coalesce(json_extract(m.data,'$.cost'),0)), \
+         coalesce(json_extract(m.data,'$.path.cwd'),s.directory,'') \
+         from message m left join session s on s.id = m.session_id \
+         where m.time_created >= {} and json_extract(m.data,'$.role')='assistant' \
+         group by m.time_created/{}, 2, 3, 9",
+        from * 1000,
+        BUCKET * 1000
+    );
+    let Ok(out) = std::process::Command::new("/usr/bin/sqlite3")
+        .args(["-readonly", "-separator", "\t"])
+        .arg(&db)
+        .arg(query)
+        .output()
+    else {
+        return;
+    };
+    if out.status.success() {
+        opencode_book(&String::from_utf8_lossy(&out.stdout), book);
+    }
+}
+
+/// `secs \t session \t model \t input \t output \t cache read \t cache
+/// write \t cost \t folder` rows into the book.
+fn opencode_book(text: &str, book: &mut Book) {
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [secs, session, model, input, output, read, write, cost, cwd] = f[..] else { continue };
+        let n = |s: &str| s.parse::<f64>().unwrap_or(0.).max(0.) as u64;
+        let Ok(secs) = secs.parse::<i64>() else { continue };
+        book.add(Entry {
+            agent: "opencode",
+            session,
+            project: cwd,
+            secs,
+            model: if model.is_empty() { "opencode" } else { model },
+            input: n(input),
+            output: n(output),
+            read: n(read),
+            write: n(write),
+            cost: cost.parse::<f64>().unwrap_or(0.),
+        });
+    }
+}
+
+/// A chat file's replies, kept while its size and time stay the same.
+type GeminiChat = (u64, Option<SystemTime>, Vec<GeminiReply>);
+static GEMINI_CHATS: LazyLock<Mutex<HashMap<PathBuf, GeminiChat>>> = LazyLock::new(Default::default);
+
+/// Gemini CLI's chats under `tmp/<project>/chats` written since `from`.
+/// Each project folder names the folder it stands for in `.project_root`,
+/// or `projects.json` maps folders to it. Gemini CLI records no cost.
+fn gemini_range(root: &Path, from: i64, book: &mut Book) {
+    let since = UNIX_EPOCH + Duration::from_secs(from.max(0) as u64);
+    let known: HashMap<String, String> = std::fs::read(root.join("projects.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.get("projects").and_then(Value::as_object).cloned())
+        .map(|o| o.into_iter().filter_map(|(path, name)| Some((name.as_str()?.to_string(), path))).collect())
+        .unwrap_or_default();
+    for project in std::fs::read_dir(root.join("tmp")).into_iter().flatten().flatten() {
+        let Ok(chats) = std::fs::read_dir(project.path().join("chats")) else { continue };
+        let folder = project.file_name().to_string_lossy().into_owned();
+        let cwd = std::fs::read_to_string(project.path().join(".project_root"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| known.get(&folder).cloned())
+            .unwrap_or_default();
+        for chat in chats.flatten() {
+            let path = chat.path();
+            let Ok(meta) = chat.metadata() else { continue };
+            let modified = meta.modified().ok();
+            if !meta.is_file() || modified.is_none_or(|m| m < since) {
+                continue;
+            }
+            let key = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let lock = || GEMINI_CHATS.lock().unwrap_or_else(|e| e.into_inner());
+            let cached = lock().get(&path).filter(|c| c.0 == meta.len() && c.1 == modified).map(|c| c.2.clone());
+            let replies = match cached {
+                Some(r) => r,
+                None => {
+                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    let r: Vec<GeminiReply> = gemini_messages(&text).iter().filter_map(gemini_reply).collect();
+                    lock().insert(path.clone(), (meta.len(), modified, r.clone()));
+                    r
+                }
+            };
+            gemini_book(&replies, &key, &cwd, from, book);
+        }
+    }
+}
+
+fn gemini_book(replies: &[GeminiReply], session: &str, cwd: &str, from: i64, book: &mut Book) {
+    for r in replies.iter().filter(|r| r.secs >= from) {
+        book.add(Entry {
+            agent: "gemini",
+            session,
+            project: cwd,
+            secs: r.secs,
+            model: r.model.as_deref().unwrap_or("gemini"),
+            input: r.input,
+            output: r.output,
+            read: r.cache_read,
+            write: 0,
+            cost: 0.,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CSV export
+
+/// Days since 1970-01-01 as (year, month, day).
+pub fn civil(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// The local date `day` days from today as "YYYY-MM-DD", read at local
+/// noon so the zone cannot move it across a date line.
+pub fn local_date(day: i64) -> String {
+    let (y, m, d) = civil((local_midnight() + day * 86_400 + 43_200).div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A field quoted when it holds a comma, quote or line break.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// One row per day, agent and model, oldest first, `date` naming each day.
+pub fn csv(r: &Report, date: impl Fn(i64) -> String) -> String {
+    let mut out = String::from("date,agent,model,input,output,cache_read,cache_write,cost_usd\n");
+    for (day, m) in &r.rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{:.6}\n",
+            date(*day),
+            m.agent,
+            csv_field(&m.model),
+            m.input,
+            m.output,
+            m.cache_read,
+            m.cache_write,
+            m.cost
+        ));
+    }
+    out
+}
+
+/// Writes the report to `~/Downloads/deck-usage-<days>d-<today>.csv`.
+pub fn export_csv(r: &Report) -> std::io::Result<PathBuf> {
+    let dir = home().ok_or(std::io::ErrorKind::NotFound)?.join("Downloads");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("deck-usage-{}d-{}.csv", r.days, local_date(0)));
+    std::fs::write(&path, csv(r, local_date))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn book() -> Book {
+        Book { midnight: 1_000 * 86_400, ..Default::default() }
+    }
+
+    #[test]
+    fn json_str_reads_one_field() {
+        assert_eq!(json_str(r#"{"a":1,"cwd":"/Users/me/a \"b\"","x":"y"}"#, "cwd").as_deref(), Some("/Users/me/a \"b\""));
+        assert_eq!(json_str(r#"{"cwd":"C:\\dev"}"#, "cwd").as_deref(), Some("C:\\dev"));
+        assert_eq!(json_str(r#"{"a":"b"}"#, "cwd"), None);
+    }
+
+    #[test]
+    fn claude_scans_keep_the_first_cwd() {
+        let mut s = Scan::default();
+        s.line(r#"{"type":"user","cwd":"/Users/me/deck","message":{"role":"user","content":"hi"}}"#);
+        s.line(r#"{"type":"user","cwd":"/Users/me/deck/crates"}"#);
+        assert_eq!(s.cwd.as_deref(), Some("/Users/me/deck"));
+        assert_eq!(decode_project_dir("-Users-me-deck"), "/Users/me/deck");
+    }
+
+    #[test]
+    fn book_splits_days_models_and_projects() {
+        let mut b = book();
+        let e = |session, project, secs, model, cost| Entry {
+            agent: "claude",
+            session,
+            project,
+            secs,
+            model,
+            input: 10,
+            output: 5,
+            read: 0,
+            write: 0,
+            cost,
+        };
+        let today = 1_000 * 86_400 + 3_600;
+        b.add(e("s1", "/a/deck", today, "claude-opus-5-5", 1.0));
+        b.add(e("s1", "/a/deck", today - 86_400, "claude-opus-5-5", 2.0));
+        b.add(e("s2", "/b/deck", today, "claude-sonnet-5", 0.5));
+        b.add(e("s3", "", today, "claude-sonnet-5", 0.25));
+        let r = b.finish(2);
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0].0, -1);
+        assert_eq!(r.rows[0].1.cost, 2.0);
+        let names: Vec<(&str, u32)> = r.projects.iter().map(|p| (p.name.as_str(), p.sessions)).collect();
+        assert_eq!(names, [("a/deck", 1), ("b/deck", 1), ("Other", 1)]);
+        assert_eq!(r.projects[0].cost, 3.0);
+        assert_eq!(r.projects[0].tokens, 30);
+    }
+
+    #[test]
+    fn codex_logs_book_their_cwd() {
+        let log = concat!(
+            r#"{"timestamp":"2026-11-02T10:00:00Z","type":"session_meta","payload":{"cwd":"/Users/me/deck"}}"#, "\n",
+            r#"{"timestamp":"2026-11-02T10:00:01Z","type":"turn_context","payload":{"cwd":"/Users/me/other","model":"gpt-5.5"}}"#, "\n",
+            r#"{"timestamp":"2026-11-02T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":7}}}}"#, "\n",
+        );
+        let mut b = Book { midnight: iso_secs("2026-11-02T00:00:00Z").unwrap(), ..Default::default() };
+        codex_log(log, "k", 0, &mut b);
+        let r = b.finish(1);
+        assert_eq!(r.projects.len(), 1);
+        assert_eq!(r.projects[0].path, "/Users/me/deck");
+        let m = &r.models[0];
+        assert_eq!((m.model.as_str(), m.input, m.cache_read, m.output), ("gpt-5.5", 60, 40, 7));
+    }
+
+    #[test]
+    fn opencode_rows_book_with_their_own_cost() {
+        let mut b = Book { midnight: 1_793_600_000, ..Default::default() };
+        opencode_book(
+            "1793634876\tses_1\tbig-pickle\t9930\t229\t16128\t0\t0\t/Users/me\n\
+             1793634900\tses_2\tclaude-sonnet\t100\t50\t0\t10\t0.012\t\n\
+             bad line\n",
+            &mut b,
+        );
+        let r = b.finish(1);
+        assert_eq!(r.sessions, [("opencode", 2)]);
+        let pickle = r.models.iter().find(|m| m.model == "big-pickle").unwrap();
+        assert_eq!((pickle.input, pickle.output, pickle.cache_read), (9930, 229, 16128));
+        assert!((r.cost() - 0.012).abs() < 1e-9);
+        assert!(r.projects.iter().any(|p| p.path == "/Users/me" && p.name == "me"));
+    }
+
+    #[test]
+    fn gemini_messages_follow_set_and_ids() {
+        let text = concat!(
+            r#"{"sessionId":"x","projectHash":"h"}"#, "\n",
+            r#"{"$set":{"messages":[{"id":"a","type":"gemini","timestamp":"2026-11-02T10:00:00Z","model":"gemini-3-pro","tokens":{"input":100,"output":5,"cached":60,"thoughts":3,"tool":2,"total":110}}]}}"#, "\n",
+            r#"{"id":"a","type":"gemini","timestamp":"2026-11-02T10:00:00Z","model":"gemini-3-pro","tokens":{"input":100,"output":5,"cached":60,"thoughts":3,"tool":2,"total":110}}"#, "\n",
+            r#"{"id":"b","type":"user","timestamp":"2026-11-02T10:01:00Z"}"#, "\n",
+        );
+        let msgs = gemini_messages(text);
+        assert_eq!(msgs.len(), 2);
+        let replies: Vec<GeminiReply> = msgs.iter().filter_map(gemini_reply).collect();
+        assert_eq!(replies.len(), 1);
+        let r = &replies[0];
+        assert_eq!((r.input, r.output, r.cache_read, r.total), (42, 8, 60, 110));
+        let mut b = Book { midnight: iso_secs("2026-11-02T00:00:00Z").unwrap(), ..Default::default() };
+        gemini_book(&replies, "chat", "/Users/me/deck", 0, &mut b);
+        let rep = b.finish(1);
+        assert_eq!(rep.tokens(), 110);
+        assert_eq!(rep.projects[0].name, "deck");
+    }
+
+    #[test]
+    fn csv_has_a_row_per_day_agent_model() {
+        let mut b = book();
+        let e = |agent, model, secs| Entry {
+            agent,
+            session: "s",
+            project: "",
+            secs,
+            model,
+            input: 1,
+            output: 2,
+            read: 3,
+            write: 4,
+            cost: 0.5,
+        };
+        let today = 1_000 * 86_400 + 60;
+        b.add(e("claude", "claude-opus-5-5", today));
+        b.add(e("claude", "claude-opus-5-5", today));
+        b.add(e("codex", "gpt,5", today - 86_400));
+        let text = csv(&b.finish(7), |d| format!("D{d}"));
+        assert_eq!(
+            text,
+            "date,agent,model,input,output,cache_read,cache_write,cost_usd\n\
+             D-1,codex,\"gpt,5\",1,2,3,4,0.500000\n\
+             D0,claude,claude-opus-5-5,2,4,6,8,1.000000\n"
+        );
+        assert_eq!(civil(20_727), (2026, 10, 1));
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    /// Against this Mac's own transcripts: `cargo test -- --ignored real_report --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_report() {
+        let t = std::time::Instant::now();
+        let r = super::report(30);
+        println!("{:?} cost {:.2} tokens {} sessions {:?}", t.elapsed(), r.cost(), r.tokens(), r.sessions);
+        for m in r.models.iter().take(8) {
+            println!("{} {} ${:.2} {} saved ${:.2}", m.agent, m.model, m.cost, m.tokens(), m.saved);
+        }
+        for p in r.projects.iter().take(8) {
+            println!("{} ({}) ${:.2} {} {} sessions", p.name, p.path, p.cost, p.tokens, p.sessions);
+        }
+        println!("{} csv rows", r.rows.len());
+        let t = std::time::Instant::now();
+        let _ = super::report(30);
+        println!("again {:?}", t.elapsed());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan limits over time
+
+/// The highest each plan window reached on a local day: (day as days since
+/// the epoch, agent, window label, highest percent).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+pub struct LimitDay {
+    pub day: i64,
+    pub agent: String,
+    pub label: String,
+    pub peak: f32,
+}
+
+fn limits_file() -> PathBuf {
+    crate::control::socket_dir().join("limits-history.json")
+}
+
+pub fn limit_history() -> Vec<LimitDay> {
+    std::fs::read(limits_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Fold the readings just taken into today's peaks. Keeps 120 days.
+pub fn record_limits(claude: Option<&Limits>, codex: Option<&Limits>) {
+    let today = (local_midnight() + 43_200).div_euclid(86_400);
+    let mut all = limit_history();
+    let before = all.clone();
+    for l in claude.into_iter().chain(codex) {
+        for lim in &l.limits {
+            match all.iter_mut().find(|d| d.day == today && d.agent == l.agent && d.label == lim.label) {
+                Some(d) => d.peak = d.peak.max(lim.used_pct),
+                None => all.push(LimitDay { day: today, agent: l.agent.to_string(), label: lim.label.clone(), peak: lim.used_pct }),
+            }
+        }
+    }
+    all.retain(|d| today - d.day < 120);
+    if all != before {
+        if let Ok(b) = serde_json::to_vec(&all) {
+            let tmp = limits_file().with_extension("json.tmp");
+            if std::fs::write(&tmp, b).is_ok() {
+                let _ = std::fs::rename(tmp, limits_file());
+            }
+        }
     }
 }
