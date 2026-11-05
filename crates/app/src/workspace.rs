@@ -1051,15 +1051,27 @@ impl Workspace {
         })
         .detach();
         // Spinners and the like step on their own clock (icon::phase): after
-        // a frame that drew one, draw the next a fifteenth of a second later.
-        // Nothing animating, nothing drawn.
+        // a frame that drew one, redraw the views that drew one a fifteenth
+        // of a second later. Not the whole window: `refresh` would throw away
+        // every cached pane and lay all of it out again, 15 times a second
+        // for as long as an agent works. Nothing animating, nothing drawn.
         let animate = cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_secs_f32(1. / crate::icon::ANIM_FPS))
                 .await;
-            if crate::icon::take_animating()
-                && this.update_in(cx, |_, window, _| window.refresh()).is_err()
-            {
+            let alive = match crate::icon::take_animating() {
+                crate::icon::Animating::Nothing => true,
+                crate::icon::Animating::Window => this.update_in(cx, |_, window, _| window.refresh()).is_ok(),
+                crate::icon::Animating::Views(ids) => this
+                    .update(cx, |_, cx| {
+                        let app: &mut App = cx;
+                        for id in ids {
+                            app.notify(id);
+                        }
+                    })
+                    .is_ok(),
+            };
+            if !alive {
                 return;
             }
         });

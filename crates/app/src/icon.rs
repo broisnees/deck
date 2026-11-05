@@ -137,16 +137,37 @@ pub fn icon(kind: Icon, size: f32, color: u32) -> AnyElement {
 /// Animations here run on one clock at [`ANIM_FPS`] rather than at the
 /// display's refresh rate. Every frame redraws the whole window, so a spinner
 /// asking for 120 frames a second kept the main thread and the GPU busy for
-/// as long as an agent worked; at 15 it looks the same. Building one marks
-/// the frame as animated; the workspace's animation tick (see
-/// [`take_animating`]) draws the next one.
+/// as long as an agent worked; at 15 it looks the same. Building one records
+/// the view drawing it, and the workspace's animation tick (see
+/// [`take_animating`]) notifies those views alone: a spinner in the sidebar
+/// redraws the sidebar, while every other pane (cached) keeps its last frame.
 pub const ANIM_FPS: f32 = 15.;
 
-static ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What drew an animation since the last tick.
+pub enum Animating {
+    Nothing,
+    /// These views: notify them.
+    Views(Vec<gpui::EntityId>),
+    /// Something outside any view: redraw the window.
+    Window,
+}
 
-/// Whether anything animated was drawn since the last call.
-pub fn take_animating() -> bool {
-    ANIMATING.swap(false, std::sync::atomic::Ordering::Relaxed)
+thread_local! {
+    static ANIMATING: std::cell::RefCell<(Vec<gpui::EntityId>, bool)> = const { std::cell::RefCell::new((Vec::new(), false)) };
+}
+
+/// What animated since the last call.
+pub fn take_animating() -> Animating {
+    ANIMATING.with_borrow_mut(|(views, window)| {
+        if std::mem::take(window) {
+            views.clear();
+            Animating::Window
+        } else if views.is_empty() {
+            Animating::Nothing
+        } else {
+            Animating::Views(std::mem::take(views))
+        }
+    })
 }
 
 /// Where in a cycle of `period_ms` the clock is, 0–1, in steps of a frame,
@@ -155,7 +176,11 @@ pub fn phase(period_ms: u64) -> f32 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
-    ANIMATING.store(true, std::sync::atomic::Ordering::Relaxed);
+    ANIMATING.with_borrow_mut(|(views, window)| match gpui::rendering_view() {
+        Some(id) if !views.contains(&id) => views.push(id),
+        Some(_) => {}
+        None => *window = true,
+    });
     let frame = (START.get_or_init(Instant::now).elapsed().as_secs_f32() * ANIM_FPS).floor();
     (frame / ANIM_FPS * 1000. / period_ms as f32).fract()
 }

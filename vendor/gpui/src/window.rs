@@ -815,6 +815,20 @@ impl Frame {
     }
 }
 
+// Deck patch: the view being rendered, for code that builds elements without
+// a `Window` at hand. Deck's spinners record it so their next step notifies
+// only the views that drew one, instead of `Window::refresh`, which throws
+// away every cached view and lays out the whole window again.
+thread_local! {
+    static RENDERING_VIEW: std::cell::Cell<Option<EntityId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Deck patch: the view whose render, layout or prepaint is running on this
+/// thread, if any.
+pub fn rendering_view() -> Option<EntityId> {
+    RENDERING_VIEW.get()
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -3369,7 +3383,9 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.rendered_entity_stack.push(id);
+        let outer = RENDERING_VIEW.replace(Some(id));
         let result = f(self);
+        RENDERING_VIEW.set(outer);
         self.rendered_entity_stack.pop();
         result
     }
