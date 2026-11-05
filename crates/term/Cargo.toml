@@ -4,11 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+ghostty = ["dep:ghostty-vt"]
+
 [dependencies]
 alacritty_terminal = "0.26"
 # The same poller alacritty registers the PTY with (see tap.rs).
 polling = "3"
 memchr = "2"
+libc = "0.2"
+# The Ghostty engine (`Engine::Ghostty`): libghostty-vt, built from Ghostty's
+# source with Zig 0.17 on the first build.
+ghostty-vt = { version = "=0.8.0", optional = true, default-features = false }
 anyhow.workspace = true
 futures.workspace = true
 tracing.workspace = true
