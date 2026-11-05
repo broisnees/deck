@@ -16,7 +16,7 @@ use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
 use crate::theme::{self, OneLine};
 use crate::workspace::{
-    icon_button, ClearTerminal, ClosePane, Copy, Find, FindNext, FindPrevious, Paste, SelectAll,
+    icon_button, AskCommand, ClearTerminal, ClosePane, Copy, Find, FindNext, FindPrevious, Paste, SelectAll,
     SplitDown, SplitRight,
 };
 use futures::StreamExt;
@@ -60,7 +60,17 @@ pub enum TerminalEvent {
 }
 
 pub struct TerminalPane {
+    /// The AI command box (⌘J): what you asked for, and whether the
+    /// command is being written.
+    ask: Option<(Entity<crate::field::Field>, Subscription)>,
+    asking: bool,
+    /// What a program in the pane last said with `deck report`: its state
+    /// (working, blocked, done, error) and message.
+    pub reported: Option<(String, String)>,
     term: term::Terminal,
+    /// The shell's own process when it lives in the background service and
+    /// this pane only shows it: what process scans should look under.
+    pid_override: Option<u32>,
     pub focus: FocusHandle,
     pub title: SharedString,
     /// When output last arrived; agents are "working" while this is recent.
@@ -84,6 +94,11 @@ pub struct TerminalPane {
     press: Option<(usize, usize, bool)>,
     /// The button held down while the program is receiving mouse reports.
     reporting: Option<term::MouseButton>,
+    /// A press held back from Claude Code: sent as a click on release if
+    /// the mouse stayed put, or dropped for Deck's own selection if it
+    /// moved. (Claude Code turns any drag into a selection that stays
+    /// highlighted grey while you scroll, until a key is pressed.)
+    held_click: Option<(Point<Pixels>, gpui::Modifiers)>,
     /// Last cell a motion report was sent for, so moves within a cell are free.
     last_motion: Option<(usize, usize)>,
     /// Trackpads send fractions of a line; the remainder carries over.
@@ -172,12 +187,14 @@ impl TerminalPane {
         cwd: &Path,
         command: Option<&str>,
         env: HashMap<String, String>,
+        engine: term::Engine,
     ) -> anyhow::Result<term::Terminal> {
         let mut spawn = match command {
             Some(c) => term::Spawn::command(c, cwd),
             None => term::Spawn::shell(cwd),
         };
         spawn.env.extend(env);
+        spawn.engine = engine;
         term::Terminal::spawn(spawn, 80, 24)
     }
 
@@ -199,7 +216,10 @@ impl TerminalPane {
                     // A selection the program has since redrawn over (or
                     // stretched by scrolling its own region) is no longer
                     // what the user selected; drop it rather than show it.
-                    p.term.prune_selection();
+                    // Not mid-drag: the hand is still choosing it.
+                    if !mouse_held() {
+                        p.term.prune_selection();
+                    }
                     for ev in p.term.drain_events() {
                         match ev {
                             term::TermEvent::Title(t) if !t.is_empty() && t != p.title.as_ref() => {
@@ -232,6 +252,14 @@ impl TerminalPane {
                                 p.exited = true;
                                 cx.emit(TerminalEvent::Exited);
                             }
+                            term::TermEvent::Report(state, msg) => {
+                                p.reported = (state != "clear").then(|| (state.clone(), msg.clone()));
+                                if state == "blocked" {
+                                    let said = if msg.is_empty() { None } else { Some(msg.clone()) };
+                                    cx.emit(TerminalEvent::Alert(said));
+                                }
+                                cx.emit(TerminalEvent::Retitled);
+                            }
                             term::TermEvent::Ask(request) => {
                                 let cwd = p.term.shell_cwd().map(PathBuf::from);
                                 cx.emit(TerminalEvent::Ask { request, cwd });
@@ -260,6 +288,10 @@ impl TerminalPane {
 
         term.set_cursor_default(look.cursor, look.blink);
         Self {
+            ask: None,
+            asking: false,
+            reported: None,
+            pid_override: None,
             term,
             focus: cx.focus_handle(),
             title: title.into(),
@@ -274,6 +306,7 @@ impl TerminalPane {
             origin: Point::default(),
             press: None,
             reporting: None,
+            held_click: None,
             last_motion: None,
             scroll_acc: 0.,
             marked: None,
@@ -294,7 +327,11 @@ impl TerminalPane {
     }
 
     pub fn pid(&self) -> u32 {
-        self.term.pid()
+        self.pid_override.unwrap_or_else(|| self.term.pid())
+    }
+
+    pub fn set_pid(&mut self, pid: u32) {
+        self.pid_override = Some(pid);
     }
 
     fn line_px(&self) -> f32 {
@@ -637,11 +674,18 @@ impl TerminalPane {
             && snap.cursor.is_some()
             && self.term.last_block().is_some_and(|(_, b)| !b.running());
         let word_end = line.chars().nth(*cursor).is_none_or(char::is_whitespace);
+        // The list computed for the line a keystroke ago stays up while the
+        // new one is worked out, when the line only grew at the cursor: it
+        // used to vanish on every key and come back, a flicker per letter.
+        let current = (s.cursor == *cursor && s.line == *line)
+            || (*cursor > s.cursor
+                && *cursor - s.cursor <= 2
+                && line.starts_with(&s.line)
+                && line.chars().count() == *cursor);
         (focused
             && at_prompt
             && word_end
-            && s.cursor == *cursor
-            && s.line == *line
+            && current
             && (s.found.eager || !s.found.word.is_empty())
             && self.hushed.as_deref() != Some(word_lead(s).as_str())
             && self.menu.is_none()
@@ -675,19 +719,31 @@ impl TerminalPane {
         let fs = self.look.font_px;
         let small = (fs * 0.78).max(10.);
         let label_px = (fs * 0.92).round();
-        let item_h = (fs * 1.55).round();
+        let item_h = (fs * 1.75).round();
         let n = s.found.items.len();
         let shown = n.min(MENU_ROWS);
         let first = s.sel.saturating_sub(shown - 1).min(n - shown);
         let longest = s.found.items.iter().map(|i| i.label.chars().count()).max().unwrap_or(8);
         let has_detail = s.found.items.iter().any(|i| i.detail.as_deref().is_some_and(|d| !d.is_empty()));
         let grid_w = self.term.columns() as f32 * self.cell_w;
-        // Icons only tell kinds apart, so a list of one kind goes without.
+        // The selected item's description sits in the footer, not on every
+        // row, so the list stays a clean column of names.
+        // A description worth a panel: not a one-word tag ("recent",
+        // "alias", "make") that says nothing the list does not.
+        let detail = s
+            .found
+            .items
+            .get(s.sel)
+            .and_then(|i| i.detail.clone())
+            .filter(|d| d.chars().count() > 12 && d.contains(' '));
+        let _ = has_detail;
+        // A badge only tells kinds apart: a list of one kind (all flags,
+        // all files) goes without, rather than one icon down every row.
         let mixed = s.found.items.iter().any(|i| i.kind != s.found.items[0].kind);
-        let width = (longest as f32 * self.cell_w * 0.92 + 32. + if mixed { 22. } else { 0. } + if has_detail { 120. } else { 0. })
-            .clamp(180., 440.)
-            .min(grid_w.max(180.));
-        let height = shown as f32 * item_h + 8. + (small + 10.);
+        let width = (longest as f32 * self.cell_w + if mixed { 64. } else { 36. })
+            .clamp(200., 420.)
+            .min(grid_w.max(200.));
+        let height = shown as f32 * item_h + 2.;
         let word_cols = s.found.word.chars().count();
         let left = ((col.saturating_sub(word_cols)) as f32 * self.cell_w - 10.)
             .min(grid_w - width)
@@ -716,7 +772,8 @@ impl TerminalPane {
             Kind::Branch => Icon::Git,
             Kind::Script => Icon::Bolt,
         };
-        let mut list = div().flex().flex_col().p(px(4.));
+        let badge = (fs * 1.15).round();
+        let mut list = div().flex().flex_col();
         for (i, it) in s.found.items.iter().enumerate().skip(first).take(shown) {
             let on = i == s.sel;
             let lights: Vec<_> = it
@@ -740,22 +797,31 @@ impl TerminalPane {
                     .id(("suggest", i))
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(10.))
                     .h(px(item_h))
-                    .px(px(8.))
-                    .rounded(px(6.))
-                    .when(on, |d| d.bg(rgb(theme::surface())))
+                    .px(px(10.))
+                    .when(on, |d| d.bg(rgba(theme::alpha(theme::text(), 0x14))))
                     .when(!on, |d| d.hover(|h| h.bg(rgb(theme::row_hover()))))
                     .cursor_pointer()
-                    .when(mixed, |d| {
-                        d.child(
-                            gpui::svg()
-                                .path(glyph(it.kind).path())
-                                .size(px((fs * 0.8).round()))
-                                .flex_none()
-                                .text_color(rgb(if on { tint(it.kind) } else { theme::dim() })),
-                        )
-                    })
+                    // A badge in the kind's colour when kinds are mixed:
+                    // what it is, at a glance, before the name is read.
+                    .when(mixed, |d| d.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(badge))
+                            .rounded(px(4.))
+                            .when(on, |d| d.bg(rgba(theme::alpha(tint(it.kind), 0x30))))
+                            .when(!on, |d| d.bg(rgba(theme::alpha(theme::text(), 0x0a))))
+                            .child(
+                                gpui::svg()
+                                    .path(glyph(it.kind).path())
+                                    .size(px((badge * 0.62).round()))
+                                    .text_color(rgb(if on { tint(it.kind) } else { theme::dim() })),
+                            ),
+                    ))
                     .child(
                         div()
                             .flex_1()
@@ -764,17 +830,8 @@ impl TerminalPane {
                             .font_family(self.look.family.clone())
                             .text_size(px(label_px))
                             .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
-                            .child(gpui::StyledText::new(it.label.clone()).with_highlights(lights)),
+                            .child(gpui::StyledText::new(it.label.clone()).with_highlights(theme::safe_highlights(&it.label, lights))),
                     )
-                    .children(it.detail.clone().filter(|d| !d.is_empty()).map(|d| {
-                        div()
-                            .flex_none()
-                            .max_w(px(120.))
-                            .one_line()
-                            .text_size(px(small))
-                            .text_color(rgb(theme::dim()))
-                            .child(d)
-                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |p, _, window, cx| {
@@ -786,19 +843,34 @@ impl TerminalPane {
                     ),
             );
         }
-        let foot = div()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .h(px(small + 10.))
-            .px(px(12.))
-            .border_t_1()
-            .border_color(rgba(theme::hairline()))
-            .text_size(px(small))
-            .text_color(rgb(theme::dim()))
-            .child("⇥ complete")
-            .child("↑↓ choose")
-            .child("esc close");
+        // The selected item's description beside the list, wrapped and in
+        // full, where a footer cut it off.
+        let sel_label = s.found.items.get(s.sel).map(|i| i.label.clone()).unwrap_or_default();
+        let side_w = 300f32.min((grid_w - left - width - 6.).max(0.));
+        let beside = side_w >= 180.;
+        let detail_box = detail.map(|d| {
+            div()
+                .id("suggest-detail")
+                .absolute()
+                .when(beside, |x| x.top(px(top)).left(px(left + width + 6.)).w(px(side_w)))
+                .when(!beside, |x| x.top(px(top + height + 6.)).left(px(left)).w(px(width)))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p(px(10.))
+                .rounded(px(10.))
+                .bg(rgb(theme::menu()))
+                .border_1()
+                .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                .child(
+                    div()
+                        .font_family(self.look.family.clone())
+                        .text_size(px(label_px))
+                        .text_color(rgb(theme::text()))
+                        .child(sel_label),
+                )
+                .child(div().text_size(px(small + 1.)).line_height(px((small + 1.) * 1.45)).text_color(rgb(theme::text_2())).child(d))
+        });
         Some(
             div()
                 .absolute()
@@ -816,12 +888,11 @@ impl TerminalPane {
                         .rounded(px(10.))
                         .bg(rgb(theme::menu()))
                         .border_1()
-                        .border_color(rgba(theme::hairline()))
-                        .shadow_lg()
+                        .border_color(rgba(theme::alpha(theme::text(), 0x14)))
                         .overflow_hidden()
-                        .child(list)
-                        .child(foot),
+                        .child(list),
                 )
+                .children(detail_box)
                 .into_any_element(),
         )
     }
@@ -869,10 +940,19 @@ impl TerminalPane {
         self.term.history_ansi(5000)
     }
 
+    /// Claude Code is running here: its title rests on `✳` and turns `◐`/`◑`
+    /// while it works.
+    fn is_claude_code(&self) -> bool {
+        matches!(self.title.chars().next(), Some('✳' | '◐' | '◑'))
+    }
+
     /// Whether the program says it is working, when it says: OSC 9;4
     /// progress if it reports any, else Claude Code's title, which turns
     /// `◐`/`◑` while it works and rests on `✳`. `None` when it does neither.
     pub fn activity(&self) -> Option<bool> {
+        if let Some((state, _)) = &self.reported {
+            return Some(state == "working");
+        }
         if let Some(state) = self.progress {
             return Some(state.is_some());
         }
@@ -892,12 +972,15 @@ impl TerminalPane {
         pos: Point<Pixels>,
         m: &gpui::Modifiers,
     ) -> bool {
-        if m.shift || !self.term.mouse_modes().report {
+        // A release always goes out: the press it closes was already sent,
+        // and swallowing it leaves the program dragging.
+        if (m.shift && action != term::MouseAction::Release) || !self.term.mouse_modes().report {
             return false;
         }
         let (row, col, _) = self.cell_at(pos);
         match self.term.mouse_report(button, action, row, col, mods(m)) {
             Some(bytes) => {
+                mouse_log(&format!("{action:?} {button:?} r{row} c{col} held={}", mouse_held()), &bytes);
                 self.term.write(bytes);
                 true
             }
@@ -915,6 +998,15 @@ impl TerminalPane {
             return;
         }
         let button = term::MouseButton::Left;
+        let (row, col, right) = self.cell_at(ev.position);
+        // Claude Code: hold the press until we know it is a click.
+        if self.is_claude_code() && !ev.modifiers.shift && self.term.mouse_modes().report {
+            self.term.select_clear();
+            self.held_click = Some((ev.position, ev.modifiers));
+            self.press = Some((row, col, right));
+            cx.notify();
+            return;
+        }
         if self.report(
             Some(button),
             term::MouseAction::Press,
@@ -924,7 +1016,6 @@ impl TerminalPane {
             self.reporting = Some(button);
             return;
         }
-        let (row, col, right) = self.cell_at(ev.position);
         match ev.click_count {
             2 => self
                 .term
@@ -1043,6 +1134,15 @@ impl TerminalPane {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.press = None;
+        // A held press that never moved: it was a click, so Claude Code
+        // gets it whole (expand a block, follow a link, place the cursor).
+        if let Some((at, mods)) = self.held_click.take() {
+            let left = Some(term::MouseButton::Left);
+            if self.report(left, term::MouseAction::Press, at, &mods) {
+                self.report(left, term::MouseAction::Release, at, &mods);
+            }
+            return;
+        }
         if let Some(button) = self.reporting.take() {
             self.report(
                 Some(button),
@@ -1089,7 +1189,16 @@ impl TerminalPane {
         }
         if ev.pressed_button != Some(MouseButton::Left) {
             self.press = None;
+            self.held_click = None;
             return;
+        }
+        // Moved off the cell it was pressed on: a drag, so Deck selects.
+        if let Some((at, _)) = self.held_click {
+            let (r0, c0, _) = self.cell_at(at);
+            if (r0, c0) == (row, col) {
+                return;
+            }
+            self.held_click = None;
         }
         if let Some((r, c, side)) = self.press.take() {
             self.term.select_start(r, c, side, term::SelectMode::Char);
@@ -1108,6 +1217,21 @@ impl TerminalPane {
         if lines == 0 {
             return;
         }
+        // A press whose release we never heard (let go in another window,
+        // after ⌘Tab) makes the program take every wheel step for a drag:
+        // Claude Code then selects as you scroll until the screen is grey.
+        // The wheel carries no button state, so ask the system.
+        if let Some(button) = self.reporting {
+            if !mouse_held() {
+                self.reporting = None;
+                self.report(
+                    Some(button),
+                    term::MouseAction::Release,
+                    ev.position,
+                    &ev.modifiers,
+                );
+            }
+        }
         let (row, col, _) = self.cell_at(ev.position);
         // Full-screen programs scroll themselves (wheel reports, or arrows in
         // the alternate screen); everything else scrolls our scrollback.
@@ -1121,6 +1245,7 @@ impl TerminalPane {
             // The program scrolls its own content now; a highlight left on
             // cells it is about to redraw would only mislead.
             Some(bytes) => {
+                mouse_log(&format!("Wheel {lines} reporting={:?} held={}", self.reporting, mouse_held()), &bytes);
                 self.term.select_clear();
                 self.term.write(bytes);
             }
@@ -1172,6 +1297,103 @@ impl TerminalPane {
 
     /// Type `text` in as a paste: a shell or TUI takes it whole, and a
     /// newline in it does not run anything.
+    /// Open the AI command box over the prompt.
+    fn open_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ask.is_some() {
+            return;
+        }
+        let field = cx.new(|cx| {
+            let mut f = crate::field::Field::new("Describe a command, e.g. install codex from npm", cx);
+            f.bare = true;
+            f
+        });
+        let sub = cx.subscribe_in(&field, window, |p, _, ev: &crate::field::FieldEvent, window, cx| match ev {
+            crate::field::FieldEvent::Submit(text) if !text.trim().is_empty() && !p.asking => {
+                p.asking = true;
+                let cwd = p.term.shell_cwd().map(PathBuf::from);
+                cx.emit(TerminalEvent::Ask { request: text.trim().to_string(), cwd });
+                cx.notify();
+            }
+            crate::field::FieldEvent::Cancel => {
+                p.close_ask(window, cx);
+            }
+            _ => {}
+        });
+        window.focus(&field.read(cx).focus);
+        self.ask = Some((field, sub));
+        cx.notify();
+    }
+
+    fn close_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask = None;
+        self.asking = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// The command came back (or failed): the box goes, the prompt has it.
+    pub fn ask_done(&mut self, cx: &mut Context<Self>) {
+        if self.ask.take().is_some() {
+            self.asking = false;
+            cx.notify();
+        }
+    }
+
+    fn render_ask(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (field, _) = self.ask.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .top(theme::u(10.))
+                .left(theme::u(16.))
+                .right(theme::u(16.))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("ask-box")
+                        .w_full()
+                        .max_w(theme::u(560.))
+                        .flex()
+                        .flex_col()
+                        .gap(theme::u(6.))
+                        .p(theme::u(8.))
+                        .rounded(theme::u(12.))
+                        .bg(rgb(theme::menu()))
+                        .border_1()
+                        .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                        .occlude()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(theme::u(8.))
+                                .h(theme::u(32.))
+                                .px(theme::u(6.))
+                                .child(if self.asking {
+                                    crate::icon::spinner("ask-spin", 14., theme::accent())
+                                } else {
+                                    crate::icon::icon(Icon::Bolt, 14., theme::accent())
+                                })
+                                .child(div().flex_1().child(field.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(theme::u(12.))
+                                .px(theme::u(6.))
+                                .text_size(theme::u(11.))
+                                .text_color(rgb(theme::dim()))
+                                .child(if self.asking { "Writing the command…" } else { "⏎ write it into the prompt" })
+                                .child("esc close")
+                                .child("nothing runs until you press ⏎ in the shell"),
+                        )
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn paste_text(&mut self, text: &str) {
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let bytes = if self.term.bracketed_paste() {
@@ -1525,7 +1747,6 @@ impl TerminalPane {
                     .bg(rgb(pad))
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
-                    .shadow_sm()
                     .cursor_pointer()
                     .font_family(self.look.family.clone())
                     .text_size(px(self.look.font_px))
@@ -1664,17 +1885,7 @@ impl Render for TerminalPane {
         let focused = self.focus.is_focused(window) || self.menu.is_some();
         let blink = focused && self.look.blink && self.term.last().cursor_blink;
         self.sync_blink(blink, cx);
-        // Full-screen TUIs (OpenCode, Claude Code) paint their own background.
-        // Extending the top-left cell's colour into the padding, as Ghostty
-        // does, keeps that from showing as a frame around the app.
-        let pad = self
-            .term
-            .last()
-            .rows
-            .first()
-            .and_then(|r| r.runs.first())
-            .and_then(|r| r.style.bg)
-            .unwrap_or(self.look.palette.bg);
+        let pad = pane_background(self.term.last(), &self.look);
         let find = self.find.as_ref().map(|bar| self.render_find(bar, cx));
         div()
             .track_focus(&self.focus)
@@ -1689,6 +1900,7 @@ impl Render for TerminalPane {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(|p, _: &AskCommand, window, cx| p.open_ask(window, cx)))
             .on_action(cx.listener(|p, _: &SelectAll, _, cx| {
                 p.term.select_all();
                 cx.notify();
@@ -1724,6 +1936,7 @@ impl Render for TerminalPane {
             .children(self.render_progress())
             .children(self.render_blocks(pad, cx))
             .children(self.render_suggest(focused, cx))
+            .children(self.render_ask(cx))
             .children(find)
             .children(self.menu.as_ref().map(menu::Open::render))
     }
@@ -1761,6 +1974,33 @@ fn on_grid(ch: char) -> bool {
     matches!(ch as u32, 0x20..=0x7e | 0xa0..=0x17f | 0x2500..=0x259f)
 }
 
+/// The colour behind the grid and in the padding around it.
+///
+/// A full-screen TUI (OpenCode, a theme-painting editor) paints every cell
+/// with its own background; extending that colour into the padding, as
+/// Ghostty does, keeps it from showing as a frame around the app. A program
+/// that paints only some rows (Claude Code's band on each prompt) gets the
+/// pane's colour: taking the top-left cell alone turned the whole pane that
+/// band's colour whenever scrolling put a prompt on the top row. Painted
+/// means most rows start with the top-left cell's colour, and the colour is
+/// softened as the cells' fills are, so they match.
+fn pane_background(snap: &term::Snapshot, look: &Look) -> u32 {
+    let first = |r: &term::Row| r.runs.first().and_then(|run| run.style.bg);
+    let Some(top) = snap.rows.first().and_then(first) else {
+        return look.palette.bg;
+    };
+    let same = snap.rows.iter().filter(|r| first(r) == Some(top)).count();
+    if same * 2 <= snap.rows.len() {
+        return look.palette.bg;
+    }
+    let p = &look.palette;
+    if look.soften && ![p.selection, p.search, p.search_focus].contains(&top) {
+        soften(top, p.bg)
+    } else {
+        top
+    }
+}
+
 /// A program's red or green background as a tint of the pane rather than
 /// a solid block: a third of its saturation taken out, then 40% of the way
 /// to the pane's colour. Claude Code's diffs otherwise paint whole lines in
@@ -1772,8 +2012,11 @@ fn soften(color: u32, pane: u32) -> u32 {
     let ch = |c: u32, shift: u32| ((c >> shift) & 0xff) as f32;
     let (r, g, b) = (ch(color, 16), ch(color, 8), ch(color, 0));
     let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    // A grey (Claude Code's command box, a TUI's panel): most of the way to
+    // the pane, a quiet tint that still marks the block, not a slab.
     if max - min < 24. {
-        return color;
+        let toward = |c: f32, p: f32| (c * 0.4 + p * 0.6).round().clamp(0., 255.) as u32;
+        return (toward(r, ch(pane, 16)) << 16) | (toward(g, ch(pane, 8)) << 8) | toward(b, ch(pane, 0));
     }
     let hue = {
         let d = max - min;
@@ -2162,8 +2405,21 @@ fn url_at(line: &str, col: usize) -> Option<String> {
 /// input handler (so the IME, dead keys and ⌥-characters work).
 fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     let m = &ks.modifiers;
+    // ⌘ with an editing key does what it does in every Mac text field, as
+    // Terminal and iTerm send it: ⌘⌫ deletes to the line's start (⌃U),
+    // ⌘← / ⌘→ go to its start and end (⌃A / ⌃E), ⌘⌦ deletes to its end
+    // (⌃K). Any other ⌘ key is the app's.
     if m.platform {
-        return None;
+        if m.alt || m.control {
+            return None;
+        }
+        return match ks.key.as_str() {
+            "backspace" => Some(vec![0x15]),
+            "left" if !m.shift => Some(vec![0x01]),
+            "right" if !m.shift => Some(vec![0x05]),
+            "delete" => Some(vec![0x0b]),
+            _ => None,
+        };
     }
     let arrow = |c: u8| -> Vec<u8> {
         match (m.alt, c) {
@@ -2176,7 +2432,10 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     };
     let fixed: Option<&[u8]> = match ks.key.as_str() {
         "enter" => Some(b"\r"),
-        "backspace" if m.alt => Some(b"\x1b\x7f"),
+        // ⌥⌫ deletes the word before the cursor: ⌃W, which zsh, bash,
+        // readline and agent TUIs (Claude Code, Codex) all take as that,
+        // where Esc-Delete reads as Esc then ⌫ to some of them.
+        "backspace" if m.alt => Some(b"\x17"),
         "backspace" => Some(b"\x7f"),
         "tab" if m.shift => Some(b"\x1b[Z"),
         "tab" => Some(b"\t"),
@@ -2249,6 +2508,43 @@ mod tests {
     use super::*;
     use gpui::Modifiers;
 
+    fn look(soften: bool) -> Look {
+        let mut look = crate::settings::Settings::default().term_look();
+        look.soften = soften;
+        look.palette.bg = 0x10141c;
+        look
+    }
+
+    fn snap(bgs: &[Option<u32>]) -> term::Snapshot {
+        term::Snapshot {
+            rows: bgs
+                .iter()
+                .map(|bg| term::Row {
+                    runs: vec![term::Run { text: "x".into(), style: term::Style { bg: *bg, ..Default::default() } }],
+                    block: None,
+                })
+                .collect(),
+            columns: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_painted_row_on_top_does_not_recolour_the_pane() {
+        // Claude Code's prompt band scrolled to the top row.
+        let s = snap(&[Some(0x565660), None, None, None, None]);
+        assert_eq!(pane_background(&s, &look(true)), 0x10141c);
+        assert_eq!(pane_background(&snap(&[None, None]), &look(true)), 0x10141c);
+    }
+
+    #[test]
+    fn a_program_that_paints_the_screen_colours_the_pane_too() {
+        let s = snap(&[Some(0x282c34), Some(0x282c34), Some(0x282c34), Some(0x1e2127)]);
+        assert_eq!(pane_background(&s, &look(false)), 0x282c34);
+        // Softened like the cells' fills, so no frame shows between them.
+        assert_eq!(pane_background(&s, &look(true)), soften(0x282c34, 0x10141c));
+    }
+
     #[test]
     fn coloured_backgrounds_become_tints_and_greys_stay() {
         let pane = 0x232323;
@@ -2264,8 +2560,9 @@ mod tests {
         // Still green and still red.
         assert!((green >> 8) & 0xff > green >> 16 && (green >> 8) & 0xff > green & 0xff);
         assert!(red >> 16 > (red >> 8) & 0xff);
-        // A grey bar is left alone.
-        assert_eq!(soften(0x373737, pane), 0x373737);
+        // A grey bar becomes a quiet tint: nearer the pane, still apart from it.
+        let grey = soften(0x373737, pane);
+        assert!(grey < 0x373737 && grey != pane, "{grey:06x}");
         // So is a selection: Claude Code's dark and light theme blues.
         assert_eq!(soften(0x264f78, pane), 0x264f78);
         assert_eq!(soften(0xb4d5ff, pane), 0xb4d5ff);
@@ -2314,6 +2611,10 @@ mod tests {
             Some(b"\r".to_vec())
         );
         assert_eq!(key_bytes(&ks("v", None, cmd), false), None);
+        assert_eq!(key_bytes(&ks("backspace", None, cmd), false), Some(vec![0x15]));
+        assert_eq!(key_bytes(&ks("left", None, cmd), false), Some(vec![0x01]));
+        assert_eq!(key_bytes(&ks("right", None, cmd), false), Some(vec![0x05]));
+        assert_eq!(key_bytes(&ks("backspace", None, alt), false), Some(vec![0x17]));
         // Text belongs to the input handler, so the IME and ⌥-characters work.
         assert_eq!(key_bytes(&ks("a", Some("a"), none), false), None);
         assert_eq!(key_bytes(&ks("s", Some("ß"), alt), false), None);
@@ -2397,4 +2698,31 @@ mod tests {
         );
         assert_eq!(line_height(13., 1.6), 21.);
     }
+}
+
+/// Whether any mouse button is down right now, from the system rather than
+/// from events this pane happened to receive.
+/// Every mouse report sent to a program, with a timestamp, when
+/// `mouse-debug.log` exists in Deck's data folder (create it to turn this
+/// on, delete it to stop); nothing otherwise. For finding which event makes
+/// a full-screen program think a button is held.
+fn mouse_log(what: &str, bytes: &[u8]) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = crate::control::socket_dir().join("mouse-debug.log");
+        path.exists()
+            .then(|| std::fs::OpenOptions::new().append(true).open(path).ok().map(std::sync::Mutex::new))
+            .flatten()
+    });
+    if let Some(f) = file {
+        if let Ok(mut f) = f.lock() {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            let _ = writeln!(f, "{t} {what} {:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+}
+
+fn mouse_held() -> bool {
+    objc2_app_kit::NSEvent::pressedMouseButtons() != 0
 }
