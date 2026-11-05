@@ -11545,6 +11545,10 @@ impl Tip {
     pub(crate) fn view(text: &'static str, cx: &mut App) -> AnyView {
         cx.new(|_| Tip(text.into())).into()
     }
+
+    pub(crate) fn view_owned(text: String, cx: &mut App) -> AnyView {
+        cx.new(|_| Tip(text.into())).into()
+    }
 }
 
 impl Render for Tip {

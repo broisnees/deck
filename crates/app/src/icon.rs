@@ -86,6 +86,7 @@ icons! {
     Import => "import.svg",
     Claude => "agent-claude.svg",
     Codex => "agent-codex.svg",
+    Copilot => "agent-copilot.svg",
     Gemini => "agent-gemini.svg",
     Grok => "agent-grok.svg",
     OpenCode => "agent-opencode.svg",
@@ -98,6 +99,7 @@ impl Icon {
         match cmd {
             "claude" => Icon::Claude,
             "codex" => Icon::Codex,
+            "copilot" => Icon::Copilot,
             "gemini" => Icon::Gemini,
             "grok" => Icon::Grok,
             "opencode" => Icon::OpenCode,
