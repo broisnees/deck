@@ -941,6 +941,10 @@ pub struct Workspace {
     /// servers and watchers an agent started with `deck job start`. Each is
     /// a tab in the status bar, and opens in the drawer above it.
     jobs: Vec<PaneId>,
+    /// Background pages and when each was last used: opened, named in a
+    /// `deck` call, or shown in the drawer. One left alone for
+    /// [`BG_PAGE_IDLE`] closes, since each holds a WebKit process.
+    bg_used: HashMap<PaneId, Instant>,
     /// The job whose terminal the drawer shows.
     job_open: Option<PaneId>,
     /// What each job was started with, until its shell reports it.
@@ -1145,6 +1149,7 @@ impl Workspace {
             scroll_keys: HashMap::new(),
             named: HashMap::new(),
             jobs: Vec::new(),
+            bg_used: HashMap::new(),
             job_open: None,
             job_cmds: HashMap::new(),
             daemon_jobs: Vec::new(),
@@ -3140,6 +3145,7 @@ impl Workspace {
             cx.background_executor().spawn(async move { crate::daemon::stop(&name) }).detach();
         }
         self.jobs.retain(|j| *j != id);
+        self.bg_used.remove(&id);
         self.job_cmds.remove(&id);
         if self.job_open == Some(id) {
             self.job_open = None;
@@ -3697,6 +3703,9 @@ impl Workspace {
         if blocked != self.blocked {
             self.blocked = blocked;
             cx.notify();
+        }
+        if self.ticks % 30 == 0 {
+            self.close_idle_pages(window, cx);
         }
         if self.ticks % 2 == 0 && !self.daemon_asking {
             self.daemon_asking = true;
@@ -7252,6 +7261,13 @@ impl Workspace {
                 "unknown or expired token: run deck from a terminal inside a deck window".into(),
             ));
         };
+        // A background page named in a call is in use: it stays open.
+        let target = str_param(p, "name")
+            .and_then(|n| self.named.get(n).copied())
+            .or_else(|| p.get("pane").and_then(Value::as_u64));
+        if let Some(t) = target.and_then(|id| self.bg_used.get_mut(&id)) {
+            *t = Instant::now();
+        }
         let r = match req.method.as_str() {
             "pane.list" => Ok(self.list(caller, cx)),
             "pane.split" => self.rpc_split(p, caller, window, cx),
@@ -7762,6 +7778,28 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Close the background pages nobody has used for [`BG_PAGE_IDLE`]. The
+    /// one in the drawer counts as in use.
+    fn close_idle_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.job_open.and_then(|id| self.bg_used.get_mut(&id)) {
+            *t = Instant::now();
+        }
+        let idle: Vec<PaneId> = self
+            .bg_used
+            .iter()
+            .filter(|(_, used)| used.elapsed() >= BG_PAGE_IDLE)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in idle {
+            self.bg_used.remove(&id);
+            if self.jobs.contains(&id) {
+                self.named.retain(|_, v| *v != id);
+                self.close_pane(id, window, cx);
+                cx.notify();
+            }
+        }
+    }
+
     fn stop_job(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(j) = self.daemon_job(id).cloned() {
             self.daemon_jobs.retain(|x| x.name != j.name);
@@ -7775,6 +7813,7 @@ impl Workspace {
     /// The drawer's job as a tab of its own: it leaves the status bar.
     fn job_to_tab(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         self.jobs.retain(|j| *j != id);
+        self.bg_used.remove(&id);
         if let Some(PaneKind::Browser(b)) = self.panes.get(&id).map(|p| &p.kind) {
             b.update(cx, |b, _| b.set_visible(true));
         }
@@ -8028,6 +8067,7 @@ impl Workspace {
                 });
             }
             self.jobs.push(id);
+            self.bg_used.insert(id, Instant::now());
             let n = name.map_or_else(|| format!("page {id}"), str::to_string);
             self.named.insert(n.clone(), id);
             // The caller keeps the keyboard.
@@ -11973,6 +12013,10 @@ fn row_trailer(id: ElementId, state: RowState, when: String) -> AnyElement {
 /// Background jobs and pages shown inline in the status bar before the
 /// rest fold into "+N".
 const BG_INLINE: usize = 4;
+
+/// How long a background page may sit unused before it closes. A later
+/// `deck browser open --bg --name N` opens it again.
+const BG_PAGE_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// A background job or page, as the status bar shows it.
 struct BgRow {
