@@ -9443,13 +9443,25 @@ impl Workspace {
             )))
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .min_w_0()
-                    .one_line()
-                    .text_size(u(12.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
-                    .child(label),
+                    .items_baseline()
+                    .gap(u(6.))
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w_0()
+                            .one_line()
+                            .text_size(u(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
+                            .child(label),
+                    )
+                    // The branch the project is on, quiet beside its name.
+                    .children(g.root.as_deref().and_then(head_branch).map(|b| {
+                        div().flex_shrink().min_w_0().one_line().text_size(u(11.5)).text_color(rgb(theme::dim())).child(b)
+                    })),
             )
             // What's going on inside, readable even when folded.
             .when(wants, |d| d.child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(theme::DANGER))))
@@ -11212,6 +11224,32 @@ fn git_head(root: &std::path::Path) -> Option<String> {
 /// its own controls.
 /// A group's header: its name, a step down from the rows, in semibold,
 /// the same for days, projects and the view switch.
+/// The branch checked out at `root`, read from `.git/HEAD` (a worktree's
+/// `.git` file points at its own HEAD): no git process, kept a few seconds.
+fn head_branch(root: &std::path::Path) -> Option<String> {
+    type Cache = HashMap<PathBuf, (Instant, Option<String>)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some((at, b)) = cache.get(root) {
+        if at.elapsed() < Duration::from_secs(5) {
+            return b.clone();
+        }
+    }
+    let dot = root.join(".git");
+    let git_dir = if dot.is_file() {
+        let text = std::fs::read_to_string(&dot).unwrap_or_default();
+        text.trim().strip_prefix("gitdir:").map(|d| root.join(d.trim()))
+    } else {
+        Some(dot)
+    };
+    let branch = git_dir
+        .and_then(|d| std::fs::read_to_string(d.join("HEAD")).ok())
+        .and_then(|h| h.trim().strip_prefix("ref: refs/heads/").map(str::to_string));
+    cache.insert(root.to_path_buf(), (Instant::now(), branch.clone()));
+    branch
+}
+
 fn sidebar_header(label: &'static str) -> gpui::Div {
     div()
         .flex()

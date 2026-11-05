@@ -229,11 +229,29 @@ pub fn now() -> (u64, (u32, u32, u32)) {
         _wday: i32,
         _yday: i32,
         _isdst: i32,
+        // Windows' C runtime ends the struct here.
+        #[cfg(unix)]
         _gmtoff: std::ffi::c_long,
+        #[cfg(unix)]
         _zone: *const std::ffi::c_char,
     }
+    #[cfg(unix)]
     extern "C" {
         fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    // The same, as Windows' C runtime spells it: 0 on success.
+    #[cfg(windows)]
+    extern "C" {
+        fn _localtime64_s(out: *mut Tm, t: *const i64) -> i32;
+    }
+    #[cfg(windows)]
+    unsafe fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm {
+        // SAFETY: as localtime_r; both pointers are the caller's.
+        if unsafe { _localtime64_s(out, t) } == 0 {
+            out
+        } else {
+            std::ptr::null_mut()
+        }
     }
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
