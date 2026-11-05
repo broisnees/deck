@@ -11375,10 +11375,10 @@ fn lead(mark: AnyElement) -> AnyElement {
 }
 
 /// A small label shown on hover, for controls that are only an icon.
-struct Tip(SharedString);
+pub(crate) struct Tip(SharedString);
 
 impl Tip {
-    fn view(text: &'static str, cx: &mut App) -> AnyView {
+    pub(crate) fn view(text: &'static str, cx: &mut App) -> AnyView {
         cx.new(|_| Tip(text.into())).into()
     }
 }

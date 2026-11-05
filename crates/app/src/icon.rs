@@ -61,6 +61,7 @@ icons! {
     Check => "check.svg",
     Spinner => "spinner.svg",
     ListCheck => "list-check.svg",
+    List => "list.svg",
     Pencil => "pencil.svg",
     Search => "search.svg",
     Download => "download.svg",

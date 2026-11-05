@@ -2630,7 +2630,7 @@ impl ChatPane {
             .id("console-body")
             .flex()
             .flex_col()
-            .gap(u(10.))
+            .gap(u(14.))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -2652,38 +2652,64 @@ impl ChatPane {
                 Some(other) => format!("{other:?}"),
             };
             let lines: Vec<&str> = out.lines().collect();
-            let tail = lines[lines.len().saturating_sub(TAIL)..].join("\n");
-            let state = if t.is_open() {
-                "running"
+            let skipped = lines.len().saturating_sub(TAIL);
+            let took = self
+                .tool_times
+                .get(&t.id.0.to_string())
+                .map(|(start, end)| end.unwrap_or_else(|| start.elapsed()));
+            let (state, tone) = if t.is_open() {
+                ("running".to_string(), theme::accent())
             } else if t.is_error {
-                "failed"
+                ("failed".to_string(), crate::theme::DANGER)
             } else {
-                ""
+                (took.map(|d| human_duration(d)).unwrap_or_default(), theme::dim())
             };
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(u(2.))
-                    .child(
+            // The command on a tinted bar, so each entry starts plainly.
+            let head = div()
+                .flex()
+                .items_start()
+                .gap(u(8.))
+                .px(u(8.))
+                .py(u(4.))
+                .rounded(u(6.))
+                .bg(rgb(theme::surface()))
+                .child(div().flex_none().text_color(rgb(theme::accent())).child("$"))
+                .child(div().flex_1().min_w_0().text_color(rgb(theme::text())).child(cmd))
+                .when(!state.is_empty(), |d| {
+                    d.child(
                         div()
-                            .flex()
-                            .gap(u(8.))
-                            .child(div().flex_none().text_color(rgb(theme::dim())).child("$"))
-                            .child(div().flex_1().min_w_0().text_color(rgb(theme::text())).child(cmd))
-                            .when(!state.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .flex_none()
-                                        .font_family(theme::ui())
-                                        .text_size(u(11.))
-                                        .text_color(rgb(if t.is_error { crate::theme::DANGER } else { theme::text_2() }))
-                                        .child(state),
-                                )
-                            }),
+                            .flex_none()
+                            .font_family(theme::ui())
+                            .text_size(u(11.))
+                            .text_color(rgb(tone))
+                            .child(state),
                     )
-                    .when(!tail.trim().is_empty(), |d| d.child(div().text_color(rgb(theme::text_2())).child(tail))),
-            );
+                });
+            // What it printed, line by line under a rule, quieter than the
+            // command; the oldest lines of a long run are left out.
+            let mut output = div()
+                .flex()
+                .flex_col()
+                .ml(u(12.))
+                .pl(u(10.))
+                .border_l_1()
+                .border_color(rgba(theme::hairline()))
+                .text_size(u(11.))
+                .line_height(u(16.))
+                .text_color(rgb(theme::text_2()));
+            if skipped > 0 {
+                output = output.child(div().text_color(rgb(theme::dim())).child(format!("… {skipped} earlier lines")));
+            }
+            for line in &lines[skipped..] {
+                // An empty line keeps its height.
+                output = output.child(div().min_h(u(16.)).child(line.to_string()));
+            }
+            if lines.iter().all(|l| l.trim().is_empty()) {
+                output = output.child(
+                    div().text_color(rgb(theme::dim())).child(if t.is_open() { "waiting for output…" } else { "no output" }),
+                );
+            }
+            body = body.child(div().flex().flex_col().gap(u(6.)).child(head).child(output));
         }
         if running {
             self.console_scroll.scroll_to_bottom();
@@ -2693,7 +2719,7 @@ impl ChatPane {
                 div()
                     .flex()
                     .flex_col()
-                    .h(u(240.))
+                    .h(u(300.))
                     .mb(u(8.))
                     .rounded(u(12.))
                     .bg(rgb(theme::raised()))
@@ -4400,11 +4426,12 @@ impl ChatPane {
                 // The console: the agent's commands and their output.
                 chip("console")
                     .px(u(0.))
-                    .w(u(28.))
+                    .w(u(30.))
                     .justify_center()
+                    .tooltip(|_, cx| crate::workspace::Tip::view("Console: commands and their output", cx))
                     .when(self.console, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::surface())))
-                    .child(icon(Icon::Terminal, 13., if self.console { theme::text() } else { theme::text_2() }))
+                    .child(icon(Icon::Terminal, 15., if self.console { theme::text() } else { theme::text_2() }))
                     .on_click(cx.listener(|c, _, _, cx| {
                         c.console = !c.console;
                         cx.notify();
@@ -4414,11 +4441,12 @@ impl ChatPane {
                 // The outline: every message you sent, to jump back to.
                 chip("outline")
                     .px(u(0.))
-                    .w(u(28.))
+                    .w(u(30.))
                     .justify_center()
+                    .tooltip(|_, cx| crate::workspace::Tip::view("Outline: jump to a message", cx))
                     .when(self.outline_open, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::surface())))
-                    .child(icon(Icon::ListCheck, 13., if self.outline_open { theme::text() } else { theme::text_2() }))
+                    .child(icon(Icon::List, 15., if self.outline_open { theme::text() } else { theme::text_2() }))
                     .on_click(cx.listener(|c, _, _, cx| {
                         c.outline_open = !c.outline_open;
                         cx.notify();
