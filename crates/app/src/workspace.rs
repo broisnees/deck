@@ -1464,9 +1464,9 @@ impl Workspace {
                                 ws.command_done(id, command.clone(), *exit, *took, window, cx);
                             }
                             TerminalEvent::History => ws.open_history(id, window, cx),
-                            TerminalEvent::Ask { request, cwd } => {
+                            TerminalEvent::Ask { request, cwd, run } => {
                                 let (request, cwd) = (request.clone(), cwd.clone());
-                                ws.write_command(id, request, cwd, cx);
+                                ws.write_command(id, request, cwd, *run, cx);
                             }
                             TerminalEvent::AskAgent { prompt, cwd } => {
                                 let (prompt, cwd) = (prompt.clone(), cwd.clone());
@@ -1508,6 +1508,11 @@ impl Workspace {
                         window,
                         move |ws, _, ev: &ChatEvent, window, cx| match ev {
                             ChatEvent::Focused => ws.mark_focused(id, cx),
+                            ChatEvent::DefaultAgent(agent) => {
+                                let mut next = ws.settings.clone();
+                                next.default_agent = Some(agent.clone());
+                                ws.apply_settings(next, window, cx);
+                            }
                             ChatEvent::StartTask { brief, agent, cwd } => {
                                 let (brief, agent, cwd) = (brief.clone(), agent.clone(), cwd.clone());
                                 ws.spawn_task(brief, cwd, Some(agent), None, None, window, cx);
@@ -7004,7 +7009,7 @@ impl Workspace {
 
     /// "# …" at a terminal's prompt: a command for it, typed at the prompt
     /// (not run) once the model has written it.
-    fn write_command(&mut self, id: PaneId, request: String, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn write_command(&mut self, id: PaneId, request: String, cwd: Option<PathBuf>, run: bool, cx: &mut Context<Self>) {
         let cwd = cwd.filter(|c| c.is_dir()).or_else(|| self.cwd_of(id, cx)).unwrap_or_else(|| self.cwd.clone());
         let model = crate::refine::model();
         cx.spawn(async move |this, cx| {
@@ -7017,7 +7022,10 @@ impl Workspace {
                     if let Some(PaneKind::Terminal(t)) = ws.panes.get(&id).map(|p| &p.kind) {
                         t.update(cx, |t, cx| {
                             t.ask_done(cx);
-                            t.paste_text(&cmd)
+                            t.paste_text(&cmd);
+                            if run {
+                                t.press_enter();
+                            }
                         });
                     }
                 }

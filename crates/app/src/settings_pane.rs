@@ -2167,11 +2167,39 @@ impl SettingsPane {
                 .on_click(self.on(move |s| s.access = a, cx))
             })
             .collect();
+        // Where a thread goes when its agent hits the plan's usage limit.
+        let fallback = self.settings.limit_fallback.clone();
+        let mut on_limit = vec![choice(
+            "limit-wait".into(),
+            Some(Icon::Clock),
+            "Wait for the reset".into(),
+            Some("The thread picks up by itself when the limit resets".into()),
+            fallback.is_none(),
+        )
+        .on_click(self.on(|s| s.limit_fallback = None, cx))];
+        for (ix, (id, name)) in self.agents.iter().enumerate() {
+            let pick = id.to_string();
+            on_limit.push(
+                choice(
+                    ElementId::NamedInteger("limit-agent".into(), ix as u64),
+                    Some(Icon::agent(id)),
+                    format!("Continue with {name}").into(),
+                    None,
+                    fallback.as_deref() == Some(id.as_ref()),
+                )
+                .on_click(self.on(move |s| s.limit_fallback = Some(pick.clone()), cx)),
+            );
+        }
         vec![
             choices(
                 "New chats",
                 start,
                 (self.agents.is_empty()).then(|| "Detecting agents…".into()),
+            ),
+            choices(
+                "When an agent reaches its limit",
+                on_limit,
+                Some("Claude's 5-hour and weekly limits, Codex's monthly one. Continuing hands the thread, with the whole conversation, to the agent picked here.".into()),
             ),
             choices(
                 "Access",

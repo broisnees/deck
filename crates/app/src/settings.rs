@@ -92,6 +92,9 @@ pub struct Settings {
     /// (`deck browser console|network|storage|eval|read`). Off, they can
     /// still open pages for you to look at.
     pub agents_read_pages: bool,
+    /// The agent a thread moves to when its own reaches its plan's usage
+    /// limit, carrying the conversation; `None` waits for the reset.
+    pub limit_fallback: Option<String>,
     /// Your shortcuts, by `workspace::SHORTCUTS` id: a key in gpui's form
     /// ("cmd-shift-k"), or "" for none. Absent ones keep Deck's.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -140,6 +143,7 @@ impl Default for Settings {
             import_offered: false,
             block_ads: true,
             agents_read_pages: true,
+            limit_fallback: None,
             keys: Default::default(),
             routes: Default::default(),
             access: Access::default(),
@@ -550,6 +554,7 @@ struct Stored {
     #[serde(deserialize_with = "lenient")]
     block_ads: Option<bool>,
     agents_read_pages: Option<bool>,
+    limit_fallback: Option<String>,
     #[serde(deserialize_with = "lenient")]
     keys: Option<std::collections::BTreeMap<String, String>>,
     #[serde(deserialize_with = "lenient")]
@@ -628,6 +633,7 @@ fn from_stored(s: Stored) -> Settings {
         import_offered: s.import_offered.unwrap_or(d.import_offered),
         block_ads: s.block_ads.unwrap_or(d.block_ads),
         agents_read_pages: s.agents_read_pages.unwrap_or(d.agents_read_pages),
+        limit_fallback: s.limit_fallback.filter(|a| !a.is_empty()),
         // A key that does not parse is dropped, so Deck's comes back.
         keys: s
             .keys
@@ -748,6 +754,7 @@ mod tests {
             import_offered: true,
             block_ads: false,
             agents_read_pages: true,
+            limit_fallback: None,
             keys: [("palette".to_string(), "cmd-p".to_string())].into(),
             routes: [
                 ("rewrite".to_string(), "ollama:qwen2.5-coder:7b".to_string()),

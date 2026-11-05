@@ -125,6 +125,8 @@ pub enum ChatEvent {
     /// The first message of a thread set to work on its own branch: start
     /// a task (its own branch and worktree) with this brief and agent.
     StartTask { brief: String, agent: String, cwd: PathBuf },
+    /// "Make … the default" in the agent menu: new chats start with it.
+    DefaultAgent(String),
 }
 
 /// An attached image's square thumbnail: being made, made, or not
@@ -935,6 +937,32 @@ impl ChatPane {
                 self.error = Some(format!("{why}. A retry would not fix this.").into());
             }
             crate::retry::Verdict::Retry { wait, reason } => {
+                // Out of plan for this agent: carry on with the one Settings
+                // names, if it is ready, instead of waiting hours.
+                if reason == "usage limit" {
+                    let to = crate::settings::load()
+                        .limit_fallback
+                        .and_then(|f| self.env.registry.all().into_iter().find(|e| e.id().as_str() == f && e.is_ready()))
+                        .map(|e| (e.id(), e.display_name().to_string()))
+                        .filter(|(id, _)| *id != self.agent);
+                    if let Some((to, name)) = to {
+                        let from = self.agent_name().to_string();
+                        self.retries = 0;
+                        self.retry = None;
+                        self.switch_agent(to, None, cx);
+                        self.refine_note = Some(format!("{from} reached its usage limit; continuing with {name}").into());
+                        self.send_turn(
+                            Outgoing {
+                                text: "continue".into(),
+                                attachments: Vec::new(),
+                                now: false,
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
                 if self.retries >= crate::retry::MAX_TRIES {
                     self.error = Some(
                         format!(
@@ -4803,6 +4831,7 @@ impl ChatPane {
         let entries = self.env.registry.all();
         let n = entries.len();
         let mut lit_ix = 0usize;
+        let default_agent = crate::settings::load().default_agent;
         let mut agents = panel().w(u(196.)).child(head("Agent".into()));
         for (ix, entry) in entries.into_iter().enumerate() {
             let id = entry.id();
@@ -4837,6 +4866,10 @@ impl ChatPane {
                         },
                     ))
                     .child(div().flex_1().min_w_0().one_line().child(entry.display_name().to_string()))
+                    // The one new chats start with.
+                    .when(ready && Some(id.as_str()) == default_agent.as_deref(), |d| {
+                        d.child(div().flex_none().text_size(u(10.5)).text_color(rgb(theme::dim())).child("default"))
+                    })
                     .when(!ready, |d| d.child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child("Not set up")))
                     .when(ready && current, |d| d.child(icon(Icon::Check, 11., theme::text())))
                     .when(ready && has_models, |d| d.child(icon(Icon::ChevronRight, 10., theme::dim())))
@@ -4847,6 +4880,27 @@ impl ChatPane {
                         )
                     }),
             );
+        }
+        // Make the agent under the pointer the one new chats start with.
+        let mut below = 0.;
+        if let Some(entry) = self.env.registry.get(&lit).filter(|e| e.is_ready()) {
+            if default_agent.as_deref() != Some(lit.as_str()) {
+                // The divider (1 + 4 margin) and the row, under the agents.
+                below = 5. + GAP + ROW + GAP;
+                let to = lit.as_str().to_string();
+                agents = agents.child(div().h(u(1.)).mx(u(6.)).my(u(2.)).bg(rgba(theme::hairline()))).child(
+                    row(ElementId::Name("menu-make-default".into()))
+                        .cursor_pointer()
+                        .text_size(u(12.))
+                        .text_color(rgb(theme::text_2()))
+                        .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                        .child(format!("Make {} the default", entry.display_name()))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| cx.emit(ChatEvent::DefaultAgent(to.clone()))),
+                        ),
+                );
+            }
         }
         let models = self
             .env
@@ -4873,7 +4927,7 @@ impl ChatPane {
             // the room above; then it sits on the menu's floor. Both panels
             // open with a title row.
             let height = PAD * 2. + HEAD + GAP + visible as f32 * ROW + (visible - 1) as f32 * GAP + 2.;
-            let row_top = (n - lit_ix) as f32 * (ROW + GAP) - GAP + PAD + 1. + HEAD + GAP;
+            let row_top = (n - lit_ix) as f32 * (ROW + GAP) - GAP + PAD + 1. + HEAD + GAP + below;
             let lift = (row_top - height).max(0.);
             let agent_label = lit.as_str().to_lowercase();
             let agent_name = self.env.registry.get(&lit).map(|e| e.display_name().to_string()).unwrap_or_default();

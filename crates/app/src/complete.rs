@@ -558,6 +558,13 @@ fn shell_defined() -> Vec<(String, &'static str)> {
     out
 }
 
+/// What `word` was meant as, when it is not a command here: another
+/// system's name for one (`cls` for `clear`) or a slip of a letter from one
+/// in use (`gti` for `git`). For the terminal's offer after a command fails.
+pub fn meant(word: &str) -> Option<String> {
+    commands(word).into_iter().find(|i| i.meant).map(|i| i.label)
+}
+
 /// Other systems' commands for what a Unix one does, offered when typed:
 /// (typed, meant).
 const INTENT: &[(&str, &str)] = &[

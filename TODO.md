@@ -338,6 +338,14 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [ ] Memory page of its own: search, edit in place, move between a project and everywhere (today: Settings › Agents › Deck memory lists and forgets)
 - [ ] Notes from a finished chat: offer the decisions and gotchas it found as memories, one click to keep
 
+### Agents: default, limits, failed commands (asked 2026-11-05)
+
+- [x] Default agent from the chat's agent menu: "default" beside it, "Make … the default" on the one under the pointer (Settings › Agents › Default agent too)
+- [x] A failed command in a terminal raises an overlay: what failed, "Run clear" when it was likely meant (`cls`, `gti`), Fix with agent, dismiss; gone with the next command
+- [x] Command box (⌘J): Ctrl+Enter writes the command and runs it; keys shown as keycaps
+- [~] Routing when a limit is reached (Settings › Agents › When an agent reaches its limit: wait for the reset, or continue with a chosen agent, which takes the thread with the whole conversation and says so; still to do: a chain of fallbacks, models within one agent, handing back after the reset): an agent that hits its plan limit hands the thread to another
+- [ ] Before the limit: warn at 90% in the composer and offer the switch, with the reset time
+
 ### One setup for every agent (asked 2026-11-05)
 
 - [ ] See each agent's MCP servers, skills, slash commands, hooks and plugins side by side (Claude Code, Codex, Gemini CLI, OpenCode, Grok, Crush, Vibe), read from their own config files
