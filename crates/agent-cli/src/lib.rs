@@ -436,8 +436,10 @@ pub(crate) fn kill_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // The group was made by `process_group(0)`, so its id is the pid.
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
+        // TERM first, then KILL: a process that came up with TERM ignored
+        // (an `opencode serve` did) would otherwise outlive us for good.
+        let _ = Command::new("sh")
+            .args(["-c", "kill -TERM -$0 2>/dev/null; sleep 3; kill -KILL -$0 2>/dev/null", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

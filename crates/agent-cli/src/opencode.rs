@@ -49,11 +49,13 @@ const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
 /// deck's: deck holds this shell's stdin open, and when that pipe closes —
 /// deck quit, crashed or was killed — the whole process group goes. Without
 /// it, a deck that dies without cleaning up leaves a server running for good.
-/// It also exits when the server does, so a dead server is noticed.
+/// It also exits when the server does, so a dead server is noticed. TERM is
+/// followed by KILL: servers that came up with TERM ignored were found
+/// running days after their deck had gone.
 const LIFELINE: &str = r#"exec 3<&0
 "$@" </dev/null 3<&- &
 pid=$!
-( cat <&3 >/dev/null; kill -TERM 0 ) &
+( trap '' TERM; cat <&3 >/dev/null; kill -TERM 0; sleep 3; kill -KILL 0 ) &
 exec 3<&-
 wait "$pid"
 kill -TERM 0"#;
