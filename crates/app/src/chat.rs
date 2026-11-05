@@ -4320,34 +4320,6 @@ impl ChatPane {
                     .child(icon(Icon::Plus, 14., theme::text_2()))
                     .on_click(cx.listener(|c, _, _, cx| c.pick_files(cx))),
             )
-            .child(
-                // The console: the agent's commands and their output.
-                chip("console")
-                    .px(u(0.))
-                    .w(u(28.))
-                    .justify_center()
-                    .when(self.console, |d| d.bg(rgb(theme::surface())))
-                    .hover(|s| s.bg(rgb(theme::surface())))
-                    .child(icon(Icon::Terminal, 13., if self.console { theme::text() } else { theme::text_2() }))
-                    .on_click(cx.listener(|c, _, _, cx| {
-                        c.console = !c.console;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                // The outline: every message you sent, to jump back to.
-                chip("outline")
-                    .px(u(0.))
-                    .w(u(28.))
-                    .justify_center()
-                    .when(self.outline_open, |d| d.bg(rgb(theme::surface())))
-                    .hover(|s| s.bg(rgb(theme::surface())))
-                    .child(icon(Icon::ListCheck, 13., if self.outline_open { theme::text() } else { theme::text_2() }))
-                    .on_click(cx.listener(|c, _, _, cx| {
-                        c.outline_open = !c.outline_open;
-                        cx.notify();
-                    })),
-            )
             .child({
                 // One chip for who answers: the agent's mark and the model.
                 // Its menu lists the agents, each opening onto its models.
@@ -4420,6 +4392,36 @@ impl ChatPane {
                     .children(self.render_access_menu(cx))
             })
             .child(div().flex_1())
+            // The thread's own views, beside send: they never squeeze the
+            // agent's name out of its chip.
+            .child(
+                // The console: the agent's commands and their output.
+                chip("console")
+                    .px(u(0.))
+                    .w(u(28.))
+                    .justify_center()
+                    .when(self.console, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(Icon::Terminal, 13., if self.console { theme::text() } else { theme::text_2() }))
+                    .on_click(cx.listener(|c, _, _, cx| {
+                        c.console = !c.console;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                // The outline: every message you sent, to jump back to.
+                chip("outline")
+                    .px(u(0.))
+                    .w(u(28.))
+                    .justify_center()
+                    .when(self.outline_open, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(Icon::ListCheck, 13., if self.outline_open { theme::text() } else { theme::text_2() }))
+                    .on_click(cx.listener(|c, _, _, cx| {
+                        c.outline_open = !c.outline_open;
+                        cx.notify();
+                    })),
+            )
             .child(
                 div()
                     .id("send")
