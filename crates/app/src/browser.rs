@@ -45,9 +45,16 @@ pub enum BrowserEvent {
     /// The editor asked to open a folder (a worktree) in Deck: as an editor
     /// (`terminal: false`) or a terminal.
     OpenFolder { path: PathBuf, terminal: bool },
+    /// A shortcut of Deck's, pressed in the page.
+    Key(String),
+    /// The import offer's buttons.
+    Import,
+    DismissImport,
 }
 
 pub enum Msg {
+    /// One of Deck's shortcuts, pressed in the page.
+    Key(String),
     Title(String),
     /// A navigation committed (`true`) or finished loading (`false`).
     Load(String, bool),
@@ -111,6 +118,163 @@ const PAGE_SCRIPT: &str = r#"(() => {
   addEventListener('click', (e) => { if (e.metaKey && e.button === 0) tab(e); }, true);
   addEventListener('auxclick', (e) => { if (e.button === 1) tab(e); }, true);
 })();"#;
+
+/// Deck's shortcuts, as "cmd-w", "cmd-shift-[": a page (or the editor)
+/// hands these to Deck instead of keeping them, so ⌘W, ⌘K and the rest work
+/// with a page focused. Set from the keymap whenever it changes.
+static FORWARD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn set_forward_keys(keys: Vec<String>) {
+    if let Ok(mut f) = FORWARD.lock() {
+        // One spelling for each: the order the page script and the key
+        // monitor build them in ("cmd-shift-k" and "shift-cmd-k" are one
+        // shortcut, and only one of them ever matched).
+        *f = keys.iter().filter_map(|k| canonical(k)).collect();
+    }
+}
+
+/// "cmd-shift-K" → "shift-cmd-k": modifiers as ctrl, alt, shift, cmd, then
+/// the key, lowercase.
+pub fn canonical(key: &str) -> Option<String> {
+    let mut mods = (false, false, false, false);
+    let mut last = None;
+    for part in key.split('-') {
+        match part {
+            "ctrl" => mods.0 = true,
+            "alt" => mods.1 = true,
+            "shift" => mods.2 = true,
+            "cmd" => mods.3 = true,
+            "" => last = Some("-".to_string()),
+            k => last = Some(k.to_lowercase()),
+        }
+    }
+    let k = last?;
+    let mut out = String::new();
+    for (on, name) in [(mods.0, "ctrl-"), (mods.1, "alt-"), (mods.2, "shift-"), (mods.3, "cmd-")] {
+        if on {
+            out.push_str(name);
+        }
+    }
+    out.push_str(&k);
+    Some(out)
+}
+
+/// Deck's shortcuts pressed while a page has the keyboard, caught before
+/// WebKit (which keeps some, ⌃Tab among them, from the page's own script).
+static PAGE_KEYS: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
+
+/// Watch the app's key presses: one of Deck's shortcuts, while a web view
+/// is what has the keyboard, goes to Deck instead. Returns where they
+/// arrive. Main thread, once.
+pub fn watch_page_keys() -> futures::channel::mpsc::UnboundedReceiver<String> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    if let Ok(mut t) = PAGE_KEYS.lock() {
+        *t = Some(tx);
+    }
+    let handler = block2::RcBlock::new(|event: *mut AnyObject| -> *mut AnyObject {
+        // SAFETY: AppKit hands a live key event on the main thread.
+        unsafe {
+            let Some(ev) = event.as_ref() else { return event };
+            let flags: usize = msg_send![ev, modifierFlags];
+            let (shift, ctrl, alt, cmd) = (flags & (1 << 17) != 0, flags & (1 << 18) != 0, flags & (1 << 19) != 0, flags & (1 << 20) != 0);
+            if !(ctrl || alt || cmd) {
+                return event;
+            }
+            // Only while a web view is the first responder.
+            let window: Option<Retained<AnyObject>> = msg_send![ev, window];
+            let Some(window) = window else { return event };
+            let responder: Option<Retained<AnyObject>> = msg_send![&*window, firstResponder];
+            let in_page = responder.is_some_and(|r| {
+                let mut v: Option<Retained<AnyObject>> = Some(r);
+                let wk = class!(WKWebView);
+                for _ in 0..12 {
+                    let Some(cur) = v else { return false };
+                    let is: bool = msg_send![&*cur, isKindOfClass: wk];
+                    if is {
+                        return true;
+                    }
+                    let isview: bool = msg_send![&*cur, isKindOfClass: class!(NSView)];
+                    if !isview {
+                        return false;
+                    }
+                    v = msg_send![&*cur, superview];
+                }
+                false
+            });
+            if !in_page {
+                return event;
+            }
+            let code: u16 = msg_send![ev, keyCode];
+            let key = match code {
+                48 => "tab".to_string(),
+                36 => "enter".to_string(),
+                49 => "space".to_string(),
+                51 => "backspace".to_string(),
+                53 => "escape".to_string(),
+                123 => "left".to_string(),
+                124 => "right".to_string(),
+                125 => "down".to_string(),
+                126 => "up".to_string(),
+                _ => {
+                    let chars: Option<Retained<objc2_foundation::NSString>> = msg_send![ev, charactersIgnoringModifiers];
+                    match chars.map(|c| c.to_string().to_lowercase()) {
+                        Some(c) if c.chars().count() == 1 => c,
+                        _ => return event,
+                    }
+                }
+            };
+            let mut combo = String::new();
+            for (on, name) in [(ctrl, "ctrl-"), (alt, "alt-"), (shift, "shift-"), (cmd, "cmd-")] {
+                if on {
+                    combo.push_str(name);
+                }
+            }
+            combo.push_str(&key);
+            let ours = FORWARD.lock().is_ok_and(|f| f.contains(&combo));
+            if !ours {
+                return event;
+            }
+            if let Some(tx) = PAGE_KEYS.lock().ok().and_then(|t| t.clone()) {
+                let _ = tx.unbounded_send(combo);
+            }
+            std::ptr::null_mut()
+        }
+    });
+    // SAFETY: NSEvent's local monitor; the block lives as long as the app.
+    unsafe {
+        let mask: u64 = 1 << 10; // NSEventMaskKeyDown
+        let _: Option<Retained<AnyObject>> =
+            msg_send![class!(NSEvent), addLocalMonitorForEventsMatchingMask: mask, handler: &*handler];
+    }
+    std::mem::forget(handler);
+    rx
+}
+
+/// The script that catches those keys in a page and posts `key:cmd-w`.
+fn key_script() -> String {
+    let keys = FORWARD.lock().map(|f| f.clone()).unwrap_or_default();
+    let list = serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into());
+    format!(
+        r#"(() => {{
+  const keys = new Set({list});
+  const post = (m) => {{ try {{ window.ipc.postMessage(m); }} catch (_) {{}} }};
+  const named = {{ BracketLeft: '[', BracketRight: ']', Comma: ',', Period: '.', Semicolon: ';', Quote: "'", Slash: '/', Backslash: '\\', Minus: '-', Equal: '=', Backquote: '`', Space: 'space', Enter: 'enter', Tab: 'tab', Escape: 'escape', Backspace: 'backspace', Delete: 'delete', ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' }};
+  addEventListener('keydown', (e) => {{
+    if (!e.metaKey && !e.ctrlKey && !e.altKey) return;
+    const c = e.code || '';
+    const k = c.startsWith('Key') ? c.slice(3).toLowerCase() : c.startsWith('Digit') ? c.slice(5) : named[c];
+    if (!k) return;
+    const combo = (e.ctrlKey ? 'ctrl-' : '') + (e.altKey ? 'alt-' : '') + (e.shiftKey ? 'shift-' : '') + (e.metaKey ? 'cmd-' : '') + k;
+    if (!keys.has(combo)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    post('key:' + combo);
+  }}, true);
+}})();"#
+    )
+}
 
 /// Runs in every web page (not the editor) before its own scripts, and
 /// records what devtools would show an agent: console output, uncaught
@@ -484,6 +648,9 @@ fn parse_ipc(body: &str) -> Option<Msg> {
     if let Some(url) = body.strip_prefix("icon:") {
         return is_web(url).then(|| Msg::Icon(url.to_string()));
     }
+    if let Some(k) = body.strip_prefix("key:") {
+        return (k.len() < 40).then(|| Msg::Key(k.to_string()));
+    }
     if let Some(url) = body.strip_prefix("tab:") {
         return is_web(url).then(|| Msg::LinkTab(url.to_string()));
     }
@@ -725,6 +892,9 @@ struct Download {
 }
 
 pub struct BrowserPane {
+    /// The browser to offer importing from, until the offer is answered.
+    pub import_offer: Option<SharedString>,
+    pub importing: bool,
     webview: wry::WebView,
     /// The view the webview fills, placed where the pane is. Dropped after
     /// the webview, which takes itself out of it first.
@@ -758,6 +928,9 @@ pub struct BrowserPane {
     /// Something floats over the window (the command palette) that a
     /// native view would cover.
     covered: bool,
+    /// A picture of the page, shown in its place while something covers
+    /// it (the native page can't be drawn over, so it is hidden then).
+    cover_shot: Option<std::sync::Arc<Image>>,
     favicon: Option<Arc<Image>>,
     /// What was typed in the address bar, without the inline completion.
     typed: String,
@@ -833,7 +1006,8 @@ impl BrowserPane {
             // Camera and microphone: WebKit asks per site, as Safari does,
             // instead of wry's default of granting every request.
             .with_permission_handler(|_| wry::PermissionResponse::Default)
-            .with_initialization_script(PAGE_SCRIPT);
+            .with_initialization_script(PAGE_SCRIPT)
+            .with_initialization_script(&key_script());
         // The editor is Deck's own page; agents read the pages they test.
         if !is_editor {
             builder = builder.with_initialization_script(RECORDER_SCRIPT);
@@ -876,6 +1050,10 @@ impl BrowserPane {
             })
             .build_as_child(window)?;
         add_page_dialogs(&webview);
+        {
+            use wry::WebViewExtMacOS;
+            crate::adblock::attach(&webview.webview());
+        }
         Ok((webview, rx, url, code))
     }
 
@@ -916,6 +1094,8 @@ impl BrowserPane {
             style_native(&h.0, theme::CARD_RADIUS - 1., all_corners);
         }
         let mut pane = Self {
+            import_offer: None,
+            importing: false,
             webview,
             host,
             logs: VecDeque::new(),
@@ -935,6 +1115,7 @@ impl BrowserPane {
             revealed: false,
             shown: false,
             covered: false,
+            cover_shot: None,
             favicon: None,
             typed: String::new(),
             editing: false,
@@ -1182,6 +1363,7 @@ impl BrowserPane {
                 }
             }
             Msg::Icon(url) => self.load_icon(url, cx),
+            Msg::Key(k) => cx.emit(BrowserEvent::Key(k)),
             Msg::DownloadStarted(path) => {
                 let name = path
                     .file_name()
@@ -1707,11 +1889,32 @@ impl BrowserPane {
         }
     }
 
-    pub fn set_covered(&mut self, covered: bool) {
-        if covered != self.covered {
-            self.covered = covered;
-            self.sync_visibility();
+    /// Something is drawn over the page. Its picture goes in its place
+    /// first, then the live page is hidden, so the pane looks the same
+    /// instead of going blank; uncovered, the live page is back.
+    pub fn set_covered(&mut self, covered: bool, cx: &mut Context<Self>) {
+        if covered == self.covered {
+            return;
         }
+        if !covered || !self.shown {
+            self.covered = covered;
+            self.cover_shot = None;
+            self.sync_visibility();
+            cx.notify();
+            return;
+        }
+        let rx = { use wry::WebViewExtMacOS; snapshot(&self.webview.webview()) };
+        cx.spawn(async move |this, cx| {
+            let shot = rx.await.ok().flatten();
+            let _ = this.update(cx, |p, cx| {
+                // Uncovered again before the picture came: nothing to do.
+                p.cover_shot = shot.map(|png| std::sync::Arc::new(Image::from_bytes(gpui::ImageFormat::Png, png)));
+                p.covered = true;
+                p.sync_visibility();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn set_zoom(&mut self, zoom: f64) {
@@ -1788,6 +1991,20 @@ impl BrowserPane {
 
     pub fn read_text(&self, done: impl FnOnce(Result<Value, String>) + Send + 'static) {
         self.eval(PAGE_TEXT, done);
+    }
+
+    /// A page nobody is looking at (a background page) still lays out at a
+    /// desktop window's size, so what a script reads is what a person
+    /// would see. Its next place on screen replaces this.
+    pub fn size_offscreen(&mut self) {
+        let b = Bounds::new(gpui::point(gpui::px(0.), gpui::px(0.)), gpui::size(gpui::px(1280.), gpui::px(900.)));
+        self.bounds = None;
+        match &self.host {
+            Some(h) => h.place(b),
+            None => {
+                let _ = self.webview.set_bounds(rect(b));
+            }
+        }
     }
 
     fn sync_bounds(&mut self, bounds: Bounds<Pixels>) {
@@ -1912,9 +2129,15 @@ impl BrowserPane {
                         Icon::Refresh
                     },
                 )
-                .mr(u(4.))
                 .on_click(cx.listener(|p, _, _, cx| {
                     p.reload();
+                    cx.notify();
+                })),
+            )
+            .child(
+                // Home: Deck's start page, your frequent sites and dev servers.
+                icon_button("home", Icon::Home).mr(u(4.)).on_click(cx.listener(|p, _, _, cx| {
+                    let _ = p.navigate("about:blank", cx);
                     cx.notify();
                 })),
             )
@@ -2295,8 +2518,12 @@ impl Render for BrowserPane {
             self.render_blank(cx).into_any_element()
         } else {
             div()
+                .relative()
                 .size_full()
                 .bg(rgb(theme::pane()))
+                .children(self.cover_shot.clone().filter(|_| self.covered).map(|shot| {
+                    img(shot).absolute().top_0().left_0().size_full().object_fit(gpui::ObjectFit::Fill)
+                }))
                 .child(
                     canvas(
                         move |bounds, _, cx| entity.update(cx, |p, _| p.sync_bounds(bounds)),
@@ -2307,16 +2534,105 @@ impl Render for BrowserPane {
                 .into_any_element()
         };
 
+        // Once, until answered: bring sign-ins and history over from the
+        // browser you use, so sites open signed in here.
+        let offer = self.import_offer.clone().filter(|_| !self.is_editor()).map(|from| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(10.))
+                .h(u(40.))
+                .px(u(14.))
+                .border_t_1()
+                .border_color(rgba(theme::hairline()))
+                .bg(rgba(theme::tint()))
+                .text_size(u(12.5))
+                .child(icon(Icon::Import, 14., theme::accent()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .one_line()
+                        .text_color(rgb(theme::text_2()))
+                        .child(format!("Sign in less: bring your sign-ins, history and bookmarks over from {from}.")),
+                )
+                .child(
+                    div()
+                        .id("import-later")
+                        .flex()
+                        .items_center()
+                        .h(u(28.))
+                        .px(u(10.))
+                        .rounded(u(6.))
+                        .cursor_pointer()
+                        .text_color(rgb(theme::text_2()))
+                        .hover(|s| s.bg(rgb(theme::row_hover())))
+                        .child("Not now")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::DismissImport))),
+                )
+                .child(
+                    div()
+                        .id("import-now")
+                        .flex()
+                        .items_center()
+                        .gap(u(6.))
+                        .h(u(28.))
+                        .px(u(12.))
+                        .rounded(u(6.))
+                        .cursor_pointer()
+                        .bg(rgb(theme::text()))
+                        .text_color(rgb(theme::pane()))
+                        .hover(|s| s.opacity(0.88))
+                        .when(self.importing, |d| d.child(crate::icon::spinner("importing", 12., theme::pane())))
+                        .child(if self.importing { "Importing…" } else { "Import" })
+                        .when(!self.importing, |d| d.on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::Import)))),
+                )
+        });
         div()
             .flex()
             .flex_col()
             .size_full()
-            .child(toolbar)
+            // The toolbar is set apart by tone, not a line: a site's own
+            // header border sat right under ours, two edges in a row.
+            .child(div().flex_none().bg(rgba(theme::alpha(theme::text(), 0x05))).child(toolbar))
+            .children(offer)
             .children(find)
-            .child(div().flex_none().h(u(1.)).bg(rgba(theme::hairline())))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
+}
+
+/// A PNG of what the web view shows now, from WebKit, delivered once.
+fn snapshot(wk: &objc2::runtime::AnyObject) -> futures::channel::oneshot::Receiver<Option<Vec<u8>>> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let done = block2::RcBlock::new(move |image: *mut AnyObject, _err: *mut AnyObject| {
+        // SAFETY: WebKit calls back on the main thread with an NSImage or nil.
+        let png = unsafe {
+            image.as_ref().and_then(|image| {
+                let tiff: Option<Retained<AnyObject>> = msg_send![image, TIFFRepresentation];
+                let rep: Option<Retained<AnyObject>> = msg_send![class!(NSBitmapImageRep), imageRepWithData: &*tiff?];
+                let props: Retained<AnyObject> = msg_send![class!(NSDictionary), dictionary];
+                // NSBitmapImageFileTypePNG
+                let data: Option<Retained<AnyObject>> = msg_send![&*rep?, representationUsingType: 4usize, properties: &*props];
+                let data = data?;
+                let len: usize = msg_send![&*data, length];
+                let ptr: *const u8 = msg_send![&*data, bytes];
+                (!ptr.is_null() && len > 0).then(|| std::slice::from_raw_parts(ptr, len).to_vec())
+            })
+        };
+        if let Some(tx) = tx.lock().ok().and_then(|mut t| t.take()) {
+            let _ = tx.send(png);
+        }
+    });
+    // SAFETY: a plain WebKit call with a completion block it copies.
+    unsafe {
+        let _: () = msg_send![wk, takeSnapshotWithConfiguration: std::ptr::null::<AnyObject>(), completionHandler: &*done];
+    }
+    rx
 }
 
 /// A site's icon at `size`, or `fallback` when deck has none for it yet.
