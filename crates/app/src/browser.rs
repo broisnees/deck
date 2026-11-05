@@ -1067,6 +1067,8 @@ impl BrowserPane {
             })
             .build_as_child(window)?;
         add_page_dialogs(&webview);
+        #[cfg(target_os = "linux")]
+        crate::gtk_loop::PAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
         {
             use wry::WebViewExtMacOS;
@@ -3146,6 +3148,8 @@ impl Drop for BrowserPane {
     /// An inspector in a window of its own would outlive the pane, and so
     /// would the popups its page opened.
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        crate::gtk_loop::PAGES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if self.webview.is_devtools_open() {
             self.webview.close_devtools();
         }

@@ -4826,9 +4826,10 @@ impl ChatPane {
                             cx.notify();
                         }
                     }))
-                    .child(icon(
-                        Icon::agent(id.as_str()),
-                        13.,
+                    .child(crate::icon::agent_mark(
+                        id.as_str(),
+                        entry.display_name(),
+                        14.,
                         match (ready, current) {
                             (false, _) => theme::dim(),
                             (true, true) => Icon::agent(id.as_str()).brand().unwrap_or(theme::text()),

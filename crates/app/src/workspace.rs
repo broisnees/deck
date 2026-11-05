@@ -4486,14 +4486,6 @@ impl Workspace {
         const PAD: f32 = 14.;
         const BODY_H: f32 = 330.;
         let us = &self.usage;
-        let label = |text: &str| {
-            div()
-                .pb(u(6.))
-                .text_size(u(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::dim()))
-                .child(text.to_string())
-        };
         let meter_row = |name: SharedString, pct: f32, note: Option<String>| {
             div()
                 .flex()
@@ -4792,7 +4784,8 @@ impl Workspace {
             .h(u(BODY_H))
             .pt(u(16.))
             .overflow_y_scroll()
-            .child(div().flex().flex_col().min_h_full().child(label(names[tab])).child(content))
+            // The tab above already names what this is.
+            .child(div().flex().flex_col().min_h_full().pt(u(4.)).child(content))
 ;
 
         let updated = us.at.map(|t| match t.elapsed().as_secs() {
@@ -4833,6 +4826,7 @@ impl Workspace {
                     .bg(rgb(theme::menu()))
                     .border_1()
                     .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                    .shadow_lg()
                     .text_size(u(12.5))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(tabs)
@@ -8972,31 +8966,13 @@ impl Workspace {
             .items_center()
             .gap(u(2.))
             .h(u(34.))
+            // Tools on the leading edge, Settings first; what is going on
+            // (agents at work or waiting, the plan's usage) on the other.
+            .child(tool("foot-settings", Icon::Settings, settings_on).on_click(cx.listener(|ws, _, w, cx| ws.open_settings(w, cx))))
             .child(
                 tool("foot-packages", Icon::Package, page_on(PageKind::Packages))
                     .on_click(cx.listener(|ws, _, w, cx| ws.open_page(PageKind::Packages, w, cx))),
             )
-            .child(
-                // Hover: the numbers in a small card. Click: the full panel.
-                div()
-                    .relative()
-                    .child(
-                        tool("foot-usage", Icon::Gauge, self.usage_open || page_on(PageKind::Usage))
-                            .children(glance.map(|(_, pct)| div().text_color(rgb(level_color(pct))).child(pct_text(pct))))
-                            .on_hover(cx.listener(|ws, on: &bool, _, cx| {
-                                if ws.gauge_hover != *on {
-                                    ws.gauge_hover = *on;
-                                    cx.notify();
-                                }
-                            }))
-                            .on_click(cx.listener(|ws, _, _, cx| {
-                                ws.gauge_hover = false;
-                                ws.toggle_usage(true, cx)
-                            })),
-                    )
-                    .when(self.gauge_hover && !self.usage_open, |d| d.child(gpui::deferred(self.render_usage_card()).with_priority(2))),
-            )
-            .child(tool("foot-settings", Icon::Settings, settings_on).on_click(cx.listener(|ws, _, w, cx| ws.open_settings(w, cx))))
             .child(div().flex_1())
             .when(working > 0, |d| {
                 d.child(
@@ -9018,6 +8994,26 @@ impl Workspace {
                     }
                 })))
             })
+            .child(
+                // Hover: the numbers in a small card. Click: the full panel.
+                div()
+                    .relative()
+                    .child(
+                        tool("foot-usage", Icon::Gauge, self.usage_open || page_on(PageKind::Usage))
+                            .children(glance.map(|(_, pct)| div().text_color(rgb(level_color(pct))).child(pct_text(pct))))
+                            .on_hover(cx.listener(|ws, on: &bool, _, cx| {
+                                if ws.gauge_hover != *on {
+                                    ws.gauge_hover = *on;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(|ws, _, _, cx| {
+                                ws.gauge_hover = false;
+                                ws.toggle_usage(true, cx)
+                            })),
+                    )
+                    .when(self.gauge_hover && !self.usage_open, |d| d.child(gpui::deferred(self.render_usage_card()).with_priority(2))),
+            )
             .into_any_element()
     }
 
@@ -10383,7 +10379,7 @@ impl Workspace {
             .absolute()
             .bottom(u(32.))
             .left_0()
-            .w(u(340.))
+            .w(u(360.))
             .p(u(4.))
             .flex()
             .flex_col()
@@ -10392,6 +10388,7 @@ impl Workspace {
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_lg()
             .occlude()
             .on_hover(cx.listener(|ws, on: &bool, _, cx| {
                 ws.bar_chats_over_list = *on;
@@ -10406,8 +10403,8 @@ impl Workspace {
                     .text_size(u(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(theme::dim()))
-                    .child(div().flex_1().child("Chats in this window"))
-                    .child(div().font_weight(FontWeight::NORMAL).child("by spend")),
+                    .child(div().flex_1().child("Chats"))
+                    .child(div().child("Spend")),
             );
         // The conversation you are in comes first, marked: a chat here, or
         // the agent in the focused terminal (read from its own transcript).
@@ -10420,7 +10417,7 @@ impl Workspace {
             .filter(|id| !spend.iter().any(|c| c.pane == *id))
             .and(self.usage.session.as_ref());
         if let Some((title, su)) = here_terminal {
-            let figure = su.cost_usd.map_or_else(|| tokens(su.input + su.output + su.cache_read), |c| format!("${c:.2}"));
+            let figure = su.cost_usd.map_or_else(|| format!("{} tok", tokens(su.input + su.output + su.cache_read)), |c| format!("${c:.2}"));
             let pct = su.context_used as f32 / su.context_window.max(1) as f32 * 100.;
             list = list.child(
                 div()
@@ -10458,9 +10455,10 @@ impl Workspace {
         for c in spend.iter().take(10) {
             let pane = c.pane;
             let busy = self.status(pane, cx) == Some(Status::Working);
+            // Dollars when the agent reports them, else tokens, said so.
             let figure = match c.usage.cost_usd.filter(|v| *v >= 0.01) {
                 Some(v) => format!("${v:.2}"),
-                None => tokens(c.usage.tokens()),
+                None => format!("{} tok", tokens(c.usage.tokens())),
             };
             list = list.child(
                 div()
@@ -12285,18 +12283,17 @@ struct BgRow {
     open: bool,
 }
 
+/// A quiet mark: an accent dot and the word, no filled badge; the row's
+/// own highlight already says most of it.
 fn current_tag() -> gpui::Div {
     div()
         .flex_none()
-        .h(u(18.))
-        .px(u(6.))
         .flex()
         .items_center()
-        .rounded(u(4.))
-        .bg(rgba(theme::alpha(theme::accent(), 0x26)))
-        .text_size(u(10.5))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(theme::accent()))
+        .gap(u(5.))
+        .text_size(u(11.))
+        .text_color(rgb(theme::dim()))
+        .child(div().size(u(6.)).rounded_full().bg(rgb(theme::accent())))
         .child("Current")
 }
 

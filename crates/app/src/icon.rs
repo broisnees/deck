@@ -7,7 +7,7 @@
 
 use crate::theme::u;
 use gpui::prelude::*;
-use gpui::{rgb, svg, AnyElement, AssetSource, SharedString};
+use gpui::{div, rgb, rgba, svg, AnyElement, AssetSource, SharedString};
 use std::borrow::Cow;
 
 /// `Variant => "file.svg"`, once; the enum, paths and embeds derive from it.
@@ -124,6 +124,30 @@ impl Icon {
             _ => return None,
         })
     }
+}
+
+/// An agent's mark: its brand icon, or for one without (Vibe, Crush) its
+/// initial in a small rounded square, rather than a stock robot.
+pub fn agent_mark(cmd: &str, name: &str, size: f32, color: u32) -> AnyElement {
+    let glyph = Icon::agent(cmd);
+    if glyph != Icon::GenericAgent {
+        return icon(glyph, size, color);
+    }
+    let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(crate::theme::u(size))
+        .rounded(crate::theme::u(size / 4.))
+        .border_1()
+        .border_color(rgba(crate::theme::alpha(color, 0x99)))
+        .text_size(crate::theme::u(size * 0.62))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(color))
+        .child(initial)
+        .into_any_element()
 }
 
 pub fn icon(kind: Icon, size: f32, color: u32) -> AnyElement {
