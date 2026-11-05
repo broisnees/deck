@@ -57,6 +57,9 @@ pub struct SettingsPane {
     /// The toggle that just flipped and how many flips so far, so only it
     /// slides (a fresh id restarts the animation) and the rest sit still.
     flip: Option<(&'static str, u64)>,
+    /// Browsers to import from, and the last import's outcome for each.
+    imports: Vec<(crate::browser_import::Source, Option<SharedString>)>,
+    importing: Option<usize>,
     /// The page the sidebar has open.
     page: Page,
     scroll: gpui::ScrollHandle,
@@ -70,6 +73,12 @@ pub struct SettingsPane {
     /// The sidebar's search: while it holds text, the page shows every
     /// setting that matches, from all pages.
     search: Entity<Field>,
+    /// Settings › Keyboard's own search.
+    key_filter: Entity<Field>,
+    _key_filter: Subscription,
+    /// Settings › Agents › Deck memory: a new global note.
+    memory_field: Entity<Field>,
+    _memory: Subscription,
     /// Pages folded shut in the sidebar.
     collapsed: std::collections::HashSet<Page>,
     /// The shortcut waiting for its new keys, and the hook that takes the
@@ -168,6 +177,29 @@ impl SettingsPane {
             f.bare = true;
             f
         });
+        let key_filter = cx.new(|cx| {
+            let mut f = Field::new("Search by name or keys, e.g. terminal, cmd-j, ⌃⌥", cx);
+            f.bare = true;
+            f
+        });
+        let _key_filter = cx.subscribe(&key_filter, |_: &mut Self, _, ev: &FieldEvent, cx| {
+            if matches!(ev, FieldEvent::Changed) {
+                cx.notify();
+            }
+        });
+        let memory_field = cx.new(|cx| {
+            let mut f = Field::new("e.g. Prefers pnpm; deploys go through wrangler", cx);
+            f.bare = true;
+            f
+        });
+        let _memory = cx.subscribe(&memory_field, |_: &mut Self, f, ev: &FieldEvent, cx| {
+            if let FieldEvent::Submit(text) = ev {
+                if !text.trim().is_empty() && crate::memory::add(text, None).is_ok() {
+                    f.update(cx, |f, cx| f.set_text("", cx));
+                    cx.notify();
+                }
+            }
+        });
         let _search = cx.subscribe(&search, |p: &mut Self, _, ev: &FieldEvent, cx| {
             if matches!(ev, FieldEvent::Changed) {
                 p.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
@@ -180,6 +212,8 @@ impl SettingsPane {
             focus: cx.focus_handle(),
             agents,
             flip: None,
+            imports: crate::browser_import::sources().into_iter().map(|s| (s, None)).collect(),
+            importing: None,
             page: Page::Appearance,
             scroll: gpui::ScrollHandle::new(),
             snippets: Vec::new(),
@@ -191,6 +225,10 @@ impl SettingsPane {
             key_note: None,
             models: models::Models::new(cx),
             perms_polling: false,
+            memory_field,
+            _memory,
+            key_filter,
+            _key_filter,
             _search,
         }
     }
@@ -429,8 +467,24 @@ impl SettingsPane {
             }
         }
         let mut sections: Vec<Section> = Vec::new();
+        // The page's own search: a name, or keys as you'd write them
+        // ("cmd-j", "⌘J", "ctrl").
+        let q = self.key_filter.read(cx).text().trim().to_lowercase();
+        let squash = |t: &str| t.to_lowercase().replace([' ', '-', '+'], "");
         for (ix, s) in SHORTCUTS.iter().enumerate() {
             let keys = s.keys(mine);
+            if !q.is_empty() {
+                let hay = format!(
+                    "{} {} {} {}",
+                    s.name.to_lowercase(),
+                    s.group.to_lowercase(),
+                    keys.join(" "),
+                    keys.iter().map(|k| crate::keys::pretty(k)).collect::<Vec<_>>().join(" ")
+                );
+                if !hay.contains(&q) && !squash(&hay).contains(&squash(&q)) {
+                    continue;
+                }
+            }
             let recording = self.recording.as_ref().is_some_and(|(r, _)| *r == s.id);
             let shown: SharedString = if recording {
                 "Press a shortcut…".into()
@@ -510,10 +564,19 @@ impl SettingsPane {
                 .filter(|(n, _)| *n == s.id)
                 .map(|(_, t)| t.to_string())
                 .or(clash);
-            let mut r = row(s.name, control);
-            if let Some(n) = note {
-                r = r.about(n);
-            }
+            // Where it applies, as VS Code's "when".
+            let when = match s.context {
+                None => "Everywhere in Deck",
+                Some("Terminal") => "In a terminal",
+                Some("Composer") => "In a chat's message box",
+                Some("Field") => "In text fields",
+                Some("SystemWide") => "From any app, Deck in front or not",
+                Some(c) => c,
+            };
+            let r = row(s.name, control).about(match note {
+                Some(n) => format!("{when} · {n}"),
+                None => when.to_string(),
+            });
             match sections.iter_mut().find(|sec| sec.title == s.group) {
                 Some(sec) => sec.rows.push(r),
                 None => sections.push(group(s.group, vec![r], None)),
@@ -522,16 +585,30 @@ impl SettingsPane {
         let restore = button("keys-restore", "Restore Deck's Shortcuts")
             .on_click(self.on(|s| s.keys.clear(), cx))
             .into_any_element();
-        let top = group(
-            "Shortcuts",
-            vec![row("Change a shortcut", if mine.is_empty() {
+        let search = div()
+            .flex()
+            .items_center()
+            .gap(u(8.))
+            .h(u(32.))
+            .px(u(10.))
+            .rounded(u(8.))
+            .bg(rgb(theme::surface()))
+            .child(icon(Icon::Search, 13., theme::dim()))
+            .child(div().flex_1().child(self.key_filter.clone()))
+            .into_any_element();
+        let mut top_rows = vec![
+            wide("Search shortcuts", search),
+            row("Change a shortcut", if mine.is_empty() {
                 div().into_any_element()
             } else {
                 restore
             })
-            .about("Click its keys, then press the new ones. ⌫ leaves it without a shortcut, esc keeps it as it was. The menus and ⌘K show yours.")],
-            None,
-        );
+            .about("Click its keys, then press the new ones. ⌫ leaves it without a shortcut, esc keeps it as it was. The menus and ⌘K show yours."),
+        ];
+        if sections.is_empty() {
+            top_rows.push(row("No shortcut matches", div().into_any_element()));
+        }
+        let top = group("Shortcuts", top_rows, None);
         sections.insert(0, top);
         sections
     }
@@ -729,6 +806,68 @@ impl SettingsPane {
 
     // -- controls -------------------------------------------------------------
 
+    /// A sound picker: ‹ name › steps through macOS's sounds and plays each
+    /// as it is picked, so you hear what you chose.
+    fn sound_picker(
+        &self,
+        id: &'static str,
+        current: &str,
+        set: fn(&mut Settings, String),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sounds = crate::notify::SOUNDS;
+        let at = sounds.iter().position(|x| *x == current).unwrap_or(0);
+        let step = |by: isize| sounds[(at as isize + by).rem_euclid(sounds.len() as isize) as usize].to_string();
+        let (prev, next) = (step(-1), step(1));
+        let volume = self.settings.sound_volume;
+        let arrow = |side: u64, glyph: Icon| {
+            div()
+                .id(ElementId::NamedInteger(id.into(), side))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(u(22.))
+                .rounded(u(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::row_hover())))
+                .child(icon(glyph, 11., theme::text_2()))
+        };
+        let play_now = current.to_string();
+        div()
+            .flex()
+            .items_center()
+            .gap(u(2.))
+            .child(arrow(0, Icon::ArrowLeft).on_click(cx.listener(move |p, _, _, cx| {
+                crate::notify::play(&prev, volume);
+                let v = prev.clone();
+                p.change(cx, &move |s: &mut Settings| set(s, v.clone()));
+            })))
+            .child(
+                div()
+                    .id(ElementId::NamedInteger(id.into(), 2))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(u(5.))
+                    .w(u(96.))
+                    .h(u(24.))
+                    .rounded(u(6.))
+                    .bg(rgba(theme::tint()))
+                    .text_size(u(12.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(icon(Icon::Bell, 11., if current == "None" { theme::dim() } else { theme::text_2() }))
+                    .child(current.to_string())
+                    .on_click(move |_, _, _| crate::notify::play(&play_now, volume)),
+            )
+            .child(arrow(1, Icon::ArrowRight).on_click(cx.listener(move |p, _, _, cx| {
+                crate::notify::play(&next, volume);
+                let v = next.clone();
+                p.change(cx, &move |s: &mut Settings| set(s, v.clone()));
+            })))
+            .into_any_element()
+    }
+
     /// `−  value  +`. A side that has hit its limit is drawn dim and does
     /// nothing.
     fn stepper(
@@ -809,7 +948,7 @@ impl SettingsPane {
                     .id(ElementId::NamedInteger(id.into(), ix as u64))
                     .flex()
                     .items_center()
-                    .h(u(26.))
+                    .h(u(24.))
                     .px(u(10.))
                     .rounded(u(6.))
                     .text_size(u(12.))
@@ -1419,11 +1558,11 @@ impl SettingsPane {
                     .id(ElementId::NamedInteger("page".into(), pi as u64))
                     .flex()
                     .items_center()
-                    .gap(u(6.))
-                    .h(u(34.))
-                    .px(u(6.))
+                    .gap(u(8.))
+                    .h(u(32.))
+                    .px(u(8.))
                     .rounded(u(8.))
-                    .text_size(u(14.))
+                    .text_size(u(13.))
                     .cursor_pointer()
                     .when(on, |d| {
                         d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
@@ -1670,6 +1809,15 @@ impl SettingsPane {
                 None,
             ),
             group(
+                "Agents",
+                vec![row(
+                    "Match coding agents' themes",
+                    self.toggle("match-agents", s.match_agent_themes, |s, on| s.match_agent_themes = on, cx),
+                )
+                .about("Changing the theme here also sets Claude Code, Gemini CLI and OpenCode to the theme of theirs that draws with the terminal colours Deck sets for it, so the agents look like part of Deck. Codex has no theme setting.")],
+                None,
+            ),
+            group(
                 "Scale",
                 vec![row("Zoom", zoom)
                     .about("One size for everything. ⌘+ and ⌘− step it, ⌘0 puts it back.")],
@@ -1692,6 +1840,43 @@ impl SettingsPane {
                 None,
             ),
         ]
+    }
+
+    /// The background service's jobs.
+    fn job_rows(&self) -> Vec<Row> {
+        // Terminal tabs kept by the service are tabs, not jobs: one line
+        // for them, the jobs listed.
+        let all = crate::daemon::cached_list();
+        let tabs = all.iter().filter(|j| j.tab && j.running).count();
+        let jobs: Vec<_> = all.into_iter().filter(|j| !j.tab).collect();
+        let mut rows = Vec::new();
+        if tabs > 0 {
+            rows.push(
+                row(
+                    "Terminal tabs",
+                    div().text_color(rgb(theme::dim())).child(format!("{tabs} running")).into_any_element(),
+                )
+                .about("Your terminal tabs' shells, kept by the background service so they outlive Deck."),
+            );
+        }
+        if jobs.is_empty() {
+            if !rows.is_empty() {
+                return rows;
+            }
+            return vec![row("No background jobs", div().into_any_element())
+                .about("Agents start them with `deck job start --name dev npm run dev`; so can you, from any terminal. Run an agent the same way: `deck job start --name fixer claude`.")];
+        }
+        rows.extend(jobs.into_iter()
+            .map(|j| {
+                let state = match (j.running, j.exit) {
+                    (true, _) => "running".to_string(),
+                    (false, Some(c)) => format!("exited {c}"),
+                    _ => "stopped".to_string(),
+                };
+                let place = crate::chat::short_path(&j.cwd);
+                row(j.name, div().text_color(rgb(theme::dim())).child(state).into_any_element()).about(format!("{} · {place}", j.cmd))
+            }));
+        rows
     }
 
     fn page_terminal(&self, cx: &mut Context<Self>) -> Vec<Section> {
@@ -1720,6 +1905,11 @@ impl SettingsPane {
         );
         let cursors: Vec<(Cursor, &'static str)> =
             Cursor::ALL.iter().map(|c| (*c, c.name())).collect();
+        let engines: Vec<(crate::settings::Engine, &'static str)> = crate::settings::Engine::ALL
+            .iter()
+            .filter(|e| e.term().available())
+            .map(|e| (*e, e.name()))
+            .collect();
         vec![
             group(
                 "Typography",
@@ -1746,6 +1936,15 @@ impl SettingsPane {
                     )
                     .about("Only while the terminal has focus."),
                 ],
+                None,
+            ),
+            group(
+                "Engine",
+                vec![row(
+                    "Emulator",
+                    self.segmented("engine", &engines, s.engine, |s, e| s.engine = e, cx),
+                )
+                .about("What reads programs' output and keeps the screen and scrollback. New terminals use it; open ones keep theirs.")],
                 None,
             ),
             group(
@@ -1780,6 +1979,20 @@ impl SettingsPane {
                 .about("⌥B and ⌥F jump by word in the shell, instead of typing ∫ and ƒ.")],
                 None,
             ),
+            group(
+                "Keep running",
+                vec![row(
+                    "Keep terminals running when Deck quits",
+                    self.toggle("keep-terminals", s.keep_terminals, |s, on| s.keep_terminals = on, cx),
+                )
+                .about("New terminal tabs run in Deck's background service: quit Deck and their shells, agents and servers keep going; open it again and every tab reattaches with its output. Closing a tab ends its shell.")],
+                None,
+            ),
+            group(
+                "Background jobs",
+                self.job_rows(),
+                Some("Background jobs and agents run in Deck's background service: they keep going when Deck quits, start again after the Mac restarts, and show in the menu bar and as tabs in the status bar.".into()),
+            ),
         ]
     }
 
@@ -1810,11 +2023,89 @@ impl SettingsPane {
                 .on_click(self.on(move |s| s.search = e, cx))
             })
             .collect();
-        vec![choices(
-            "Search engine",
-            rows,
-            Some("Anything typed in the address bar that is not an address is searched for here, and suggestions come from it too.".into()),
-        )]
+        let mut import: Vec<Row> = self
+            .imports
+            .iter()
+            .enumerate()
+            .map(|(ix, (src, done))| {
+                let busy = self.importing == Some(ix);
+                let button = div()
+                    .id(ElementId::NamedInteger("import".into(), ix as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(5.))
+                    .h(u(26.))
+                    .px(u(10.))
+                    .rounded(u(7.))
+                    .border_1()
+                    .border_color(rgba(theme::hairline()))
+                    .text_size(u(12.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(if busy {
+                        crate::icon::spinner("import-spin", 12., theme::text_2())
+                    } else {
+                        icon(Icon::Import, 12., theme::text_2())
+                    })
+                    .child(if busy { "Importing…" } else { "Import" })
+                    .when(self.importing.is_none(), |d| d.on_click(cx.listener(move |p, _, _, cx| p.import_from(ix, cx))))
+                    .into_any_element();
+                let what = if src.safari() {
+                    "History, bookmarks and sign-ins (cookies). Needs Full Disk Access for Deck."
+                } else {
+                    "History, bookmarks and sign-ins (cookies). macOS asks once to unlock its key."
+                };
+                row(src.name, button).about(done.clone().unwrap_or_else(|| what.into()))
+            })
+            .collect();
+        if import.is_empty() {
+            import.push(row("No other browser found", div().into_any_element()));
+        }
+        vec![
+            choices(
+                "Search engine",
+                rows,
+                Some("Anything typed in the address bar that is not an address is searched for here, and suggestions come from it too.".into()),
+            ),
+            group(
+                "Privacy",
+                vec![row(
+                    "Block ads and trackers",
+                    self.toggle("block-ads", self.settings.block_ads, |s, on| {
+                        s.block_ads = on;
+                        crate::adblock::set_enabled(on);
+                    }, cx),
+                )
+                .about("Third-party loads from the ad and tracking networks behind most of them are dropped, so pages are lighter and quieter. A site's own content and its sign-in are never touched. Applies to pages opened after the change.")],
+                None,
+            ),
+            group(
+                "Import from another browser",
+                import,
+                Some("Pages and bookmarks feed the address bar's suggestions. Sign-ins come over as the browser's cookies, so sites you are logged in to there open logged in here. Saved passwords are not imported.".into()),
+            ),
+        ]
+    }
+
+    fn import_from(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some((src, _)) = self.imports.get(ix).cloned() else { return };
+        self.importing = Some(ix);
+        cx.notify();
+        let task = cx.background_executor().spawn(async move { crate::browser_import::import(&src, true) });
+        cx.spawn(async move |this, cx| {
+            let (report, jar) = task.await;
+            if !jar.is_empty() {
+                crate::browser_import::install_cookies(&jar);
+            }
+            let _ = this.update(cx, |p, cx| {
+                p.importing = None;
+                if let Some(slot) = p.imports.get_mut(ix) {
+                    slot.1 = Some(report.summary().into());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn page_agents(&self, cx: &mut Context<Self>) -> Vec<Section> {
@@ -1975,11 +2266,98 @@ impl SettingsPane {
                     ),
                 ],
                 Some(
-                    "Only while you are looking at something else. A finish is told once work has run for ten seconds; quick replies are not."
+                    "Only while you are looking at something else. A finish is told once work has run for ten seconds; quick replies are not. An approval's banner has Approve, Always Allow, Deny and Reply, so you can answer without coming back to Deck; a question's has Reply."
                         .into(),
                 ),
             ),
+            group(
+                "Sounds",
+                vec![
+                    row(
+                        "Needs you",
+                        self.sound_picker("sound-attention", &self.settings.sound_attention.clone(), |s, v| s.sound_attention = v, cx),
+                    )
+                    .about("An approval, a question, a terminal agent's bell."),
+                    row(
+                        "Finished",
+                        self.sound_picker("sound-done", &self.settings.sound_done.clone(), |s, v| s.sound_done = v, cx),
+                    )
+                    .about("An agent that worked ten seconds or more is done."),
+                    row(
+                        "Job failed",
+                        self.sound_picker("sound-failed", &self.settings.sound_failed.clone(), |s, v| s.sound_failed = v, cx),
+                    )
+                    .about("A background job ended with an error."),
+                    row(
+                        "Volume",
+                        self.stepper(
+                            "sound-volume",
+                            format!("{}%", (self.settings.sound_volume * 100.).round()),
+                            (self.settings.sound_volume > 0.).then_some(|s: &mut Settings| {
+                                s.sound_volume = ((s.sound_volume - 0.1) * 10.).round() / 10.;
+                                s.sound_volume = s.sound_volume.max(0.);
+                                crate::notify::play(&s.sound_attention, s.sound_volume);
+                            }),
+                            (self.settings.sound_volume < 1.).then_some(|s: &mut Settings| {
+                                s.sound_volume = (((s.sound_volume + 0.1) * 10.).round() / 10.).min(1.);
+                                crate::notify::play(&s.sound_attention, s.sound_volume);
+                            }),
+                            cx,
+                        ),
+                    ),
+                ],
+                Some("Played with the notification, only while you are looking elsewhere. Click a sound's name to hear it.".into()),
+            ),
+            group(
+                "Command line",
+                vec![row(
+                    "Let agents run any Deck action",
+                    self.toggle("cli-actions", self.settings.cli_actions, |s, on| s.cli_actions = on, cx),
+                )
+                .about("`deck do ACTION` runs anything ⌘K lists (Split Right, Close Tabs Idle for a Day…), from an agent or your own scripts. `deck do --list` shows them.")],
+                None,
+            ),
+            group("Deck memory", self.memory_rows(cx), Some("Notes every coding agent shares. Claude Code gets the ones for its project at the start of every session; Codex, Gemini CLI and OpenCode are told to read them. Agents add their own with `deck memory add`.".into())),
         ]
+    }
+
+    /// The saved memories, newest first, each with Forget; a field adds a
+    /// global one.
+    fn memory_rows(&self, cx: &mut Context<Self>) -> Vec<Row> {
+        let mut rows = vec![wide(
+            "Add a note for every project",
+            div()
+                .h(u(32.))
+                .px(u(10.))
+                .flex()
+                .items_center()
+                .rounded(u(8.))
+                .bg(rgb(theme::surface()))
+                .child(div().flex_1().child(self.memory_field.clone()))
+                .into_any_element(),
+        )];
+        let mut all = crate::memory::load();
+        all.sort_by_key(|m| std::cmp::Reverse(m.created));
+        for (i, m) in all.into_iter().take(40).enumerate() {
+            let scope = match &m.project {
+                Some(p) => p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                None => "every project".to_string(),
+            };
+            let id = m.id.clone();
+            rows.push(
+                row(
+                    m.text.clone(),
+                    button(ElementId::NamedInteger("forget-memory".into(), i as u64), "Forget")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let _ = crate::memory::forget(&id);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+                .about(format!("{scope} · {}", m.id)),
+            );
+        }
+        rows
     }
 }
 
@@ -1990,7 +2368,7 @@ fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<
         .flex()
         .flex_none()
         .items_center()
-        .h(u(26.))
+        .h(u(28.))
         .px(u(12.))
         .rounded(u(6.))
         .bg(rgb(theme::surface()))
@@ -2024,9 +2402,9 @@ impl Render for SettingsPane {
 
         // Each child of the scrolled column is one item, so the sidebar can
         // bring a section to the top.
-        let item = || div().w(u(PAGE_W)).max_w(relative(1.)).px(u(28.));
+        let item = || div().w(u(PAGE_W)).max_w(relative(1.)).px(u(32.));
         let title = |t: SharedString| {
-            item().pt(u(32.)).pb(u(8.)).child(
+            item().pt(u(24.)).pb(u(8.)).child(
                 div()
                     .text_size(u(22.))
                     .font_weight(FontWeight::SEMIBOLD)
@@ -2042,7 +2420,7 @@ impl Render for SettingsPane {
             .flex()
             .flex_col()
             .items_center()
-            .gap(u(28.))
+            .gap(u(40.))
             .pb(u(64.))
             .overflow_y_scroll()
             .track_scroll(&self.scroll);
