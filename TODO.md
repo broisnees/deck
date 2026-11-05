@@ -301,16 +301,30 @@ In rough order of value.
 
 Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2, WebKit, Carbon, Keychain, LaunchAgent) and one place has a `cfg(target_os)` fallback. gpui has Linux and Windows backends and `alacritty_terminal` runs on both, so the core ports; the macOS-only parts go behind a platform layer. Every step below ends in a build that runs.
 
-- [ ] Platform layer: a `platform` module in `crates/app` with one interface per macOS service (web view, notifications, menu bar icon, global shortcuts, background service, keychain, pasteboard, screenshots, window blur, `deck://` handler). macOS keeps today's code; other targets start as stubs that say "not on this platform"
-- [ ] macOS-only dependencies (objc2*, block2, objc2-user-notifications) under `[target.'cfg(target_os = "macos")'.dependencies]`; `cargo check` for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` passes
-- [ ] Linux, first runnable build: window, sidebar, terminals (Alacritty engine), chats and agents, settings. Pages, notifications and the background service stubbed; Ghostty engine only when Zig is installed
-- [ ] Linux, full: pages through WebKitGTK, notifications through D-Bus with Approve / Deny / Reply actions, tray through StatusNotifierItem, `deckd` as a systemd user unit in place of the LaunchAgent, secrets through the Secret Service, global shortcuts through X11 grabs or the GlobalShortcuts portal on Wayland, cookie import from Chromium's Linux store
+- [~] Platform layer (2026-11-05: `other/*.rs` stand-ins, `desktop.rs`, `inspect/procfs.rs`, `x11.rs`, cfg gates; not one `platform` module yet): a `platform` module in `crates/app` with one interface per macOS service (web view, notifications, menu bar icon, global shortcuts, background service, keychain, pasteboard, screenshots, window blur, `deck://` handler). macOS keeps today's code; other targets start as stubs that say "not on this platform"
+- [~] macOS-only dependencies (done; Linux `cargo check` passes, Windows does not yet) (objc2*, block2, objc2-user-notifications) under `[target.'cfg(target_os = "macos")'.dependencies]`; `cargo check` for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` passes
+- [x] Linux, first runnable build (2026-11-05, Hyprland: window, sidebar, terminals, chats and agents, settings, `deckd` jobs, all tests pass): window, sidebar, terminals (Alacritty engine), chats and agents, settings. Pages, notifications and the background service stubbed; Ghostty engine only when Zig is installed
+- [~] Linux, full (pages through WebKitGTK as X11 children with gpui on XWayland, notifications through `notify-send` with Approve/Always/Deny, XDG folders; tray, systemd unit, Secret Service, global shortcuts and cookie import still to do): pages through WebKitGTK, notifications through D-Bus with Approve / Deny / Reply actions, tray through StatusNotifierItem, `deckd` as a systemd user unit in place of the LaunchAgent, secrets through the Secret Service, global shortcuts through X11 grabs or the GlobalShortcuts portal on Wayland, cookie import from Chromium's Linux store
 - [ ] Linux packaging: AppImage and .deb, `deck` CLI on PATH, desktop file and `deck://` handler, `scripts/install.sh` for Linux
 - [ ] Windows, first runnable build: terminals over ConPTY (PowerShell, cmd, WSL), the control socket as a named pipe in place of the Unix socket, Windows paths, the `deck` CLI. Pages and the background service stubbed
 - [ ] Windows, full: pages through WebView2, toast notifications with buttons, tray icon, `deckd` as a per-user background task, Credential Manager for secrets, RegisterHotKey for global shortcuts, DPAPI for Chromium cookie import
 - [ ] Windows packaging: an installer (MSIX or similar), code signing, `deck://` registration
 - [ ] Agents off macOS: each adapter's config and transcript paths (`%APPDATA%`, XDG dirs) for usage; the OpenCode lifeline and `kill_tree` are `sh` and process groups, so Windows needs job objects
 - [ ] CI on ubuntu-latest and windows-latest: build, tests, and a smoke test that opens a window, starts a shell and runs a command
+
+### Linux polish and chat redesign (asked 2026-11-05)
+
+- [~] Model picker (titled panels, shadow, aligned notes, check on the current agent): agents and their models in one cleaner menu (rows, sizes, the model list beside the agent)
+- [~] Activity log (verbs in one quiet column, `cd <chat folder> &&` left off commands): "Working for 7s · Ran 4 commands" and its command rows in a calmer, scannable look
+- [~] Permission card (Yes / Always allow / No as one row of buttons, typing a reply offered beside them): "Claude wants to run a command" with the command, Yes / Always / No, in a tighter design
+- [~] Bottom panel in a chat (the Console: terminal button in the composer toolbar, every command with its output, live and following): the commands the agent runs and their live output, opened from the activity log or a status chip
+- [~] Chat outline (toolbar button opens it on the right; the open chat's row in the sidebar lists your messages; a click jumps): every message you sent as a table of contents, to jump to it, in the sidebar under the chat and on the right
+- [~] Prompt rewrite knows the thread (a brief of every message and the start of each answer goes with it; the shell-command prompt says Linux and GNU off macOS): the rewriter gets a short overview of the conversation so far
+- [~] First answer faster (measured: Claude Code takes ~1.9s to first output here, then hooks and 7 MCP servers, two of which always fail to connect; Deck already starts the agent when you click into a chat): measure an agent chat's time to first token on Linux and cut what Deck adds before the agent starts
+- [~] Pages step aside for the address bar's suggestions on Linux (the code parks them; check on screen)
+- [ ] Sidebar redesign: project header rows, richer row content, one spacing and type scale, the bottom strip redone
+- [ ] Windows: the rest of `cargo check` (control socket over `uds_windows`, `deckd` stubbed, file modes)
+- [x] Done today: Ctrl+Shift shortcut scheme, Ctrl+Backspace by word, zoom keys, keyboard back from pages, rounded and inset pages, exit bar for finished jobs, sidebar selection (Ctrl-click, Ctrl+A), no repeated row labels, last command on idle shells, command suggestions with intent and typos, job viewers not kept as sessions, X11 window class, release build
 
 ### Chat scrolling and experience
 - [~] Auto-follow: the thread follows new output while you are at the bottom; scrolling up pauses it; sending or jumping resumes it (built; the state machine is not unit-tested yet)

@@ -9690,7 +9690,7 @@ impl Workspace {
         };
         let (_, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
-        sidebar_row(
+        let row = sidebar_row(
             div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
             indent,
             active,
@@ -9792,8 +9792,43 @@ impl Workspace {
                 cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
                     ws.open_tab_menu(ix, ev.position, window, cx)
                 }),
-            )
-            .into_any_element()
+            );
+        // The open chat lists what you asked in it, to jump back to.
+        let chat = match self.tabs.get(ix).and_then(|t| self.panes.get(&t.focused)).map(|p| &p.kind) {
+            Some(PaneKind::Chat(c)) if ix == self.active => Some(c.clone()),
+            _ => None,
+        };
+        let outline = chat.as_ref().map(|c| (c.read(cx).outline(), c.read(cx).outline_at())).filter(|(o, _)| o.len() > 1);
+        let Some((items, at)) = outline else {
+            return row.into_any_element();
+        };
+        let chat = chat.expect("outline came from it");
+        let mut col = div().flex().flex_col().gap(u(2.)).child(row);
+        for (ix_msg, text) in items {
+            let here = at == Some(ix_msg);
+            let c = chat.clone();
+            col = col.child(
+                div()
+                    .id(ElementId::NamedInteger("side-outline".into(), ix_msg as u64))
+                    .flex()
+                    .items_center()
+                    .h(u(24.))
+                    .ml(u(theme::ROW_PAD + ROW_SLOT / 2.))
+                    .pl(u(ROW_GAP + ROW_SLOT / 2. - 1.))
+                    .pr(u(ROW_END))
+                    .border_l_1()
+                    .border_color(rgba(if here { theme::focus_edge() } else { theme::hairline() }))
+                    .text_size(u(12.))
+                    .text_color(rgb(if here { theme::text() } else { theme::dim() }))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(theme::text())))
+                    .child(div().flex_1().min_w_0().one_line().child(text))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        c.update(cx, |c, cx| c.jump_to(ix_msg, cx));
+                    })),
+            );
+        }
+        col.into_any_element()
     }
 
     /// New agents as a menu: a chat with each one that has one, its own

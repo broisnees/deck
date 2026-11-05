@@ -237,6 +237,9 @@ pub struct Context {
     pub folder: String,
     pub task: String,
     pub last_reply: String,
+    /// The conversation so far in brief: each earlier message of yours and
+    /// the start of the answer to it, oldest first.
+    pub history: String,
 }
 
 /// Whether Enter rewrites `text` before it goes, and if so whether the
@@ -276,6 +279,9 @@ fn input(body: &str, ctx: &Context) -> String {
     if !ctx.task.is_empty() {
         b.push_str(&format!("current task: {}\n", clip(&ctx.task, 1200)));
     }
+    if !ctx.history.is_empty() {
+        b.push_str(&format!("the conversation so far (in brief):\n{}\n", tail(&ctx.history, 1500)));
+    }
     if !ctx.last_reply.is_empty() {
         b.push_str(&format!(
             "its last reply (end):\n{}\n",
@@ -311,12 +317,21 @@ pub fn rewrite(text: &str, ctx: &Context, model: &str, cwd: &Path) -> Result<Str
     Ok(format!("{mentions}{refined}"))
 }
 
+#[cfg(target_os = "macos")]
 const SHELL_SYSTEM: &str = "You turn a request into one command for zsh on macOS. \
 Reply with the command only: no explanation, no backticks, no comments. Use the \
 tools a Mac has (BSD versions of find, sed, stat, date) unless the request names \
 others. When it takes more than one step, chain them with && or a pipe. Never \
 write something destructive (rm -rf, overwriting files, force pushes) unless the \
 request asks for exactly that.";
+
+#[cfg(not(target_os = "macos"))]
+const SHELL_SYSTEM: &str = "You turn a request into one command for the user's shell on Linux. \
+Reply with the command only: no explanation, no backticks, no comments. Use the \
+GNU versions of find, sed, stat and date unless the request names others. When it \
+takes more than one step, chain them with && or a pipe. Never write something \
+destructive (rm -rf, overwriting files, force pushes) unless the request asks for \
+exactly that.";
 
 /// A shell command for a request in plain words ("# …" at a prompt), on
 /// the shell job's route (Claude with `model` unless Settings says

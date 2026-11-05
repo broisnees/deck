@@ -288,6 +288,12 @@ fn commands_for(agent: &str, cwd: &std::path::Path, sigil: char) -> Vec<(String,
 }
 
 pub struct ChatPane {
+    /// The console under the thread: every command the agent ran in it,
+    /// with what each printed, live while it runs.
+    console: bool,
+    console_scroll: gpui::ScrollHandle,
+    /// The outline on the thread's right edge: your messages, to jump to.
+    outline_open: bool,
     env: Arc<ChatEnv>,
     pub agent: AgentId,
     session_id: SessionId,
@@ -562,6 +568,9 @@ impl ChatPane {
             collapsed: HashSet::new(),
             tool_times: HashMap::new(),
             model_menu: None,
+            console: false,
+            outline_open: false,
+            console_scroll: gpui::ScrollHandle::new(),
             model: None,
             warmed: false,
             // Edits flow; shell commands stay gated, except `deck …`, which is
@@ -817,6 +826,7 @@ impl ChatPane {
             folder: self.cwd.display().to_string(),
             task: self.title.to_string(),
             last_reply: self.last_reply_text(),
+            history: self.history_brief(),
         };
         let model = crate::refine::model();
         let cwd = self.cwd.clone();
@@ -1996,7 +2006,7 @@ impl ChatPane {
                 ..
             } => {
                 let (title, preview) = permission_preview(action, input, tool, &self.cwd);
-                let mut card = card
+                let card = card
                     .child(
                         div()
                             .flex()
@@ -2019,20 +2029,51 @@ impl ChatPane {
                         d.child(div().text_color(rgb(theme::text_2())).child(r))
                     })
                     .when_some(preview, |d, p| d.child(p));
-                for (i, (_, label, key)) in PERMISSION_CHOICES.iter().enumerate() {
-                    card = card.child(option(
-                        i,
-                        i == self.ask_choice,
-                        label.to_string(),
-                        None,
-                        Some(*key),
-                    ));
+                // The answers as one row of buttons, the one the keys
+                // would pick filled, and typing a reply offered beside them.
+                let short = ["Yes", "Always allow", "No"];
+                let mut buttons = div().flex().items_center().gap(u(6.));
+                for (i, (_, _, key)) in PERMISSION_CHOICES.iter().enumerate() {
+                    let selected = i == self.ask_choice;
+                    buttons = buttons.child(
+                        div()
+                            .id(ElementId::NamedInteger("ask-opt".into(), i as u64))
+                            .flex()
+                            .items_center()
+                            .gap(u(6.))
+                            .h(u(28.))
+                            .px(u(12.))
+                            .rounded(u(7.))
+                            .cursor_pointer()
+                            .text_size(u(12.5))
+                            .when(selected, |d| {
+                                d.bg(rgb(theme::text())).text_color(rgb(theme::pane())).hover(|s| s.opacity(0.9))
+                            })
+                            .when(!selected, |d| {
+                                d.bg(rgb(theme::surface()))
+                                    .text_color(rgb(theme::text_2()))
+                                    .hover(|s| s.bg(rgb(theme::surface_hover())).text_color(rgb(theme::text())))
+                            })
+                            .child(short[i])
+                            .when(!key.is_empty() && !selected, |d| d.child(crate::kbd::key(*key)))
+                            .on_click(cx.listener(move |c, _, _, cx| c.choose(i, cx))),
+                    );
                 }
                 card.child(
                     div()
-                        .text_size(u(11.))
-                        .text_color(rgb(theme::dim()))
-                        .child(crate::kbd::hints("Or type what to do instead and press ⏎")),
+                        .flex()
+                        .items_center()
+                        .gap(u(12.))
+                        .pt(u(2.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(u(11.5))
+                                .text_color(rgb(theme::dim()))
+                                .child("or type what to do instead"),
+                        )
+                        .child(buttons),
                 )
             }
             Ask::Question {
@@ -2564,6 +2605,249 @@ impl ChatPane {
 
     /// Scrolled down into a reply: a slim bar over the thread with the
     /// message it answers; a click goes back up to that message.
+    /// The console: the thread's commands, oldest first, each as `$ cmd`
+    /// and what it printed, the running one streaming. Follows the newest
+    /// output while something runs.
+    fn render_console(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.console {
+            return None;
+        }
+        const KEEP: usize = 30;
+        const TAIL: usize = 60;
+        let cmds: Vec<&ToolInvocation> = self
+            .transcript
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                Block::Tool(t) if tool_kind(&t.name) == Kind::Command => Some(t),
+                _ => None,
+            })
+            .collect();
+        let start = cmds.len().saturating_sub(KEEP);
+        let running = cmds.iter().any(|t| t.is_open());
+        let mut body = div()
+            .id("console-body")
+            .flex()
+            .flex_col()
+            .gap(u(10.))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.console_scroll)
+            .px(u(12.))
+            .py(u(10.))
+            .font_family(theme::mono())
+            .text_size(u(11.5))
+            .line_height(u(17.));
+        if cmds.is_empty() {
+            body = body.child(div().text_color(rgb(theme::dim())).child("No commands in this chat yet."));
+        }
+        for t in &cmds[start..] {
+            let (_, cmd) = step_phrase_full(t, t.is_open(), &self.cwd);
+            let out = match &t.result {
+                None => t.progress.clone(),
+                Some(ToolOutput::Terminal { text, .. }) | Some(ToolOutput::Text(text)) => text.clone(),
+                Some(ToolOutput::Truncated { preview, .. }) => preview.clone(),
+                Some(other) => format!("{other:?}"),
+            };
+            let lines: Vec<&str> = out.lines().collect();
+            let tail = lines[lines.len().saturating_sub(TAIL)..].join("\n");
+            let state = if t.is_open() {
+                "running"
+            } else if t.is_error {
+                "failed"
+            } else {
+                ""
+            };
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(u(8.))
+                            .child(div().flex_none().text_color(rgb(theme::dim())).child("$"))
+                            .child(div().flex_1().min_w_0().text_color(rgb(theme::text())).child(cmd))
+                            .when(!state.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .font_family(theme::ui())
+                                        .text_size(u(11.))
+                                        .text_color(rgb(if t.is_error { crate::theme::DANGER } else { theme::text_2() }))
+                                        .child(state),
+                                )
+                            }),
+                    )
+                    .when(!tail.trim().is_empty(), |d| d.child(div().text_color(rgb(theme::text_2())).child(tail))),
+            );
+        }
+        if running {
+            self.console_scroll.scroll_to_bottom();
+        }
+        Some(
+            Self::column(
+                div()
+                    .flex()
+                    .flex_col()
+                    .h(u(240.))
+                    .mb(u(8.))
+                    .rounded(u(12.))
+                    .bg(rgb(theme::raised()))
+                    .border_1()
+                    .border_color(rgba(theme::hairline()))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(u(8.))
+                            .h(u(30.))
+                            .px(u(12.))
+                            .border_b_1()
+                            .border_color(rgba(theme::hairline()))
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::text_2()))
+                            .child(icon(Icon::Terminal, 12., theme::dim()))
+                            .child(div().flex_1().child("Console"))
+                            .child(
+                                div()
+                                    .id("console-close")
+                                    .cursor_pointer()
+                                    .rounded(u(4.))
+                                    .hover(|s| s.bg(rgb(theme::surface())))
+                                    .child(icon(Icon::Close, 12., theme::dim()))
+                                    .on_click(cx.listener(|c, _, _, cx| {
+                                        c.console = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(body)
+                    .into_any_element(),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// The thread so far in a few lines, for the prompt rewriter: each of
+    /// your messages and the first line of the answer to it.
+    fn history_brief(&self) -> String {
+        let mut out = String::new();
+        for m in &self.transcript.messages {
+            let text = message_text(m);
+            let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty()) else { continue };
+            let first: String = first.chars().take(160).collect();
+            match m.role {
+                Role::User => out.push_str(&format!("me: {first}\n")),
+                Role::Assistant => out.push_str(&format!("agent: {first}\n")),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Every message you sent in this thread: its row in the list and its
+    /// first line. The sidebar shows these under the open chat.
+    pub fn outline(&self) -> Vec<(usize, String)> {
+        self.transcript
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == Role::User)
+            .filter_map(|(ix, m)| {
+                let text = message_text(m);
+                let first = text.lines().find(|l| !l.trim().is_empty())?.trim().chars().take(80).collect::<String>();
+                Some((ix, first))
+            })
+            .collect()
+    }
+
+    /// The message of yours the reader is in now: the last one at or above
+    /// the top of the view.
+    pub fn outline_at(&self) -> Option<usize> {
+        let top = self.list.logical_scroll_top().item_ix;
+        let msgs = &self.transcript.messages;
+        msgs.get(..=top.min(msgs.len().saturating_sub(1)))?.iter().rposition(|m| m.role == Role::User)
+    }
+
+    /// Bring message `ix` to the top of the view, and stop following new
+    /// output so it stays there.
+    pub fn jump_to(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.paused = true;
+        self.list.scroll_to(gpui::ListOffset { item_ix: ix, offset_in_item: px(0.) });
+        cx.notify();
+    }
+
+    /// The outline on the right edge: your messages, the one you are in
+    /// marked; a click jumps to it.
+    fn render_outline(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.outline_open {
+            return None;
+        }
+        let items = self.outline();
+        let at = self.outline_at();
+        let mut col = div()
+            .id("outline")
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .p(u(6.))
+            .w(u(240.))
+            .max_h(u(420.))
+            .overflow_y_scroll()
+            .rounded(u(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .h(u(24.))
+                    .px(u(8.))
+                    .flex()
+                    .items_center()
+                    .text_size(u(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child(format!("Outline · {}", items.len())),
+            );
+        for (n, (ix, text)) in items.into_iter().enumerate() {
+            let here = at == Some(ix);
+            col = col.child(
+                div()
+                    .id(ElementId::NamedInteger("outline-item".into(), ix as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(28.))
+                    .px(u(8.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .text_size(u(12.5))
+                    .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
+                    .when(here, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                    .child(div().flex_none().w(u(16.)).text_size(u(11.)).text_color(rgb(theme::dim())).child(format!("{}", n + 1)))
+                    .child(div().flex_1().min_w_0().one_line().child(text))
+                    .on_click(cx.listener(move |c, _, _, cx| c.jump_to(ix, cx))),
+            );
+        }
+        Some(
+            div()
+                .absolute()
+                .top(u(8.))
+                .right(u(12.))
+                .child(col)
+                .into_any_element(),
+        )
+    }
+
     fn render_sticky_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let msgs = &self.transcript.messages;
         if msgs.len() < 3 {
@@ -3397,13 +3681,16 @@ impl ChatPane {
                     },
                 )
             })
+            // Verbs in one quiet column, so what each step touched lines
+            // up down the log.
             .child(
                 div()
                     .flex_none()
+                    .min_w(u(54.))
                     .text_color(rgb(if running {
                         theme::text()
                     } else {
-                        theme::text_2()
+                        theme::dim()
                     }))
                     .child(verb),
             )
@@ -4034,6 +4321,34 @@ impl ChatPane {
                     .child(icon(Icon::Plus, 14., theme::text_2()))
                     .on_click(cx.listener(|c, _, _, cx| c.pick_files(cx))),
             )
+            .child(
+                // The console: the agent's commands and their output.
+                chip("console")
+                    .px(u(0.))
+                    .w(u(28.))
+                    .justify_center()
+                    .when(self.console, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(Icon::Terminal, 13., if self.console { theme::text() } else { theme::text_2() }))
+                    .on_click(cx.listener(|c, _, _, cx| {
+                        c.console = !c.console;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                // The outline: every message you sent, to jump back to.
+                chip("outline")
+                    .px(u(0.))
+                    .w(u(28.))
+                    .justify_center()
+                    .when(self.outline_open, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(Icon::ListCheck, 13., if self.outline_open { theme::text() } else { theme::text_2() }))
+                    .on_click(cx.listener(|c, _, _, cx| {
+                        c.outline_open = !c.outline_open;
+                        cx.notify();
+                    })),
+            )
             .child({
                 // One chip for who answers: the agent's mark and the model.
                 // Its menu lists the agents, each opening onto its models.
@@ -4413,7 +4728,8 @@ impl ChatPane {
     /// this thread runs. Both ease in; the models slide over as the
     /// pointer moves between agents.
     fn render_model_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        const ROW: f32 = 28.;
+        const ROW: f32 = 30.;
+        const HEAD: f32 = 24.;
         const GAP: f32 = 1.;
         const PAD: f32 = 4.;
         let lit = self.model_menu.clone()?;
@@ -4427,7 +4743,20 @@ impl ChatPane {
                 .bg(rgb(theme::menu()))
                 .border_1()
                 .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                .shadow_lg()
                 .occlude()
+        };
+        // A panel's small title: what its rows choose.
+        let head = |label: String| {
+            div()
+                .flex()
+                .items_center()
+                .h(u(HEAD))
+                .px(u(8.))
+                .text_size(u(11.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::dim()))
+                .child(label)
         };
         let row = |id: ElementId| {
             div()
@@ -4438,12 +4767,12 @@ impl ChatPane {
                 .h(u(ROW))
                 .px(u(8.))
                 .rounded(u(6.))
-                .text_size(u(12.5))
+                .text_size(u(13.))
         };
         let entries = self.env.registry.all();
         let n = entries.len();
         let mut lit_ix = 0usize;
-        let mut agents = panel().w(u(184.));
+        let mut agents = panel().w(u(196.)).child(head("Agent".into()));
         for (ix, entry) in entries.into_iter().enumerate() {
             let id = entry.id();
             let ready = entry.is_ready();
@@ -4477,7 +4806,7 @@ impl ChatPane {
                     ))
                     .child(div().flex_1().min_w_0().one_line().child(entry.display_name().to_string()))
                     .when(!ready, |d| d.child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child("Not set up")))
-                    .when(ready && current && !has_models, |d| d.child(icon(Icon::Check, 11., theme::text())))
+                    .when(ready && current, |d| d.child(icon(Icon::Check, 11., theme::text())))
                     .when(ready && has_models, |d| d.child(icon(Icon::ChevronRight, 10., theme::dim())))
                     .when(ready && !has_models, |d| {
                         d.on_mouse_down(
@@ -4509,17 +4838,20 @@ impl ChatPane {
             let count = models.len() + 1;
             let visible = count.min(MAX_ROWS);
             // Its top on the hovered agent's row, unless it is taller than
-            // the room above; then it sits on the menu's floor.
-            let height = PAD * 2. + visible as f32 * ROW + (visible - 1) as f32 * GAP + 2.;
-            let row_top = (n - lit_ix) as f32 * (ROW + GAP) - GAP + PAD + 1.;
+            // the room above; then it sits on the menu's floor. Both panels
+            // open with a title row.
+            let height = PAD * 2. + HEAD + GAP + visible as f32 * ROW + (visible - 1) as f32 * GAP + 2.;
+            let row_top = (n - lit_ix) as f32 * (ROW + GAP) - GAP + PAD + 1. + HEAD + GAP;
             let lift = (row_top - height).max(0.);
             let agent_label = lit.as_str().to_lowercase();
+            let agent_name = self.env.registry.get(&lit).map(|e| e.display_name().to_string()).unwrap_or_default();
             let mut col = panel()
                 .id("menu-models")
-                .w(u(264.))
+                .w(u(280.))
                 .mb(u(lift))
                 .max_h(u(height))
-                .overflow_y_scroll();
+                .overflow_y_scroll()
+                .child(head(format!("{agent_name} models")));
             let choices = std::iter::once((None, "Default".to_string(), "what the CLI picks"))
                 .chain(models.iter().map(|m| (Some(smol_str::SmolStr::new(m.id)), m.label.to_string(), m.note)));
             for (i, (id, label, note)) in choices.enumerate() {
@@ -4532,9 +4864,10 @@ impl ChatPane {
                         .cursor_pointer()
                         .text_color(rgb(if current { theme::text() } else { theme::text_2() }))
                         .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
-                        .child(div().flex_shrink().min_w_0().one_line().child(label))
-                        .child(div().flex_1().min_w_0().one_line().text_size(u(11.)).text_color(rgb(theme::dim())).child(note))
-                        .when(current, |d| d.child(icon(Icon::Check, 11., theme::text())))
+                        .child(div().flex_1().min_w_0().one_line().child(label))
+                        // Notes in one column on the right, the check after.
+                        .child(div().flex_none().one_line().text_size(u(11.5)).text_color(rgb(theme::dim())).child(note))
+                        .child(div().flex_none().w(u(12.)).when(current, |d| d.child(icon(Icon::Check, 11., theme::text()))))
                         // On press: the menu hangs outside the chip, so by
                         // release the press outside has shut it.
                         .on_mouse_down(
@@ -5604,6 +5937,28 @@ fn tool_icon(name: &str) -> Icon {
 /// `src/chat.rs`. Present tense while it runs. The object is one line: a
 /// script fed to a command keeps its first line and an ellipsis, since the
 /// row is one line tall.
+/// `cd /the/chat/folder && cargo test` reads as `cargo test`: agents lead
+/// most commands with a `cd` back into the folder the chat is already in.
+fn strip_cd<'a>(cmd: &'a str, cwd: &std::path::Path) -> &'a str {
+    let Some(rest) = cmd.strip_prefix("cd ") else {
+        return cmd;
+    };
+    let Some((dir, after)) = rest.split_once(" && ").or_else(|| rest.split_once("; ")) else {
+        return cmd;
+    };
+    let dir = dir.trim().trim_matches(|c| c == '"' || c == '\'');
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = match dir.strip_prefix('~') {
+        Some(tail) => format!("{home}{tail}"),
+        None => dir.to_string(),
+    };
+    if std::path::Path::new(dir.trim_end_matches('/')) == cwd || dir == "." {
+        after.trim_start()
+    } else {
+        cmd
+    }
+}
+
 fn step_phrase(t: &ToolInvocation, running: bool, cwd: &std::path::Path) -> (&'static str, String) {
     let (verb, object) = step_phrase_full(t, running, cwd);
     (verb, one_line(&object))
@@ -5640,7 +5995,7 @@ fn step_phrase_full(t: &ToolInvocation, running: bool, cwd: &std::path::Path) ->
     match tool_kind(&t.name) {
         Kind::Command => (
             pick("Running", "Ran"),
-            relative_to(&input("command").unwrap_or_else(|| t.title.clone()), cwd),
+            relative_to(strip_cd(&input("command").unwrap_or_else(|| t.title.clone()), cwd), cwd),
         ),
         Kind::Edit if n.contains("write") || n.contains("create") => {
             (pick("Writing", "Wrote"), path())
@@ -6163,7 +6518,8 @@ impl Render for ChatPane {
                             .flex_1()
                             .pb(u(16.)),
                         )
-                        .children(self.render_sticky_prompt(cx)),
+                        .children(self.render_sticky_prompt(cx))
+                        .children(self.render_outline(cx)),
                 )
                 .child(
                     div()
@@ -6171,6 +6527,7 @@ impl Render for ChatPane {
                         .flex_none()
                         .pb(u(12.))
                         .children(self.render_jump(cx))
+                        .children(self.render_console(cx))
                         .child(Self::column(self.render_composer(window, cx))),
                 )
             })
@@ -6366,6 +6723,15 @@ fn subsequence_gaps(s: &str, q: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cd_into_the_chat_folder_is_left_out() {
+        let cwd = std::path::Path::new("/home/me/deck");
+        assert_eq!(strip_cd("cd /home/me/deck && git status", cwd), "git status");
+        assert_eq!(strip_cd("cd '/home/me/deck'; ls", cwd), "ls");
+        assert_eq!(strip_cd("cd /tmp && ls", cwd), "cd /tmp && ls");
+        assert_eq!(strip_cd("cargo test", cwd), "cargo test");
+    }
     use agent_core::ToolId;
 
     fn tool(name: &str) -> ToolInvocation {
