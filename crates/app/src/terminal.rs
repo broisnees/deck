@@ -1900,7 +1900,7 @@ impl TerminalPane {
             .border_color(rgba(theme::alpha(theme::DANGER, 0x55)))
             .shadow_lg()
             .font_family(theme::ui())
-            .text_size(px(12.5))
+            .text_size(px(theme::TEXT_UI))
             .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(theme::DANGER)))
             .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text())).child(what))
             .children(fix.map(|fix| {

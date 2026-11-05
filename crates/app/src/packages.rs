@@ -644,7 +644,7 @@ impl Render for PackagesPage {
                 .h(u(24.))
                 .px(u(10.))
                 .rounded(u(6.))
-                .text_size(u(12.5))
+                .text_size(u(theme::TEXT_UI))
                 .cursor_pointer()
                 .when(on, |d| {
                     d.bg(rgb(theme::row_active())).border_1().border_color(rgba(theme::hairline())).text_color(rgb(theme::text()))
@@ -782,7 +782,7 @@ impl Render for PackagesPage {
                                         .items_baseline()
                                         .gap(u(8.))
                                         .child(div().font_weight(FontWeight::MEDIUM).line_height(u(18.)).child(f.name.clone()))
-                                        .child(div().text_size(u(11.5)).text_color(rgb(theme::dim())).child(f.version.clone())),
+                                        .child(div().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(f.version.clone())),
                                 )
                                 .when(!f.about.is_empty(), |x| {
                                     x.child(
@@ -849,7 +849,7 @@ impl Render for PackagesPage {
                         .px(u(8.))
                         .rounded(u(8.))
                         .cursor_pointer()
-                        .text_size(u(12.5))
+                        .text_size(u(theme::TEXT_UI))
                         .text_color(rgb(theme::text_2()))
                         .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                         .child(icon(Icon::Search, 12., theme::dim()))
@@ -918,7 +918,7 @@ impl Render for PackagesPage {
                     .flex()
                     .items_center()
                     .h(u(30.))
-                    .text_size(u(11.5))
+                    .text_size(u(theme::TEXT_SMALL))
                     .text_color(rgb(theme::dim()))
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
@@ -968,12 +968,12 @@ impl Render for PackagesPage {
                                 .items_center()
                                 .gap(u(6.))
                                 .child(div().font_weight(FontWeight::MEDIUM).one_line().child(d.name.clone()))
-                                .when(d.dev, |x| x.child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child("dev")))
-                                .child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child(d.eco.label()))
+                                .when(d.dev, |x| x.child(div().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child("dev")))
+                                .child(div().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child(d.eco.label()))
                                 .children(worst.map(sev_badge)),
                         )
                         .children(latest.about.clone().map(|a| {
-                            div().w_full().one_line().text_size(u(11.5)).text_color(rgb(theme::text_2())).child(a)
+                            div().w_full().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::text_2())).child(a)
                         })),
                 )
                 .child(div().w(u(110.)).text_color(rgb(theme::text_2())).one_line().child(d.wanted.clone()))
@@ -1100,7 +1100,7 @@ fn sev_badge(sev: Sev) -> gpui::Div {
         .px(u(5.))
         .rounded(u(4.))
         .bg(rgba((c << 8) | 0x24))
-        .text_size(u(10.5))
+        .text_size(u(theme::TEXT_META))
         .text_color(rgb(c))
         .child(sev.label())
 }

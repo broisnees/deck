@@ -509,7 +509,7 @@ impl Render for Palette {
                     .children(hint.map(|h| {
                         div()
                             .flex_none()
-                            .text_size(u(11.5))
+                            .text_size(u(theme::TEXT_SMALL))
                             .text_color(rgb(if selected { theme::text_2() } else { theme::dim() }))
                             .child(h)
                     }))
@@ -574,7 +574,7 @@ impl Render for Palette {
                             .items_center()
                             .rounded(u(5.))
                             .bg(rgba(theme::tint()))
-                            .text_size(u(11.5))
+                            .text_size(u(theme::TEXT_SMALL))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(theme::text_2()))
                             .child(if self.scope == Scope::Tabs { "Tabs" } else { "Actions" })

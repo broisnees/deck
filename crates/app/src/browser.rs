@@ -2667,7 +2667,7 @@ impl Render for BrowserPane {
                 .border_t_1()
                 .border_color(rgba(theme::hairline()))
                 .bg(rgba(theme::tint()))
-                .text_size(u(12.5))
+                .text_size(u(theme::TEXT_UI))
                 .child(icon(Icon::Import, 14., theme::accent()))
                 .child(
                     div()

@@ -199,7 +199,7 @@ impl UsagePage {
             .h(u(height))
             .w(u(54.))
             .flex_none()
-            .text_size(u(10.5))
+            .text_size(u(theme::TEXT_META))
             .text_color(rgb(theme::dim()))
             .children([scale, scale * 2. / 3., scale / 3., 0.].map(|v| div().child(label(v))));
         let first = r.daily.first().map(|d| d.day).unwrap_or(0);
@@ -223,7 +223,7 @@ impl UsagePage {
                         Metric::Cost => "Daily cost",
                         Metric::Tokens => "Daily tokens",
                     }))
-                    .children(when.map(|w| div().text_size(u(11.5)).text_color(rgb(theme::text_2())).child(w))),
+                    .children(when.map(|w| div().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::text_2())).child(w))),
             )
             .child(div().flex().gap(u(8.)).child(axis).child(bars))
             .child(
@@ -231,7 +231,7 @@ impl UsagePage {
                     .flex()
                     .justify_between()
                     .pl(u(62.))
-                    .text_size(u(10.5))
+                    .text_size(u(theme::TEXT_META))
                     .text_color(rgb(theme::dim()))
                     .child(day_label(first))
                     .when(first < -2, |d| d.child(day_label(mid)))
@@ -248,7 +248,7 @@ impl UsagePage {
                 .flex()
                 .items_center()
                 .h(u(30.))
-                .text_size(u(11.5))
+                .text_size(u(theme::TEXT_SMALL))
                 .text_color(rgb(theme::dim()))
                 .border_b_1()
                 .border_color(rgba(theme::hairline()))
@@ -322,7 +322,7 @@ impl Render for UsagePage {
                 .h(u(24.))
                 .px(u(10.))
                 .rounded(u(6.))
-                .text_size(u(12.5))
+                .text_size(u(theme::TEXT_UI))
                 .cursor_pointer()
                 .when(on, |d| {
                     d.bg(rgb(theme::row_active()))
@@ -458,13 +458,13 @@ impl Render for UsagePage {
                                     .child(div().size(u(7.)).rounded_full().bg(rgb(mark.brand().unwrap_or(theme::text_2()))))
                                     .child(icon(mark, 15., mark.brand().unwrap_or(theme::text_2())))
                                     .child(div().font_weight(FontWeight::MEDIUM).child(agent_name(agent)))
-                                    .child(div().flex_1().text_size(u(11.5)).text_color(rgb(theme::dim())).child(format!(
+                                    .child(div().flex_1().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(format!(
                                         "{n} session{}",
                                         if n == 1 { "" } else { "s" }
                                     )))
                                     .child(div().font_weight(FontWeight::MEDIUM).child(self.figure(c, t))),
                             )
-                            .child(div().pl(u(15.)).text_size(u(11.5)).text_color(rgb(theme::dim())).child(format!(
+                            .child(div().pl(u(15.)).text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(format!(
                                 "{:.1}% of {} · {} tokens",
                                 share * 100.,
                                 if self.metric == Metric::Cost { "cost" } else { "tokens" },
@@ -484,7 +484,7 @@ impl Render for UsagePage {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(self.figure(cost, tokens)),
                     )
-                    .child(div().text_size(u(12.5)).text_color(rgb(theme::text_2())).child(format!(
+                    .child(div().text_size(u(theme::TEXT_UI)).text_color(rgb(theme::text_2())).child(format!(
                         "{sessions} sessions · {}",
                         if self.metric == Metric::Cost { "API estimate" } else { "all tokens processed" }
                     )))
@@ -557,7 +557,7 @@ impl Render for UsagePage {
                     )
                     .child(
                         div()
-                            .text_size(u(11.5))
+                            .text_size(u(theme::TEXT_SMALL))
                             .text_color(rgb(theme::dim()))
                             .child("Read from Claude Code's, Codex's, OpenCode's and Gemini CLI's own records on this Mac. Costs are at API list prices (OpenCode's as it recorded them; Gemini CLI records none), not what a plan bills."),
                     )
@@ -649,7 +649,7 @@ fn limit_history() -> Option<AnyElement> {
                         .w(u(160.))
                         .flex_none()
                         .child(icon(Icon::agent(&agent), 13., Icon::agent(&agent).brand().unwrap_or(theme::text_2())))
-                        .child(div().text_size(u(12.5)).child(label.clone())),
+                        .child(div().text_size(u(theme::TEXT_UI)).child(label.clone())),
                 )
                 .child(bars)
                 .child(div().w(u(48.)).flex().justify_end().text_size(u(12.)).text_color(rgb(theme::text_2())).child(format!("{last:.0}%"))),

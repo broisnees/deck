@@ -327,6 +327,9 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [x] Browser toolbar as one floating capsule
 - [~] Sidebar redesign (rows: 4px apart, 32px tall, fill-only active row, no repeated labels, last command on idle shells; project headers show their git branch; footer icons have labels on hover; still to do: the bottom strip itself, one type scale with chat and pages)
 - [x] Windows: `cargo check` passes for the whole workspace (control socket over `uds_windows`, `os.rs` for permissions, exec and detach, `deckd`'s server Unix-only with Windows stand-ins)
+- [x] One type scale (11 meta, 12 small, 13 UI, 14 reading; `theme::TEXT_*`) across sidebar, chat, pages and settings
+- [x] Smooth wheel scrolling: a wheel's notches glide in over a few frames in the chat's list and every scrolling panel (vendored gpui); trackpads unchanged
+- [x] Sidebar footer counts as one family, and Select All (Ctrl+A) while rows are picked picks every row even with a text field focused
 - [x] Done today: Ctrl+Shift shortcut scheme, Ctrl+Backspace by word, zoom keys, keyboard back from pages, rounded and inset pages, exit bar for finished jobs, sidebar selection (Ctrl-click, Ctrl+A), no repeated row labels, last command on idle shells, command suggestions with intent and typos, job viewers not kept as sessions, X11 window class, release build
 
 ### Memory for agents (asked 2026-11-05)
@@ -343,8 +346,8 @@ Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2
 - [x] Default agent from the chat's agent menu: "default" beside it, "Make … the default" on the one under the pointer (Settings › Agents › Default agent too)
 - [x] A failed command in a terminal raises an overlay: what failed, "Run clear" when it was likely meant (`cls`, `gti`), Fix with agent, dismiss; gone with the next command
 - [x] Command box (⌘J): Ctrl+Enter writes the command and runs it; keys shown as keycaps
-- [~] Routing when a limit is reached (Settings › Agents › When an agent reaches its limit: wait for the reset, or continue with a chosen agent, which takes the thread with the whole conversation and says so; still to do: a chain of fallbacks, models within one agent, handing back after the reset): an agent that hits its plan limit hands the thread to another
-- [ ] Before the limit: warn at 90% in the composer and offer the switch, with the reset time
+- [x] Routing when a limit is reached: Settings › Agents › When an agent reaches its limit takes agents in order (numbered as picked); the thread moves to the first ready one with the whole conversation, on down the chain if that one is out too, and back to its own agent with the first message after the reset
+- [x] Before the limit: a chat on an agent at 90% or more of a plan limit says so under its composer, with the reset time
 
 ### One setup for every agent (asked 2026-11-05)
 

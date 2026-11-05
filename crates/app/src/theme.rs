@@ -611,6 +611,17 @@ pub fn term_font(family: impl Into<gpui::SharedString>) -> gpui::Font {
 }
 
 pub const FONT_PX: f32 = 13.;
+
+// One type scale for the sidebar, chat, pages and settings. Anything
+// between two steps reads as a mistake, so there is nothing between them.
+/// Times, counts, hints, keycaps.
+pub const TEXT_META: f32 = 11.;
+/// Labels, notes, chips, section heads.
+pub const TEXT_SMALL: f32 = 12.;
+/// Sidebar rows, menus, buttons, popovers.
+pub const TEXT_UI: f32 = 13.;
+/// What you read and write: chat messages, the composer.
+pub const TEXT_READ: f32 = 14.;
 pub const TOOLBAR_PX: f32 = 40.;
 pub const SIDEBAR_PX: f32 = 256.;
 pub const INSPECTOR_PX: f32 = 320.;

@@ -2630,7 +2630,7 @@ impl Workspace {
                                         .child(h.name.clone()),
                                 )
                                 .children((!h.detail.is_empty()).then(|| {
-                                    div().one_line().text_size(u(11.5)).text_color(rgb(theme::dim())).child(h.detail.clone())
+                                    div().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(h.detail.clone())
                                 })),
                         )
                         .when(!selected, |d| d.child(icon(Icon::Terminal, 13., theme::dim()))),
@@ -2676,7 +2676,7 @@ impl Workspace {
                     .gap(u(6.))
                     .px(u(12.))
                     .py(u(18.))
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .text_color(rgb(theme::dim()))
                     .child(div().text_color(rgb(theme::text_2())).child("No hosts yet"))
                     .child("Add a Host to ~/.ssh/config, or run `deck remote add user@host --name box --key ~/box.pem`."),
@@ -2710,7 +2710,7 @@ impl Workspace {
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
                     .child(icon(Icon::Folder, 14., theme::dim()))
-                    .child(div().flex_1().text_size(u(13.5)).child(p.field.clone()))
+                    .child(div().flex_1().text_size(u(theme::TEXT_READ)).child(p.field.clone()))
                     .child(crate::kbd::key("esc")),
             )
             .child(
@@ -2850,7 +2850,7 @@ impl Workspace {
                                 .items_center()
                                 .rounded(u(4.))
                                 .bg(rgba(theme::alpha(theme::accent(), 0x22)))
-                                .text_size(u(10.5))
+                                .text_size(u(theme::TEXT_META))
                                 .text_color(rgb(theme::accent()))
                                 .child("Current"),
                         )
@@ -2860,7 +2860,7 @@ impl Workspace {
             );
         }
         if matches.is_empty() && !can_create {
-            list = list.child(div().h(u(36.)).flex().items_center().justify_center().text_size(u(12.5)).text_color(rgb(theme::dim())).child("No branch matches"));
+            list = list.child(div().h(u(36.)).flex().items_center().justify_center().text_size(u(theme::TEXT_UI)).text_color(rgb(theme::dim())).child("No branch matches"));
         }
         let action = |id: &'static str, glyph: Icon, label: String| {
             div()
@@ -2872,7 +2872,7 @@ impl Workspace {
                 .px(u(8.))
                 .rounded(u(6.))
                 .cursor_pointer()
-                .text_size(u(12.5))
+                .text_size(u(theme::TEXT_UI))
                 .text_color(rgb(theme::text_2()))
                 .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                 .child(icon(glyph, 13., theme::dim()))
@@ -4172,10 +4172,38 @@ impl Workspace {
                 if let Some(o) = others {
                     u.others = o;
                 }
+                ws.push_limit_notes(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Each chat on an agent at 90% or more of a plan limit says so under
+    /// its composer, with when it resets; the rest say nothing.
+    fn push_limit_notes(&self, cx: &mut Context<Self>) {
+        let note = |l: &crate::usage::Limits, name: &str| -> Option<SharedString> {
+            let top = l.limits.iter().filter(|x| x.used_pct >= 90.).max_by(|a, b| a.used_pct.total_cmp(&b.used_pct))?;
+            let reset = top.resets_at.map(|t| format!(" · {}", resets_in(t))).unwrap_or_default();
+            Some(format!("{name} has used {} of its {} limit{reset}", pct_text(top.used_pct), top.label).into())
+        };
+        let claude = self.usage.claude.as_ref().and_then(|r| r.as_ref().ok()).and_then(|l| note(l, "Claude"));
+        let codex = self.usage.codex.as_ref().and_then(|l| note(l, "Codex"));
+        for pane in self.panes.values() {
+            if let PaneKind::Chat(c) = &pane.kind {
+                c.update(cx, |c, cx| {
+                    let want = match c.agent.as_str() {
+                        "claude" => claude.clone(),
+                        "codex" => codex.clone(),
+                        _ => None,
+                    };
+                    if c.limit_note != want {
+                        c.limit_note = want;
+                        cx.notify();
+                    }
+                });
+            }
+        }
     }
 
     /// The meter at the status bar's end: the plan limit nearest its cap
@@ -4578,7 +4606,7 @@ impl Workspace {
                     .flex_col()
                     .gap(u(4.))
                     .child(agent_head(mark, a.name, Some("No plan limits".into())))
-                    .child(div().pl(u(22.)).text_size(u(11.5)).text_color(rgb(theme::dim())).child(note)),
+                    .child(div().pl(u(22.)).text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(note)),
             );
         }
 
@@ -4673,12 +4701,12 @@ impl Workspace {
                                 .flex_1()
                                 .min_w_0()
                                 .child(div().w_full().one_line().text_color(rgb(theme::text())).child(c.title.clone()))
-                                .child(div().w_full().one_line().text_size(u(10.5)).text_color(rgb(theme::dim())).child(match &c.model {
+                                .child(div().w_full().one_line().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child(match &c.model {
                                     Some(m) => format!("{} · {m}", c.agent),
                                     None => c.agent.to_string(),
                                 })),
                         )
-                        .child(div().flex_none().text_size(u(11.5)).text_color(rgb(theme::text_2())).child(figure))
+                        .child(div().flex_none().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::text_2())).child(figure))
                         .on_click(cx.listener(move |ws, _, window, cx| {
                             ws.usage_open = false;
                             ws.focus_pane(pane, window, cx);
@@ -4842,7 +4870,7 @@ impl Workspace {
                     .border_1()
                     .border_color(rgba(theme::alpha(theme::text(), 0x14)))
                     .shadow_lg()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(tabs)
                     .child(body)
@@ -9021,21 +9049,15 @@ impl Workspace {
                 .px(u(6.))
                 .rounded(u(6.))
                 .cursor_pointer()
-                .text_size(u(12.5))
+                .text_size(u(12.))
                 .text_color(rgb(theme::text_2()))
                 .hover(|s| s.bg(rgb(theme::row_hover())))
                 .child(mark)
                 .child(n.to_string())
         };
-        let done_mark = div()
-            .size(u(13.))
-            .rounded_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(theme::text()))
-            .child(icon(Icon::Check, 8., theme::sidebar()))
-            .into_any_element();
+        // The three counts are one family: outline marks at one size, the
+        // count beside each in the same quiet colour.
+        let done_mark = icon(Icon::Check, 13., theme::text_2());
         div()
             .flex()
             .items_center()
@@ -9051,13 +9073,13 @@ impl Workspace {
             .child(div().flex_1())
             .when(working > 0, |d| {
                 d.child(
-                    count("foot-working", spinner("foot-spin", 12., theme::accent()), working)
+                    count("foot-working", spinner("foot-spin", 13., theme::text_2()), working)
                         .on_click(cx.listener(|ws, _, w, cx| ws.next_with(Status::Working, w, cx))),
                 )
             })
             .when(waiting > 0, |d| {
                 d.child(
-                    count("foot-waiting", icon(Icon::Bell, 12., theme::accent()), waiting)
+                    count("foot-waiting", icon(Icon::Bell, 13., theme::accent()), waiting)
                         .on_click(cx.listener(|ws, _, w, cx| ws.next_needs_you(w, cx))),
                 )
             })
@@ -9132,7 +9154,7 @@ impl Workspace {
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
-            .text_size(u(12.5))
+            .text_size(u(theme::TEXT_UI))
             .child(div().flex_1().text_color(rgb(theme::text())).child(format!("{n} selected")))
             .child(button("pick-clear", "Clear", false).on_click(cx.listener(|ws, _, _, cx| {
                 ws.picked.clear();
@@ -9524,14 +9546,14 @@ impl Workspace {
                             .flex_shrink()
                             .min_w_0()
                             .one_line()
-                            .text_size(u(12.5))
+                            .text_size(u(theme::TEXT_UI))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
                             .child(label),
                     )
                     // The branch the project is on, quiet beside its name.
                     .children(g.root.as_deref().and_then(head_branch).map(|b| {
-                        div().flex_shrink().min_w_0().one_line().text_size(u(11.5)).text_color(rgb(theme::dim())).child(b)
+                        div().flex_shrink().min_w_0().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(b)
                     })),
             )
             // What's going on inside, readable even when folded.
@@ -10391,7 +10413,7 @@ impl Workspace {
             .border_t_1()
             .border_color(rgba(theme::hairline()))
             .bg(theme::ground())
-            .text_size(u(11.5))
+            .text_size(u(theme::TEXT_SMALL))
             .text_color(rgb(theme::text_2()))
             .children(place)
             .when(chats.is_some(), |d| d.child(sep()).children(chats))
@@ -10503,7 +10525,7 @@ impl Workspace {
                     .px(u(8.))
                     .rounded(u(6.))
                     .bg(rgb(theme::surface()))
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .child(icon(Icon::Claude, 13., Icon::Claude.brand().unwrap_or(theme::text_2())))
                     .child(
                         div()
@@ -10546,7 +10568,7 @@ impl Workspace {
                     // Concentric: the list's 10 radius less its 4 padding.
                     .rounded(u(6.))
                     .cursor_pointer()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .when(focused == Some(pane), |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::row_hover())))
                     .child(if busy {
@@ -10715,7 +10737,7 @@ impl Workspace {
                     .px(u(8.))
                     .rounded(u(6.))
                     .cursor_pointer()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .when(r.open, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::row_hover())))
                     .child(div().flex_none().flex().justify_center().w(u(14.)).child(self.bg_mark(id, 13., cx)))
@@ -10886,7 +10908,7 @@ impl Workspace {
             .when(!min, |d| d.border_b_1().border_color(rgba(theme::hairline())))
             .child(div().flex_none().size(u(7.)).rounded_full().bg(rgb(dot)))
             .child(div().flex_none().font_weight(FontWeight::MEDIUM).child(name.unwrap_or_else(|| format!("job {id}"))))
-            .child(div().flex_1().min_w_0().one_line().font_family(theme::mono()).text_size(u(11.5)).text_color(rgb(theme::dim())).child(cmd))
+            .child(div().flex_1().min_w_0().one_line().font_family(theme::mono()).text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(cmd))
             .child(div().flex_none().text_size(u(11.)).text_color(rgb(theme::dim())).child(state))
             // Run again or stop: the job and its output stay either way.
             .when(running, |d| {
@@ -11162,8 +11184,8 @@ const ROW_SLOT: f32 = 16.;
 const TRAIL_W: f32 = 30.;
 /// Every list row: one line, this tall, titles this size.
 const ROW_H: f32 = 32.;
-const ROW_TEXT: f32 = 14.;
-const HEAD_TEXT: f32 = 12.5;
+const ROW_TEXT: f32 = theme::TEXT_UI;
+const HEAD_TEXT: f32 = theme::TEXT_SMALL;
 const ROW_GAP: f32 = 10.;
 const ROW_END: f32 = 4.;
 /// A project's rows sit one step in from its header: their icons on the
@@ -12068,7 +12090,20 @@ impl Render for Workspace {
             .when(cfg!(target_os = "linux"), |d| {
                 d.capture_any_mouse_down(|_, window, _| crate::browser::reclaim_keyboard(window))
             })
-            .on_key_down(cx.listener(|ws, ev: &gpui::KeyDownEvent, _, cx| {
+            // Select All while rows are picked picks every row: taken on the
+            // way down, before the focused field's own Select All.
+            .capture_action(cx.listener(|ws, _: &SelectAll, _, cx| {
+                if ws.picked.is_empty() {
+                    return;
+                }
+                let all: Vec<PaneId> = ws.tabs.iter().filter(|t| !t.pinned).map(|t| t.leaves()[0]).collect();
+                ws.picked.extend(all);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            // On the way down, before the focused composer or field: while
+            // rows are picked, Esc and ⌘A (Ctrl+A) are the sidebar's.
+            .capture_key_down(cx.listener(|ws, ev: &gpui::KeyDownEvent, _, cx| {
                 if ws.picked.is_empty() {
                     return;
                 }
@@ -12403,7 +12438,7 @@ fn row_trailer(id: ElementId, state: RowState, when: String) -> AnyElement {
         .flex()
         .items_center()
         .gap(u(8.))
-        .child(div().text_size(u(12.5)).text_color(rgb(theme::dim())).child(when))
+        .child(div().text_size(u(theme::TEXT_UI)).text_color(rgb(theme::dim())).child(when))
         .children(mark)
         .into_any_element()
 }

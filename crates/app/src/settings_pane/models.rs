@@ -745,7 +745,7 @@ fn badge(text: String) -> AnyElement {
         .px(u(8.))
         .rounded(u(6.))
         .bg(rgb(theme::surface()))
-        .text_size(u(11.5))
+        .text_size(u(theme::TEXT_SMALL))
         .text_color(rgb(theme::text_2()))
         .child(div().size(u(6.)).rounded_full().bg(rgb(green())))
         .child(text)

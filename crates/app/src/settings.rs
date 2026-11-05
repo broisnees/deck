@@ -92,9 +92,10 @@ pub struct Settings {
     /// (`deck browser console|network|storage|eval|read`). Off, they can
     /// still open pages for you to look at.
     pub agents_read_pages: bool,
-    /// The agent a thread moves to when its own reaches its plan's usage
-    /// limit, carrying the conversation; `None` waits for the reset.
-    pub limit_fallback: Option<String>,
+    /// Where a thread goes when its agent reaches its plan's usage limit:
+    /// the first ready agent in this order, carrying the conversation, and
+    /// back to its own after the reset. Empty waits for the reset.
+    pub limit_chain: Vec<String>,
     /// Your shortcuts, by `workspace::SHORTCUTS` id: a key in gpui's form
     /// ("cmd-shift-k"), or "" for none. Absent ones keep Deck's.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -143,7 +144,7 @@ impl Default for Settings {
             import_offered: false,
             block_ads: true,
             agents_read_pages: true,
-            limit_fallback: None,
+            limit_chain: Vec::new(),
             keys: Default::default(),
             routes: Default::default(),
             access: Access::default(),
@@ -554,7 +555,9 @@ struct Stored {
     #[serde(deserialize_with = "lenient")]
     block_ads: Option<bool>,
     agents_read_pages: Option<bool>,
+    /// Older settings kept one agent here.
     limit_fallback: Option<String>,
+    limit_chain: Option<Vec<String>>,
     #[serde(deserialize_with = "lenient")]
     keys: Option<std::collections::BTreeMap<String, String>>,
     #[serde(deserialize_with = "lenient")]
@@ -633,7 +636,10 @@ fn from_stored(s: Stored) -> Settings {
         import_offered: s.import_offered.unwrap_or(d.import_offered),
         block_ads: s.block_ads.unwrap_or(d.block_ads),
         agents_read_pages: s.agents_read_pages.unwrap_or(d.agents_read_pages),
-        limit_fallback: s.limit_fallback.filter(|a| !a.is_empty()),
+        limit_chain: s
+            .limit_chain
+            .or_else(|| s.limit_fallback.filter(|a| !a.is_empty()).map(|a| vec![a]))
+            .unwrap_or_default(),
         // A key that does not parse is dropped, so Deck's comes back.
         keys: s
             .keys
@@ -715,6 +721,13 @@ mod tests {
     }
 
     #[test]
+    fn one_fallback_agent_becomes_a_chain() {
+        assert_eq!(parse(r#"{"limit_fallback":"codex"}"#).limit_chain, vec!["codex".to_string()]);
+        assert_eq!(parse(r#"{"limit_chain":["codex","opencode"]}"#).limit_chain, vec!["codex", "opencode"]);
+        assert!(parse("{}").limit_chain.is_empty());
+    }
+
+    #[test]
     fn settings_round_trip_through_the_file() {
         let s = Settings {
             theme: theme::Theme::Graphite,
@@ -754,7 +767,7 @@ mod tests {
             import_offered: true,
             block_ads: false,
             agents_read_pages: true,
-            limit_fallback: None,
+            limit_chain: Vec::new(),
             keys: [("palette".to_string(), "cmd-p".to_string())].into(),
             routes: [
                 ("rewrite".to_string(), "ollama:qwen2.5-coder:7b".to_string()),

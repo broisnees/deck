@@ -554,7 +554,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                             .flex_1()
                             .min_w_0()
                             .one_line()
-                            .text_size(u(13.5))
+                            .text_size(u(theme::TEXT_READ))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(g.branch.clone()),
                     )
@@ -575,7 +575,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     .items_center()
                     .gap(u(6.))
                     .px(u(8.))
-                    .text_size(u(11.5))
+                    .text_size(u(theme::TEXT_SMALL))
                     .text_color(rgb(theme::dim()))
                     .child(div().flex_1().min_w_0().one_line().child(tracking))
                     .when(!published, |d| {
@@ -642,7 +642,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                                 div()
                                     .min_w_0()
                                     .one_line()
-                                    .text_size(u(11.5))
+                                    .text_size(u(theme::TEXT_SMALL))
                                     .text_color(rgb(theme::dim()))
                                     .child(w.branch.clone().unwrap_or_else(|| "detached".into())),
                             ),
@@ -706,7 +706,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                                 div()
                                     .min_w_0()
                                     .one_line()
-                                    .text_size(u(11.5))
+                                    .text_size(u(theme::TEXT_SMALL))
                                     .text_color(rgb(theme::dim()))
                                     .child(dir),
                             ),
@@ -787,7 +787,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                                             .flex_1()
                                             .min_w_0()
                                             .one_line()
-                                            .text_size(u(12.5))
+                                            .text_size(u(theme::TEXT_UI))
                                             .text_color(rgb(theme::text()))
                                             .child(c.subject.clone()),
                                     )
@@ -831,7 +831,7 @@ fn git_row(id: ElementId) -> gpui::Stateful<gpui::Div> {
         .px(u(6.))
         .mx(u(-6.))
         .rounded(u(6.))
-        .text_size(u(12.5))
+        .text_size(u(theme::TEXT_UI))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(theme::row_hover())))
 }
@@ -860,7 +860,7 @@ fn ref_pill(name: String) -> gpui::Div {
         .rounded(u(4.))
         .border_1()
         .border_color(rgba(theme::input_edge()))
-        .text_size(u(10.5))
+        .text_size(u(theme::TEXT_META))
         .text_color(rgb(theme::text_2()))
         .child(name)
 }

@@ -1303,7 +1303,7 @@ fn render_row(r: Row) -> Div {
             })
             .children(r.about.map(|a| {
                 div()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .line_height(u(18.))
                     .text_color(rgb(theme::dim()))
                     .child(a)
@@ -1631,7 +1631,7 @@ impl SettingsPane {
                             .h(u(32.))
                             .px(u(10.))
                             .rounded(u(8.))
-                            .text_size(u(13.5))
+                            .text_size(u(theme::TEXT_READ))
                             .text_color(rgb(theme::text_2()))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
@@ -2167,27 +2167,43 @@ impl SettingsPane {
                 .on_click(self.on(move |s| s.access = a, cx))
             })
             .collect();
-        // Where a thread goes when its agent hits the plan's usage limit.
-        let fallback = self.settings.limit_fallback.clone();
+        // Where a thread goes when its agent hits the plan's usage limit:
+        // agents in the order picked, numbered; none waits for the reset.
+        let chain = self.settings.limit_chain.clone();
         let mut on_limit = vec![choice(
             "limit-wait".into(),
             Some(Icon::Clock),
             "Wait for the reset".into(),
             Some("The thread picks up by itself when the limit resets".into()),
-            fallback.is_none(),
+            chain.is_empty(),
         )
-        .on_click(self.on(|s| s.limit_fallback = None, cx))];
+        .on_click(self.on(|s| s.limit_chain.clear(), cx))];
         for (ix, (id, name)) in self.agents.iter().enumerate() {
             let pick = id.to_string();
+            let at = chain.iter().position(|a| a == id.as_ref());
             on_limit.push(
                 choice(
                     ElementId::NamedInteger("limit-agent".into(), ix as u64),
                     Some(Icon::agent(id)),
-                    format!("Continue with {name}").into(),
+                    match at {
+                        Some(n) => format!("{}. Continue with {name}", n + 1).into(),
+                        None => format!("Continue with {name}").into(),
+                    },
                     None,
-                    fallback.as_deref() == Some(id.as_ref()),
+                    at.is_some(),
                 )
-                .on_click(self.on(move |s| s.limit_fallback = Some(pick.clone()), cx)),
+                .on_click(self.on(
+                    move |s| {
+                        // A click adds it to the end of the chain, or takes
+                        // it out.
+                        if let Some(i) = s.limit_chain.iter().position(|a| *a == pick) {
+                            s.limit_chain.remove(i);
+                        } else {
+                            s.limit_chain.push(pick.clone());
+                        }
+                    },
+                    cx,
+                )),
             );
         }
         vec![
@@ -2199,7 +2215,7 @@ impl SettingsPane {
             choices(
                 "When an agent reaches its limit",
                 on_limit,
-                Some("Claude's 5-hour and weekly limits, Codex's monthly one. Continuing hands the thread, with the whole conversation, to the agent picked here.".into()),
+                Some("Claude's 5-hour and weekly limits, Codex's monthly one. Pick agents in the order to try them: the thread moves to the first ready one with the whole conversation, and comes back to its own agent with the first message after the reset.".into()),
             ),
             choices(
                 "Access",

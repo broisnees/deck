@@ -2400,6 +2400,7 @@ impl Interactivity {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn paint_scroll_listener(
         &self,
         hitbox: &Hitbox,
@@ -2414,8 +2415,35 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            // Deck patch: a mouse wheel's notches glide in over a few frames
+            // instead of jumping by whole lines; a share of what is left goes
+            // in each paint. Trackpads (pixels) scroll as before.
+            let key = Rc::as_ptr(&scroll_offset) as usize;
+            if overflow.y == Overflow::Scroll {
+                let left = WHEEL_GLIDE.with(|g| g.borrow().get(&key).copied()).unwrap_or(Pixels::ZERO);
+                if left != Pixels::ZERO {
+                    let step = if left.abs() <= px(1.) { left } else { left * 0.35 };
+                    scroll_offset.borrow_mut().y += step;
+                    WHEEL_GLIDE.with(|g| {
+                        let mut g = g.borrow_mut();
+                        if left - step == Pixels::ZERO {
+                            g.remove(&key);
+                        } else {
+                            g.insert(key, left - step);
+                        }
+                    });
+                    window.request_animation_frame();
+                }
+            }
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    if let (crate::ScrollDelta::Lines(lines), Overflow::Scroll) = (event.delta, overflow.y) {
+                        if lines.x == 0. {
+                            WHEEL_GLIDE.with(|g| *g.borrow_mut().entry(key).or_insert(Pixels::ZERO) += line_height * lines.y);
+                            cx.notify(current_view);
+                            return;
+                        }
+                    }
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);
@@ -3247,4 +3275,10 @@ impl ScrollHandle {
     pub fn children_count(&self) -> usize {
         self.0.borrow().child_bounds.len()
     }
+}
+
+thread_local! {
+    /// Deck patch: wheel distance still to glide, by scroll container
+    /// (the address of its offset cell). See `paint_scroll_listener`.
+    static WHEEL_GLIDE: RefCell<collections::HashMap<usize, Pixels>> = RefCell::new(collections::HashMap::default());
 }
