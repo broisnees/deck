@@ -18,6 +18,41 @@ deck: drive the deck window you are running in.
   deck run [--name NAME] [--dir right|down] [--cwd DIR] CMD
       runs CMD in a terminal split beside you; with --name, running it again
       reuses that pane (Ctrl-C, then CMD). Use it for dev servers and watchers.
+  deck run --bg [--name NAME] [--cwd DIR] CMD     same as `deck job start`
+  deck job start [--name NAME] [--cwd DIR] CMD
+      runs CMD in deck's background service: it keeps running when Deck quits,
+      starts again after the Mac restarts, shows in the menu bar and as a tab in
+      Deck's status bar. Starting NAME again restarts it. Dev servers, watchers,
+      agents (`deck job start --name fixer claude`). Works with Deck closed.
+  deck job list                     every job: name, command, running, exit code
+  deck job logs  --name NAME [--lines N]      its output, plain text
+  deck job wait  --name NAME --for TEXT[|TEXT] | --exit [--timeout SECS]
+  deck job show  --name NAME        its terminal in Deck
+  deck job restart --name NAME
+  deck job stop  --name NAME        stop it and forget it
+  deck pane prompt --pane N|--name NAME TEXT [--timeout SECS]
+      send an agent a message, wait until it has worked and stopped, print its answer
+  deck report working|blocked|done|error|clear [MESSAGE] [--progress N]
+      set this pane's state and message in Deck's sidebar (blocked also notifies you)
+  deck events [--for working,waiting,idle,opened,closed] [--once] [--json]
+      a line for every change in this window as it happens
+  deck pane diff --pane N | --name NAME [--turn]
+      what the terminal agent there changed since its current (or last) turn began
+  deck pane key --pane N KEY        a key press: enter, escape, tab, up, ctrl+c, alt+b, …
+  deck history [QUERY]              saved chat threads, newest first (open, closed, older)
+  deck resume ID                    reopen a thread (an id prefix from `deck history` works)
+  deck page open usage|packages     open Deck's Usage (cost by day and model) or Packages page
+  deck ssh HOST [--dir D] [--agent claude|codex|…]
+      this terminal becomes a shell on HOST in D (or the agent there); works without Deck
+  deck remote list | add HOST [--dir D] | remove HOST
+  deck remote open HOST [--dir D] [--agent claude|codex|…] [--chat]
+      a terminal on HOST over SSH, or an agent there: its own interface, or with
+      --chat a Deck chat whose agent runs on HOST
+  deck memory add [--global] TEXT | list [--all] | search QUERY | forget ID
+      notes every coding agent shares; Claude Code gets them at every session start
+  deck context                      what a new agent session is told: Deck, and this project's memory
+  deck do ACTION | --list             run any ⌘K action by its name, e.g. `deck do Split Right`
+  deck usage                        plan limits, this conversation, today's tokens and cost
   deck pane read  --pane N [--lines N]     --lines: just the last N lines (logs)
   deck pane wait  --pane N --for TEXT[|TEXT] [--timeout SECS]
       until the pane prints TEXT, e.g. --for \"ready|Local:\"; exit 1 on timeout
@@ -28,6 +63,13 @@ deck: drive the deck window you are running in.
       --chat starts a structured chat with that agent; --agent runs its TUI in a terminal
   deck browser open [--pane N | --name NAME] [--tab] URL
   deck browser eval [--pane N] JS
+  deck read URL [--name NAME] [--scroll N] [--max CHARS] [--json]
+      the page as Markdown, read in a background page: real WebKit with your
+      sign-ins, out of sight (a tab in the status bar). Works where plain
+      fetches are turned away (Reddit, X, sites behind sign-in). --scroll loads
+      N more screens of an endless feed. The page stays open under NAME.
+  deck browser open --bg [--name NAME] URL   a background page: no split, a tab in the status bar
+  deck browser read [--scroll N]    the page you are on, as Markdown
   deck browser snapshot             the page's headings and controls, numbered [N] for the verbs below
   deck browser click TARGET         TARGET: a [N] from snapshot, text=Some text, or a CSS selector
   deck browser type TARGET TEXT [--enter] [--append]
@@ -79,7 +121,44 @@ pub fn run(args: &[String]) -> i32 {
         return doctor();
     }
     if args.first().map(String::as_str) == Some("mcp") {
+        // `deck mcp --host H --dir D`: tools bound to one machine, for a
+        // chat whose agent works there.
+        let flag = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+        if let Some(host) = flag("--host") {
+            return crate::host_mcp::run(&host, &flag("--dir").unwrap_or_else(|| "~".into()));
+        }
         return crate::mcp::run();
+    }
+    match args.first().map(String::as_str) {
+        Some("report") => return report(&args[1..]),
+        Some("events") => return events(&args[1..]),
+        _ => {}
+    }
+    if args.len() >= 2 && args[0] == "pane" && args[1] == "prompt" {
+        return prompt(&args[2..]);
+    }
+    // Background jobs live in deck's background service, so these work
+    // from any terminal, with Deck open or not.
+    match args.first().map(String::as_str) {
+        Some("daemon") => return crate::daemon::serve(),
+        Some("memory") => return crate::memory::cli(&args[1..]),
+        Some("remote") => return remote(&args[1..]),
+        // `deck ssh HOST [--dir D] [--agent A]`: this terminal becomes a
+        // shell (or an agent) on HOST, in that folder. No Deck needed.
+        Some("ssh") => return ssh_here(&args[1..]),
+        Some("hook") if args.get(1).map(String::as_str) == Some("session-start") => return crate::memory::session_start_hook(),
+        Some("context") => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            print!("{}", crate::memory::brief(&cwd, std::env::var_os("DECK_SOCKET").is_some()));
+            return 0;
+        }
+        Some("job") => return crate::daemon::cli(&args[1..]),
+        Some("run") if args.iter().any(|a| a == "--bg") => {
+            let mut rest: Vec<String> = vec!["start".into()];
+            rest.extend(args[1..].iter().filter(|a| *a != "--bg").cloned());
+            return crate::daemon::cli(&rest);
+        }
+        _ => {}
     }
     if args.len() >= 2 && args[0] == "task" && args[1] == "wait" {
         return wait(&args[2..]);
@@ -92,7 +171,16 @@ pub fn run(args: &[String]) -> i32 {
             print!("{HELP}");
             0
         }
-        Ok(Some((method, params))) => match call(&method, params) {
+        Ok(Some((method, params))) => match call(&method, params.clone()) {
+            Ok(v) if method == "pane.diff" => {
+                print!("{}", v["diff"].as_str().unwrap_or(""));
+                0
+            }
+            Ok(v) if method == "browse.read_url" && params.get("json") != Some(&Value::Bool(true)) => {
+                println!("# {}\n<{}>\n", v["title"].as_str().unwrap_or(""), v["url"].as_str().unwrap_or(""));
+                println!("{}", v["markdown"].as_str().unwrap_or(""));
+                0
+            }
             Ok(v) => {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
                 0
@@ -109,6 +197,94 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
+/// `deck remote list | add HOST [--dir D] | remove HOST | open HOST [--dir D]
+/// [--agent A] [--chat]`.
+fn remote(args: &[String]) -> i32 {
+    let flag = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+    let host = args.get(1).filter(|h| !h.starts_with("--")).cloned();
+    let out = |v: Value| {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        0
+    };
+    match args.first().map(String::as_str) {
+        Some("list") | None => out(serde_json::json!({ "hosts": crate::remote::hosts() })),
+        Some("add") => match host {
+            Some(h) => match crate::remote::add(&h, flag("--name").as_deref(), flag("--key").as_deref(), flag("--dir")) {
+                Ok(h) => out(serde_json::json!({ "added": h })),
+                Err(e) => {
+                    eprintln!("deck: {e}");
+                    1
+                }
+            },
+            None => {
+                eprintln!("deck: remote add needs a host, e.g. `deck remote add me@10.0.0.5`");
+                2
+            }
+        },
+        Some("remove") => match host.map(|h| crate::remote::remove(&h)) {
+            Some(Ok(true)) => out(serde_json::json!({ "removed": true })),
+            Some(Ok(false)) => {
+                eprintln!("deck: only hosts added in Deck can be removed here; SSH's own are in its config");
+                1
+            }
+            Some(Err(e)) => {
+                eprintln!("deck: {e}");
+                1
+            }
+            None => 2,
+        },
+        Some("open") => {
+            let Some(h) = host else {
+                eprintln!("deck: remote open needs a host (see `deck remote list`)");
+                return 2;
+            };
+            let mut p = Map::new();
+            p.insert("host".into(), h.into());
+            if let Some(d) = flag("--dir") {
+                p.insert("dir".into(), d.into());
+            }
+            if let Some(a) = flag("--agent") {
+                p.insert("agent".into(), a.into());
+            }
+            if args.iter().any(|a| a == "--chat") {
+                p.insert("chat".into(), true.into());
+            }
+            match call("remote.open", Value::Object(p)) {
+                Ok(v) => out(v),
+                Err(e) => {
+                    eprintln!("deck: {e}");
+                    1
+                }
+            }
+        }
+        Some(_) => {
+            eprintln!("usage: deck remote list | add HOST [--name N] [--key PEM] [--dir D] | remove HOST | open HOST [--dir D] [--agent claude] [--chat]");
+            2
+        }
+    }
+}
+
+fn ssh_here(args: &[String]) -> i32 {
+    use std::os::unix::process::CommandExt;
+    let flag = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+    let Some(host) = args.first().filter(|h| !h.starts_with("--")).cloned() else {
+        eprintln!("usage: deck ssh HOST [--dir DIR] [--agent claude|codex|…]   (hosts: `deck remote list`)");
+        return 2;
+    };
+    let dir = flag("--dir").unwrap_or_else(|| "~".into());
+    let agent = flag("--agent");
+    let line = crate::remote::remote_line(&dir, agent.as_deref());
+    eprintln!("Connecting to {host}…");
+    let err = std::process::Command::new("ssh")
+        .args(["-t", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30"])
+        .args(crate::remote::ssh_flags())
+        .arg(&host)
+        .arg(line)
+        .exec();
+    eprintln!("deck: could not run ssh: {err}");
+    1
+}
+
 /// One parsed command: a socket call, or a page action that makes its own.
 fn call(method: &str, mut params: Value) -> Result<Value, String> {
     // A relative PATH is this shell's; the app runs elsewhere.
@@ -121,8 +297,209 @@ fn call(method: &str, mut params: Value) -> Result<Value, String> {
         }
     }
     match method.strip_prefix("browse.") {
+        Some("read_url") => crate::browse::read_url(&params),
         Some(verb) => crate::browse::run(verb, params),
         None => control::call(method, params),
+    }
+}
+
+/// `deck report working|blocked|done|error|clear [MESSAGE] [--progress N]`:
+/// tell Deck how the program in this pane is doing. An escape written to
+/// the terminal, so it works from any program, in a pane or a job.
+fn report(args: &[String]) -> i32 {
+    let Some(state) = args.first().map(|s| s.to_lowercase()) else {
+        eprintln!("deck: report needs a state: working, blocked, done, error or clear");
+        return 2;
+    };
+    if !matches!(state.as_str(), "working" | "blocked" | "done" | "error" | "clear") {
+        eprintln!("deck: report state is working, blocked, done, error or clear, not {state:?}");
+        return 2;
+    }
+    let mut progress = None;
+    let mut words = Vec::new();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        if a == "--progress" {
+            progress = it.next().and_then(|p| p.parse::<u8>().ok()).map(|p| p.min(100));
+        } else {
+            words.push(a.as_str());
+        }
+    }
+    let msg = words.join(" ").replace(['\x07', '\x1b'], "");
+    let mut out = format!("\x1b]6973;report;{state};{msg}\x07");
+    match (state.as_str(), progress) {
+        ("working", Some(p)) => out.push_str(&format!("\x1b]9;4;1;{p}\x07")),
+        ("working", None) => out.push_str("\x1b]9;4;3\x07"),
+        ("error", _) => out.push_str("\x1b]9;4;2;100\x07"),
+        _ => out.push_str("\x1b]9;4;0\x07"),
+    }
+    // The terminal itself, so a redirected stdout still reaches it.
+    use std::io::Write;
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .and_then(|mut t| t.write_all(out.as_bytes()));
+    if written.is_err() {
+        print!("{out}");
+    }
+    0
+}
+
+/// `deck events [--for working,waiting,idle,closed,opened] [--once] [--json]`:
+/// what changes in this window, a line each, as it happens: panes opened and
+/// closed, agents starting and stopping work or starting to wait on you.
+fn events(args: &[String]) -> i32 {
+    let mut want: Vec<String> = Vec::new();
+    let mut once = false;
+    let mut json_out = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--for" => want = it.next().map(|w| w.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+            "--once" => once = true,
+            "--json" => json_out = true,
+            _ => {}
+        }
+    }
+    let snapshot = || -> Result<std::collections::HashMap<u64, (String, String, String)>, String> {
+        let v = control::call("pane.list", Value::Object(Map::new()))?;
+        Ok(v["panes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                Some((
+                    p["id"].as_u64()?,
+                    (
+                        p["status"].as_str().unwrap_or("none").to_string(),
+                        p["title"].as_str().unwrap_or("").to_string(),
+                        p["kind"].as_str().unwrap_or("").to_string(),
+                    ),
+                ))
+            })
+            .collect())
+    };
+    let mut last = match snapshot() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("deck: {e}");
+            return 1;
+        }
+    };
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let now = match snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("deck: {e}");
+                return 1;
+            }
+        };
+        let mut said = Vec::new();
+        for (id, (status, title, kind)) in &now {
+            match last.get(id) {
+                None => said.push((*id, "opened".to_string(), title.clone(), kind.clone())),
+                Some((was, ..)) if was != status && status != "none" => said.push((*id, status.clone(), title.clone(), kind.clone())),
+                _ => {}
+            }
+        }
+        for (id, (_, title, kind)) in &last {
+            if !now.contains_key(id) {
+                said.push((*id, "closed".to_string(), title.clone(), kind.clone()));
+            }
+        }
+        for (id, event, title, kind) in said {
+            if !want.is_empty() && !want.iter().any(|w| *w == event) {
+                continue;
+            }
+            if json_out {
+                println!("{}", serde_json::json!({ "pane": id, "event": event, "title": title, "kind": kind }));
+            } else {
+                println!("{event}\tpane {id}\t{kind}\t{title}");
+            }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            if once {
+                return 0;
+            }
+        }
+        last = now;
+    }
+}
+
+/// `deck pane prompt --pane N | --name NAME TEXT [--timeout SECS]`: send an
+/// agent a message, wait until it has worked and stopped, print its answer.
+fn prompt(args: &[String]) -> i32 {
+    let mut target = Map::new();
+    let mut timeout = 600u64;
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--pane" => {
+                if let Some(n) = it.next().and_then(|n| n.parse::<u64>().ok()) {
+                    target.insert("pane".into(), n.into());
+                }
+            }
+            "--name" => {
+                if let Some(n) = it.next() {
+                    target.insert("name".into(), n.clone().into());
+                }
+            }
+            "--timeout" => timeout = it.next().and_then(|t| t.parse().ok()).unwrap_or(timeout),
+            w => words.push(w.to_string()),
+        }
+    }
+    if target.is_empty() || words.is_empty() {
+        eprintln!("deck: pane prompt needs --pane N (or --name NAME) and the message");
+        return 2;
+    }
+    let status_of = |t: &Map<String, Value>| -> Option<String> {
+        let v = control::call("pane.list", Value::Object(Map::new())).ok()?;
+        let id = match t.get("pane").and_then(Value::as_u64) {
+            Some(id) => id,
+            None => return Some("unknown".into()),
+        };
+        v["panes"].as_array()?.iter().find(|p| p["id"].as_u64() == Some(id)).and_then(|p| p["status"].as_str().map(str::to_string))
+    };
+    let mut send = target.clone();
+    send.insert("text".into(), words.join(" ").into());
+    if let Err(e) = control::call("pane.send", Value::Object(send)) {
+        eprintln!("deck: {e}");
+        return 1;
+    }
+    let start = std::time::Instant::now();
+    let mut seen_work = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let st = status_of(&target).unwrap_or_default();
+        if st == "working" {
+            seen_work = true;
+        }
+        // Done once it worked and stopped (or, for a pane that never says,
+        // after its output has been quiet a while).
+        if (seen_work && st != "working") || (st == "unknown" && start.elapsed().as_secs() > 20) {
+            break;
+        }
+        if st == "waiting" && seen_work {
+            break;
+        }
+        if start.elapsed().as_secs() > timeout {
+            eprintln!("deck: timed out waiting for the answer");
+            return 1;
+        }
+    }
+    let mut read = target.clone();
+    read.insert("lines".into(), 80u64.into());
+    match control::call("pane.read", Value::Object(read)) {
+        Ok(v) => {
+            println!("{}", v["text"].as_str().unwrap_or(""));
+            0
+        }
+        Err(e) => {
+            eprintln!("deck: {e}");
+            1
+        }
     }
 }
 
@@ -263,8 +640,8 @@ pub fn wait_text(mut params: Value, want: &str, timeout: u64) -> Result<Value, S
 /// the page come back as `browse.VERB` (see `browse.rs`); the rest are
 /// plain calls.
 fn parse_browser(verb: &str, rest: &[String]) -> Result<(String, Value), String> {
-    const FLAGS: &[&str] = &["enter", "append", "failed", "clear", "tab", "gone", "dismiss"];
-    const NUMBERS: &[&str] = &["pane", "since", "limit", "timeout"];
+    const FLAGS: &[&str] = &["enter", "append", "failed", "clear", "tab", "gone", "dismiss", "bg"];
+    const NUMBERS: &[&str] = &["pane", "since", "limit", "timeout", "scroll", "max"];
     let mut params = Map::new();
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.iter();
@@ -304,6 +681,12 @@ fn parse_browser(verb: &str, rest: &[String]) -> Result<(String, Value), String>
                 return Err("browser open needs a URL".into());
             }
             "browser.open".to_string()
+        }
+        "read" => {
+            if !positional.is_empty() {
+                return Err("browser read takes no URL; use `deck read URL` to open one".into());
+            }
+            "browse.read".into()
         }
         "console" | "network" | "errors" | "logs" => {
             if !positional.is_empty() {
@@ -424,6 +807,66 @@ fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {
     }
     // `deck run [--name N] [--dir right|down] [--cwd DIR] CMD...`: everything
     // after the flags is the command, flags and all.
+    // `deck read URL [flags]`: flags anywhere, the rest is the URL.
+    if let [read, rest @ ..] = args {
+        if read == "read" {
+            let mut params = Map::new();
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--json" => {
+                        params.insert("json".into(), Value::Bool(true));
+                    }
+                    "--name" | "--scroll" | "--max" | "--timeout" => {
+                        let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
+                        params.insert(a[2..].into(), Value::String(v.clone()));
+                    }
+                    url => {
+                        params.insert("url".into(), Value::String(url.to_string()));
+                    }
+                }
+            }
+            if !params.contains_key("url") {
+                return Err("read needs a URL, e.g. `deck read https://www.reddit.com/r/rust`".into());
+            }
+            return Ok(Some(("browse.read_url".into(), Value::Object(params))));
+        }
+    }
+    // `deck do ACTION NAME…` runs a ⌘K action by its name; `--list` lists them.
+    if let [verb, rest @ ..] = args {
+        if verb == "do" {
+            if rest.is_empty() || rest[0] == "--list" {
+                return Ok(Some(("action.list".into(), Value::Object(Map::new()))));
+            }
+            let mut params = Map::new();
+            params.insert("name".into(), rest.join(" ").into());
+            return Ok(Some(("action.run".into(), Value::Object(params))));
+        }
+    }
+    if let [usage] = args {
+        if usage == "usage" {
+            return Ok(Some(("usage.get".into(), Value::Object(Map::new()))));
+        }
+    }
+    if let [verb, rest @ ..] = args {
+        if verb == "history" || verb == "resume" {
+            let mut params = Map::new();
+            let mut words = Vec::new();
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                if a == "--limit" {
+                    params.insert("limit".into(), it.next().cloned().unwrap_or_default().into());
+                } else {
+                    words.push(a.clone());
+                }
+            }
+            let (method, key) = if verb == "history" { ("thread.history", "query") } else { ("thread.resume", "id") };
+            if !words.is_empty() {
+                params.insert(key.into(), words.join(" ").into());
+            }
+            return Ok(Some((method.into(), Value::Object(params))));
+        }
+    }
     if let [run, rest @ ..] = args {
         if run == "run" {
             let mut params = Map::new();
@@ -476,6 +919,8 @@ fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {
     if !positional.is_empty() {
         let key = match method.as_str() {
             "pane.send" | "task.new" | "task.send" => "text",
+            "pane.key" => "key",
+            "page.open" => "page",
             "browser.open" => "url",
             "browser.eval" => "js",
             "window.shot" => "out",
@@ -493,6 +938,38 @@ mod tests {
 
     fn p(s: &str) -> Result<Option<(String, Value)>, String> {
         parse(&s.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn jobs_history_and_pages_parse() {
+        assert_eq!(
+            p("run --name dev npm start").unwrap(),
+            Some(("pane.run".into(), json!({"name": "dev", "cmd": "npm start"})))
+        );
+        assert_eq!(
+            p("pane key --name dev ctrl+c").unwrap(),
+            Some(("pane.key".into(), json!({"name": "dev", "key": "ctrl+c"})))
+        );
+        assert_eq!(p("usage").unwrap(), Some(("usage.get".into(), json!({}))));
+        assert_eq!(
+            p("history auth bug --limit 5").unwrap(),
+            Some(("thread.history".into(), json!({"query": "auth bug", "limit": "5"})))
+        );
+        assert_eq!(p("resume 9e66").unwrap(), Some(("thread.resume".into(), json!({"id": "9e66"}))));
+        assert_eq!(p("page open packages").unwrap(), Some(("page.open".into(), json!({"page": "packages"}))));
+        assert_eq!(
+            p("read --scroll 2 https://www.reddit.com/r/rust").unwrap(),
+            Some(("browse.read_url".into(), json!({"scroll": "2", "url": "https://www.reddit.com/r/rust"})))
+        );
+        assert!(p("read --json").is_err());
+        assert_eq!(
+            p("browser open --bg --name r https://x.com").unwrap(),
+            Some(("browser.open".into(), json!({"bg": true, "name": "r", "url": "https://x.com"})))
+        );
+        assert_eq!(
+            p("browser read --name r --scroll 1").unwrap(),
+            Some(("browse.read".into(), json!({"name": "r", "scroll": 1})))
+        );
     }
 
     #[test]
