@@ -75,6 +75,9 @@ impl Substrate {
             permission_mode,
             env: Vec::new(),
             allowed_tools: Vec::new(),
+            remote: None,
+            disallowed_tools: Vec::new(),
+            host_only: false,
         }
     }
 }
