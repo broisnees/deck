@@ -28,6 +28,9 @@ pub struct Settings {
     pub scheme: Scheme,
     pub cursor: Cursor,
     pub cursor_blink: bool,
+    /// The emulator new terminals run on. One this build lacks falls back
+    /// to Alacritty.
+    pub engine: Engine,
     /// ⌥ sends Esc+key (Meta) instead of typing ⌥-characters like ∂ or ƒ.
     pub option_as_meta: bool,
     pub search: Search,
@@ -39,6 +42,14 @@ pub struct Settings {
     pub notify_attention: bool,
     /// A notification when an agent finishes a long piece of work.
     pub notify_done: bool,
+    /// The sound for an agent that needs you, one of `notify::SOUNDS`.
+    pub sound_attention: String,
+    /// The sound for an agent that finished.
+    pub sound_done: String,
+    /// The sound for a background job that failed.
+    pub sound_failed: String,
+    /// 0–1.
+    pub sound_volume: f32,
     /// Rewrite chat messages into clear prompts before they are sent.
     pub refine: crate::refine::Mode,
     /// The model that rewrites them, by Claude Code's alias.
@@ -48,6 +59,9 @@ pub struct Settings {
     /// The first launch offered to make deck the default terminal; it asks
     /// once.
     pub asked_default_terminal: bool,
+    /// The first launch offered to give Deck and its background service
+    /// Full Disk Access; it asks once.
+    pub asked_permissions: bool,
     /// Look for a newer deck now and then.
     pub check_updates: bool,
     /// Download a newer deck in the background and put it in place at quit.
@@ -61,6 +75,19 @@ pub struct Settings {
     pub agent_skill: bool,
     /// The strip along the bottom: running commands, pages and dev servers.
     pub status_bar: bool,
+    /// Background jobs (`deck job start`) start again at launch.
+    pub restore_jobs: bool,
+    /// Terminal tabs run in the background service, so quitting Deck
+    /// leaves their shells and agents running.
+    pub keep_terminals: bool,
+    /// Changing the theme also sets coding agents' own (Claude Code's).
+    pub match_agent_themes: bool,
+    /// `deck do ACTION` may run any ⌘K action.
+    pub cli_actions: bool,
+    /// The offer to import from another browser was answered.
+    pub import_offered: bool,
+    /// Pages load without ads and trackers.
+    pub block_ads: bool,
     /// Your shortcuts, by `workspace::SHORTCUTS` id: a key in gpui's form
     /// ("cmd-shift-k"), or "" for none. Absent ones keep Deck's.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -81,21 +108,33 @@ impl Default for Settings {
             scheme: Scheme::default(),
             cursor: Cursor::default(),
             cursor_blink: false,
+            engine: Engine::default(),
             option_as_meta: false,
             search: Search::default(),
             default_agent: None,
             notify_attention: true,
             notify_done: true,
+            sound_attention: "Glass".into(),
+            sound_done: "Pop".into(),
+            sound_failed: "Basso".into(),
+            sound_volume: 0.6,
             refine: crate::refine::Mode::default(),
             refine_model: "haiku".into(),
             auto_retry: true,
             asked_default_terminal: false,
+            asked_permissions: false,
             check_updates: true,
             install_updates: true,
             soften_backgrounds: true,
             complete_menu: true,
             agent_skill: true,
             status_bar: true,
+            restore_jobs: true,
+            keep_terminals: true,
+            match_agent_themes: false,
+            cli_actions: true,
+            import_offered: false,
+            block_ads: true,
             keys: Default::default(),
             routes: Default::default(),
             access: Access::default(),
@@ -228,6 +267,33 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
         let v = ch(a, shift) + (ch(b, shift) - ch(a, shift)) * t;
         acc | ((v.round() as u32) << shift)
     })
+}
+
+/// Which emulator a new terminal runs on (see `term::Engine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Engine {
+    #[default]
+    Alacritty,
+    Ghostty,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 2] = [Engine::Alacritty, Engine::Ghostty];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Engine::Alacritty => "Alacritty",
+            Engine::Ghostty => "Ghostty",
+        }
+    }
+
+    pub fn term(self) -> term::Engine {
+        match self {
+            Engine::Alacritty => term::Engine::Alacritty,
+            Engine::Ghostty => term::Engine::Ghostty,
+        }
+    }
 }
 
 /// The cursor a program gets until it asks for its own shape.
@@ -423,6 +489,8 @@ struct Stored {
     #[serde(deserialize_with = "lenient")]
     cursor_blink: Option<bool>,
     #[serde(deserialize_with = "lenient")]
+    engine: Option<Engine>,
+    #[serde(deserialize_with = "lenient")]
     option_as_meta: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     search: Option<Search>,
@@ -435,6 +503,14 @@ struct Stored {
     #[serde(deserialize_with = "lenient")]
     notify_done: Option<bool>,
     #[serde(deserialize_with = "lenient")]
+    sound_attention: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    sound_done: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    sound_failed: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    sound_volume: Option<f32>,
+    #[serde(deserialize_with = "lenient")]
     refine: Option<crate::refine::Mode>,
     #[serde(deserialize_with = "lenient")]
     refine_model: Option<String>,
@@ -442,6 +518,8 @@ struct Stored {
     auto_retry: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     asked_default_terminal: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    asked_permissions: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     check_updates: Option<bool>,
     #[serde(deserialize_with = "lenient")]
@@ -454,6 +532,18 @@ struct Stored {
     agent_skill: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     status_bar: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    restore_jobs: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    keep_terminals: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    match_agent_themes: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    cli_actions: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    import_offered: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    block_ads: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     keys: Option<std::collections::BTreeMap<String, String>>,
     #[serde(deserialize_with = "lenient")]
@@ -500,12 +590,17 @@ fn from_stored(s: Stored) -> Settings {
         scheme: s.scheme.unwrap_or(d.scheme),
         cursor: s.cursor.unwrap_or(d.cursor),
         cursor_blink: s.cursor_blink.unwrap_or(d.cursor_blink),
+        engine: s.engine.unwrap_or(d.engine),
         option_as_meta: s.option_as_meta.unwrap_or(d.option_as_meta),
         search: s.search.unwrap_or(d.search),
         default_agent: s.default_agent.filter(|a| !a.is_empty()),
         access: s.access.unwrap_or(d.access),
         notify_attention: s.notify_attention.unwrap_or(d.notify_attention),
         notify_done: s.notify_done.unwrap_or(d.notify_done),
+        sound_attention: s.sound_attention.unwrap_or(d.sound_attention),
+        sound_done: s.sound_done.unwrap_or(d.sound_done),
+        sound_failed: s.sound_failed.unwrap_or(d.sound_failed),
+        sound_volume: s.sound_volume.map_or(d.sound_volume, |v| v.clamp(0., 1.)),
         refine: s.refine.unwrap_or(d.refine),
         refine_model: s
             .refine_model
@@ -513,12 +608,19 @@ fn from_stored(s: Stored) -> Settings {
             .unwrap_or(d.refine_model),
         auto_retry: s.auto_retry.unwrap_or(d.auto_retry),
         asked_default_terminal: s.asked_default_terminal.unwrap_or(d.asked_default_terminal),
+        asked_permissions: s.asked_permissions.unwrap_or(d.asked_permissions),
         check_updates: s.check_updates.unwrap_or(d.check_updates),
         install_updates: s.install_updates.unwrap_or(d.install_updates),
         soften_backgrounds: s.soften_backgrounds.unwrap_or(d.soften_backgrounds),
         complete_menu: s.complete_menu.unwrap_or(d.complete_menu),
         agent_skill: s.agent_skill.unwrap_or(d.agent_skill),
         status_bar: s.status_bar.unwrap_or(d.status_bar),
+        restore_jobs: s.restore_jobs.unwrap_or(d.restore_jobs),
+        keep_terminals: s.keep_terminals.unwrap_or(d.keep_terminals),
+        match_agent_themes: s.match_agent_themes.unwrap_or(d.match_agent_themes),
+        cli_actions: s.cli_actions.unwrap_or(d.cli_actions),
+        import_offered: s.import_offered.unwrap_or(d.import_offered),
+        block_ads: s.block_ads.unwrap_or(d.block_ads),
         // A key that does not parse is dropped, so Deck's comes back.
         keys: s
             .keys
@@ -610,22 +712,34 @@ mod tests {
             scheme: Scheme::CatppuccinMocha,
             cursor: Cursor::Bar,
             cursor_blink: true,
+            engine: Engine::Ghostty,
             option_as_meta: true,
             search: Search::Kagi,
             default_agent: Some("codex".into()),
             access: Access::Full,
             notify_attention: false,
             notify_done: true,
+            sound_attention: "Ping".into(),
+            sound_done: "None".into(),
+            sound_failed: "Basso".into(),
+            sound_volume: 0.4,
             refine: crate::refine::Mode::Review,
             refine_model: "sonnet".into(),
             auto_retry: false,
             asked_default_terminal: true,
+            asked_permissions: true,
             check_updates: false,
             install_updates: false,
             soften_backgrounds: false,
             complete_menu: false,
             agent_skill: false,
             status_bar: false,
+            restore_jobs: false,
+            keep_terminals: false,
+            match_agent_themes: false,
+            cli_actions: false,
+            import_offered: true,
+            block_ads: false,
             keys: [("palette".to_string(), "cmd-p".to_string())].into(),
             routes: [
                 ("rewrite".to_string(), "ollama:qwen2.5-coder:7b".to_string()),
