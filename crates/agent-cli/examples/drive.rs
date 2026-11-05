@@ -51,6 +51,9 @@ async fn main() {
         permission_mode: mode,
         env: Vec::new(),
         allowed_tools: Vec::new(),
+        remote: None,
+        disallowed_tools: Vec::new(),
+        host_only: false,
     };
     let adapter = CliAdapter::new(spec);
     let opened = Instant::now();
