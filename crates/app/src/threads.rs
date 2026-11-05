@@ -16,6 +16,8 @@ pub struct Saved {
     pub control: bool,
     pub agent: String,
     pub cwd: PathBuf,
+    /// The SSH host its agent runs on, when not this Mac.
+    pub remote: Option<String>,
     pub full_access: bool,
     /// The model this thread asked for; `None` is the agent's default.
     pub model: Option<String>,
@@ -138,6 +140,27 @@ pub fn write(saved: &Saved) -> std::io::Result<()> {
     let tmp = dir.join(format!(".{}.tmp", saved.id));
     std::fs::write(&tmp, serde_json::to_vec(saved)?)?;
     std::fs::rename(&tmp, &path)
+}
+
+/// Closed threads, from `archive/`.
+pub fn load_archived() -> Vec<Saved> {
+    std::fs::read_dir(dir().join("archive"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| serde_json::from_slice::<Saved>(&std::fs::read(&p).ok()?).ok())
+        .filter(|s| !s.id.is_empty())
+        .collect()
+}
+
+/// Back out of the archive, for a thread reopened.
+pub fn unarchive(id: &str) {
+    let from = dir().join("archive").join(format!("{id}.json"));
+    if from.exists() {
+        let _ = std::fs::rename(&from, dir().join(format!("{id}.json")));
+    }
 }
 
 pub fn archive(id: &str) {
