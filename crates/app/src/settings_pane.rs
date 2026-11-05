@@ -1554,7 +1554,9 @@ impl SettingsPane {
         for (pi, (page, sections)) in titles.iter().enumerate() {
             let page = *page;
             let on = page == self.page && !searching;
-            let open = !self.collapsed.contains(&page);
+            // Only the page you are on shows its sections (all of them while
+            // searching); the others open when chosen.
+            let open = searching || (page == self.page && !self.collapsed.contains(&page));
             let foldable = sections.len() > 1;
             col = col.child(
                 div()
@@ -1562,10 +1564,11 @@ impl SettingsPane {
                     .flex()
                     .items_center()
                     .gap(u(8.))
-                    .h(u(32.))
+                    .h(u(30.))
                     .px(u(8.))
                     .rounded(u(8.))
-                    .text_size(u(13.))
+                    .text_size(u(theme::TEXT_UI))
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .cursor_pointer()
                     .when(on, |d| {
                         d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
@@ -1614,9 +1617,11 @@ impl SettingsPane {
                 let mut kids = div()
                     .flex()
                     .flex_col()
-                    .gap(u(2.))
-                    .ml(u(15.))
-                    .pl(u(10.))
+                    .gap(u(1.))
+                    .mt(u(2.))
+                    .mb(u(6.))
+                    .ml(u(17.))
+                    .pl(u(6.))
                     .border_l_1()
                     .border_color(rgba(theme::hairline()));
                 for (si, title) in sections.iter().enumerate() {
@@ -1628,11 +1633,11 @@ impl SettingsPane {
                             ))
                             .flex()
                             .items_center()
-                            .h(u(32.))
+                            .h(u(26.))
                             .px(u(10.))
-                            .rounded(u(8.))
-                            .text_size(u(theme::TEXT_READ))
-                            .text_color(rgb(theme::text_2()))
+                            .rounded(u(6.))
+                            .text_size(u(theme::TEXT_SMALL))
+                            .text_color(rgb(theme::dim()))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                             .child(*title)
@@ -1978,12 +1983,16 @@ impl SettingsPane {
                 None,
             ),
             group(
-                "Option key",
+                if cfg!(target_os = "macos") { "Option key" } else { "Alt key" },
                 vec![row(
-                    "Use ⌥ as Meta",
+                    if cfg!(target_os = "macos") { "Use ⌥ as Meta" } else { "Use Alt as Meta" },
                     self.toggle("meta", s.option_as_meta, |s, on| s.option_as_meta = on, cx),
                 )
-                .about("⌥B and ⌥F jump by word in the shell, instead of typing ∫ and ƒ.")],
+                .about(if cfg!(target_os = "macos") {
+                    "⌥B and ⌥F jump by word in the shell, instead of typing ∫ and ƒ."
+                } else {
+                    "Alt+B and Alt+F jump by word in the shell, as most Linux terminals do."
+                })],
                 None,
             ),
             group(
