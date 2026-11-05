@@ -208,7 +208,7 @@ pub fn env() -> HashMap<String, String> {
 const SKILL_MARK: &str = "<!-- managed by Deck: edits are kept if you delete this line -->";
 const SKILL: &str = r##"---
 name: deck
-description: Use when running inside Deck (DECK_SOCKET is set). Run dev servers, watchers, tests and other long commands in a terminal pane the user watches live, read their logs and wait for them; open web pages in Deck's browser beside you or in a tab, then read, click, type, screenshot and debug them through their console, errors and network requests.
+description: Use when running inside Deck (DECK_SOCKET is set). Run dev servers, watchers, tests and other long commands in a terminal pane the user watches live or as background jobs in the status bar, read their logs and wait for them; reopen past threads and check usage; read any web page as Markdown with `deck read URL`, even sites that block bots or need the user's sign-in; open web pages in Deck's browser beside you or in a tab, then read, click, type, screenshot and debug them through their console, errors and network requests.
 ---
 <!-- managed by Deck: edits are kept if you delete this line -->
 
@@ -238,6 +238,47 @@ when the text never shows up; look for the error there. Read logs with
 `--lines`, not the whole scrollback. Check `deck pane list` before starting a
 second dev server; if one is running, read its logs instead.
 
+## Background jobs: out of the way, one click from the user
+
+When the user doesn't need to watch it beside you (a dev server for later, a
+watcher, a long build), run it as a background job. It gets a tab in the
+status bar; the user clicks it to see its terminal. Jobs come back after
+Deck relaunches.
+
+```sh
+deck job start --name dev npm run dev     # or: deck run --bg --name dev npm run dev
+deck job wait --name dev --for "ready|Local:" --timeout 90
+deck job logs --name dev --lines 80
+deck job list                             # name, command, running, exit code
+deck job show --name dev                  # open its terminal for the user
+deck job stop --name dev
+deck pane key --name dev ctrl+c           # any key: enter, escape, up, ctrl+c, alt+b
+```
+
+## Deck memory
+
+Notes every coding agent shares, per project or global. Read them at the
+start of work; save what a later session should know and can't read from
+the code (preferences, decisions and why, gotchas).
+
+```sh
+deck memory list                 # this project's and the global ones
+deck memory add "Deploys go through wrangler, never the dashboard"
+deck memory add --global "Prefers pnpm over npm"
+deck memory search deploy
+deck memory forget 3fa9c1
+```
+
+## Threads and usage
+
+```sh
+deck history [QUERY]       # saved chat threads, newest first, with ids
+deck resume ID             # reopen one (an id prefix works)
+deck usage                 # plan limits, this conversation, today's tokens and cost
+```
+
+Check `deck usage` before starting something long when a plan limit is close.
+
 ## The browser
 
 ```sh
@@ -261,6 +302,26 @@ With one page open, or one in your own tab, `--name` can be left out.
 
 Take a fresh `snapshot` after the page changes: element numbers are only
 good until the next one.
+
+## Reading the web: `deck read`
+
+To research, read docs, Reddit, X, GitHub or anything behind a sign-in,
+use `deck read` instead of curl or a fetch tool. It loads the page in a real
+browser page with the user's sign-ins, out of sight (a tab in the status
+bar), and prints it as Markdown. Sites that turn away scripts and bots load
+normally there.
+
+```sh
+deck read https://www.reddit.com/r/rust/top/?t=week          # Markdown on stdout
+deck read --scroll 3 https://www.reddit.com/r/rust/          # load 3 more screens of a feed
+deck read --name docs --max 20000 https://docs.rs/tokio      # keep it as "docs"
+deck browser snapshot --name docs                            # then click, type, read again
+deck browser read --name docs                                # the page as it is now
+deck browser open --bg --name app http://localhost:3000      # any page in the background
+```
+
+Pages stay open under their name until `deck job stop --name NAME`. Reuse a
+name to navigate the same page instead of opening another.
 
 ## Debugging a page
 
@@ -329,6 +390,80 @@ fn skill_dirs(home: &Path) -> Vec<PathBuf> {
     ];
     out.extend(own.iter().filter(|(h, _)| home.join(h).is_dir()).map(|(_, d)| home.join(d)));
     out
+}
+
+/// Set coding agents' own themes to follow Deck's: Claude Code's "auto",
+/// which asks the terminal whether it is dark or light (`CSI ? 996 n`) and
+/// follows each switch live (mode 2031), both of which Deck answers; its
+/// ANSI themes would match the sixteen colours but drop syntax
+/// highlighting. Gemini CLI's "ANSI" / "ANSI Light", OpenCode's "system". Only that one key of each file changes;
+/// agents not installed are left alone. Codex has no theme setting.
+pub fn match_agent_themes(dark: bool) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
+    if claude.is_dir() {
+        set_json_key(&claude.join("settings.json"), &["theme"], "auto");
+    }
+    let gemini = home.join(".gemini");
+    if gemini.is_dir() {
+        set_json_key(&gemini.join("settings.json"), &["ui", "theme"], if dark { "ANSI" } else { "ANSI Light" });
+    }
+    let opencode = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config")).join("opencode");
+    if opencode.is_dir() {
+        // OpenCode 2 reads `cli.json`'s `theme.name`; 1 read `tui.json`.
+        set_json_key(&opencode.join("cli.json"), &["theme", "name"], "system");
+        if opencode.join("tui.json").is_file() {
+            set_json_key(&opencode.join("tui.json"), &["theme"], "system");
+        }
+    }
+}
+
+/// `path`'s JSON with the value at `keys` set to `value`, the rest kept;
+/// a missing file starts empty, one that is not JSON is left alone.
+fn set_json_key(path: &std::path::Path, keys: &[&str], value: &str) {
+    let mut v: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(t) if t.trim().is_empty() => serde_json::json!({}),
+        Ok(t) => match serde_json::from_str(&t) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        Err(_) => serde_json::json!({}),
+    };
+    let mut at = &mut v;
+    for k in &keys[..keys.len() - 1] {
+        if !at.get(*k).is_some_and(|x| x.is_object()) {
+            at[*k] = serde_json::json!({});
+        }
+        at = &mut at[*k];
+    }
+    let last = keys[keys.len() - 1];
+    if at.get(last).and_then(|x| x.as_str()) == Some(value) {
+        return;
+    }
+    at[last] = value.into();
+    if let Ok(out) = serde_json::to_string_pretty(&v) {
+        let tmp = path.with_extension("json.deck-tmp");
+        if std::fs::write(&tmp, out + "\n").is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    #[test]
+    fn nested_keys_set_and_the_rest_kept() {
+        let dir = std::env::temp_dir().join(format!("deck-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        std::fs::write(&p, r#"{"ui":{"hideBanner":true},"model":{"name":"x"}}"#).unwrap();
+        super::set_json_key(&p, &["ui", "theme"], "ANSI");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["ui"]["theme"], "ANSI");
+        assert_eq!(v["ui"]["hideBanner"], true);
+        assert_eq!(v["model"]["name"], "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Put Deck's skill in every agent's skills folder (`on`), or take Deck's
