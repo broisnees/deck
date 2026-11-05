@@ -4,8 +4,10 @@
 //! Settings and the first launch offer to make it deck, and to hand them
 //! back to Terminal.
 
+#[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFRetained, CFString};
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::ptr::NonNull;
 use std::sync::{LazyLock, Mutex};
 
@@ -21,8 +23,10 @@ const TYPES: [&str; 3] = [
 const SCHEMES: [&str; 3] = ["ssh", "telnet", "x-man-page"];
 
 /// Every role (viewer, editor, shell).
+#[cfg(target_os = "macos")]
 const ROLES_ALL: u32 = 0xFFFF_FFFF;
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreServices", kind = "framework")]
 extern "C" {
     fn LSSetDefaultRoleHandlerForContentType(
@@ -38,6 +42,7 @@ extern "C" {
 }
 
 /// Whether deck opens shell scripts now.
+#[cfg(target_os = "macos")]
 pub fn is_default() -> bool {
     let ty = CFString::from_static_str(TYPES[0]);
     // SAFETY: a valid CFString in; the result is a +1 reference or null.
@@ -52,6 +57,7 @@ pub fn is_default() -> bool {
 
 /// Make `bundle_id` (deck, or Terminal to hand it back) the app for shell
 /// scripts and terminal links. Returns how many of them failed.
+#[cfg(target_os = "macos")]
 pub fn set_default(bundle_id: &str) -> usize {
     let handler = CFString::from_str(bundle_id);
     let mut failed = 0;
@@ -70,6 +76,19 @@ pub fn set_default(bundle_id: &str) -> usize {
         }
     }
     failed
+}
+
+/// Off macOS, being the default terminal belongs to the desktop file
+/// (`deck.desktop` with `x-scheme-handler/ssh` and friends), which the
+/// Linux packages install; there is nothing to switch here yet.
+#[cfg(not(target_os = "macos"))]
+pub fn is_default() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_default(_bundle_id: &str) -> usize {
+    TYPES.len() + SCHEMES.len()
 }
 
 // -- opened files and links ---------------------------------------------------------

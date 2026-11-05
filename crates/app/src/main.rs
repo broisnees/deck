@@ -4,6 +4,7 @@
 //! `deck pane list` (and friends), run from a terminal inside it, drives it.
 
 mod account;
+#[cfg_attr(not(target_os = "macos"), path = "other/adblock.rs")]
 mod adblock;
 mod browse;
 mod browser;
@@ -15,11 +16,16 @@ mod code;
 mod complete;
 mod control;
 mod daemon;
+#[cfg_attr(not(target_os = "macos"), path = "other/daemon_menu.rs")]
 mod daemon_menu;
+mod desktop;
 mod favicon;
 mod field;
 mod fuzzy;
+#[cfg_attr(not(target_os = "macos"), path = "other/global.rs")]
 mod global;
+#[cfg(target_os = "linux")]
+mod gtk_loop;
 mod handler;
 mod history;
 mod icon;
@@ -29,6 +35,7 @@ mod kbd;
 mod keys;
 mod launcher;
 mod local;
+#[cfg_attr(not(target_os = "macos"), path = "other/lock.rs")]
 mod lock;
 mod markdown;
 mod memory;
@@ -36,6 +43,7 @@ mod host_mcp;
 mod mcp;
 mod menu;
 mod net;
+#[cfg_attr(not(target_os = "macos"), path = "other/notify.rs")]
 mod notify;
 mod palette;
 mod pasteboard;
@@ -50,6 +58,7 @@ mod session;
 mod settings;
 mod settings_pane;
 mod shell;
+#[cfg_attr(not(target_os = "macos"), path = "other/shot.rs")]
 mod shot;
 mod snippets;
 mod syntax;
@@ -64,6 +73,8 @@ mod usage;
 mod usage_page;
 mod packages;
 mod workspace;
+#[cfg(target_os = "linux")]
+mod x11;
 
 use gpui::prelude::*;
 use gpui::{
@@ -133,6 +144,8 @@ fn main() {
     // every shell and agent still where it was.
     app.on_reopen(|cx| cx.activate(true));
     app.run(move |cx: &mut App| {
+        #[cfg(target_os = "linux")]
+        gtk_loop::start(cx);
         theme::add_fonts(cx);
         let skill = settings::load().agent_skill;
         std::thread::spawn(move || {
@@ -172,14 +185,23 @@ fn main() {
                 // Scripted checks open a window that does not take the
                 // keyboard from whatever the user is typing in.
                 focus: !background,
+                // Wayland's app id and X11's class: what the compositor's
+                // window rules and the desktop file match on.
+                app_id: Some("deck".into()),
                 ..Default::default()
             },
             |window, cx| {
                 // Closing the window hides deck rather than quitting it, so
                 // agents at work and running commands carry on; ⌘Q quits.
+                // gpui can't hide an app off macOS, so there the window
+                // closes; terminals and jobs live on in the service.
                 window.on_window_should_close(cx, |_, cx| {
-                    cx.hide();
-                    false
+                    if cfg!(target_os = "macos") {
+                        cx.hide();
+                        false
+                    } else {
+                        true
+                    }
                 });
                 cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx))
             },

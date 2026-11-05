@@ -420,6 +420,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "System", kind = "dylib")]
 extern "C" {
     fn CCKeyDerivationPBKDF(
@@ -451,6 +452,7 @@ extern "C" {
 
 /// Chromium's cookie key on macOS: PBKDF2-SHA1 of the keychain password,
 /// salt "saltysalt", 1003 rounds, 16 bytes.
+#[cfg(target_os = "macos")]
 fn derive_key(password: &[u8]) -> Option<[u8; 16]> {
     let mut key = [0u8; 16];
     let salt = b"saltysalt";
@@ -461,7 +463,19 @@ fn derive_key(password: &[u8]) -> Option<[u8; 16]> {
     (rc == 0).then_some(key)
 }
 
+/// Chromium's Linux and Windows stores are not read yet.
+#[cfg(not(target_os = "macos"))]
+fn derive_key(_password: &[u8]) -> Option<[u8; 16]> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn decrypt(_key: &[u8; 16], _data: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
 /// AES-128-CBC with an IV of sixteen spaces and PKCS#7 padding.
+#[cfg(target_os = "macos")]
 fn decrypt(key: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     let iv = [b' '; 16];
     let mut out = vec![0u8; data.len() + 16];
@@ -477,7 +491,11 @@ fn decrypt(key: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Hand the cookies to WebKit's default store, the one Deck's pages use.
-/// Main thread only.
+/// Main thread only. Off macOS pages don't run yet, so there is no store.
+#[cfg(not(target_os = "macos"))]
+pub fn install_cookies(_jar: &[Cookie]) {}
+
+#[cfg(target_os = "macos")]
 pub fn install_cookies(jar: &[Cookie]) {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -554,6 +572,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn chromium_cookies_decrypt() {
         // Encrypt with the same scheme, then read it back.
         let key = derive_key(b"peanuts").unwrap();

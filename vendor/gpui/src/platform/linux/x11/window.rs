@@ -249,6 +249,8 @@ pub struct Callbacks {
 
 pub struct X11WindowState {
     pub destroyed: bool,
+    /// Deck patch: the child window gpui draws into (see `create_canvas`).
+    canvas: xproto::Window,
     client: X11ClientStatePtr,
     executor: ForegroundExecutor,
     atoms: XcbAtoms,
@@ -311,15 +313,79 @@ impl rwh::HasDisplayHandle for RawWindow {
     }
 }
 
+// Deck patch: these were `unimplemented!()`, so anything that embeds a
+// native view in the window (wry's WebKitGTK pages, as X11 children)
+// panicked. The window's own id and the client's connection are all
+// either needs.
 impl rwh::HasWindowHandle for X11Window {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-        unimplemented!()
+        if self.0.x_window == 0 {
+            return Err(rwh::HandleError::Unavailable);
+        }
+        // Xlib's form: an X window id is the same whichever library made
+        // it, and wry accepts only this one.
+        let handle = rwh::XlibWindowHandle::new(self.0.x_window as std::ffi::c_ulong);
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(handle.into()) })
     }
 }
 impl rwh::HasDisplayHandle for X11Window {
     fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        unimplemented!()
+        let connection =
+            as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(&*self.0.xcb);
+        let Some(connection) = NonNull::new(connection as *mut c_void) else {
+            return Err(rwh::HandleError::Unavailable);
+        };
+        let handle = rwh::XcbDisplayHandle::new(Some(connection), 0);
+        Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
     }
+}
+
+/// Deck patch: gpui draws into a child window that fills the top-level one,
+/// not into the top-level window itself. XWayland hands a top-level
+/// window's presented buffer straight to the compositor, which leaves out
+/// any child windows (Deck's pages are WebKitGTK windows embedded as X11
+/// children). A child's buffer is composited into its top-level instead,
+/// so pages stacked above the canvas show. XWayland passes a child through
+/// too when it exactly covers its top-level, so the canvas is a pixel short
+/// (`canvas_height`). The canvas selects no input:
+/// pointer and key events go on to the top-level window, where gpui
+/// listens for them.
+fn create_canvas(
+    xcb: &XCBConnection,
+    parent: xproto::Window,
+    visual: &Visual,
+    colormap: xproto::Colormap,
+    border: u32,
+    size: Size<DevicePixels>,
+) -> anyhow::Result<xproto::Window> {
+    let canvas = xcb.generate_id()?;
+    check_reply(
+        || "X11 CreateWindow for the canvas failed.",
+        xcb.create_window(
+            visual.depth,
+            canvas,
+            parent,
+            0,
+            0,
+            size.width.0.max(1) as u16,
+            canvas_height(size.height.0),
+            0,
+            xproto::WindowClass::INPUT_OUTPUT,
+            visual.id,
+            &xproto::CreateWindowAux::new()
+                .border_pixel(border)
+                .colormap(colormap)
+                .background_pixmap(x11rb::NONE),
+        ),
+    )?;
+    check_reply(|| "X11 MapWindow for the canvas failed.", xcb.map_window(canvas))?;
+    Ok(canvas)
+}
+
+/// A pixel less than the window, so XWayland never takes the canvas for
+/// the whole window (see `create_canvas`).
+fn canvas_height(window_height: i32) -> u16 {
+    (window_height - 1).max(1) as u16
 }
 
 pub(crate) fn xcb_flush(xcb: &XCBConnection) {
@@ -402,13 +468,11 @@ impl X11WindowState {
 
         let visual_set = find_visuals(xcb, x_screen_index);
 
-        let visual = match visual_set.transparent {
-            Some(visual) => visual,
-            None => {
-                log::warn!("Unable to find a transparent visual",);
-                visual_set.inherit
-            }
-        };
+        // Deck patch: the screen's own (opaque) visual. With the 32-bit one
+        // XWayland composites by the alpha channel, which the renderer leaves
+        // undefined for an opaque surface, and the window came out invisible
+        // under Hyprland. Deck's glass themes are opaque here as a result.
+        let visual = visual_set.inherit;
         log::info!("Using {:?}", visual);
 
         let colormap = if visual.colormap != 0 {
@@ -426,6 +490,9 @@ impl X11WindowState {
         let win_aux = xproto::CreateWindowAux::new()
             // https://stackoverflow.com/questions/43218127/x11-xlib-xcb-creating-a-window-requires-border-pixel-if-specifying-colormap-wh
             .border_pixel(visual_set.black_pixel)
+            // Deck patch: the canvas (see `create_canvas`) leaves a pixel row
+            // of this window bare; a background keeps stale pixels out of it.
+            .background_pixel(visual_set.black_pixel)
             .colormap(colormap)
             .event_mask(
                 xproto::EventMask::EXPOSURE
@@ -475,6 +542,8 @@ impl X11WindowState {
                 &win_aux,
             ),
         )?;
+
+        let canvas = create_canvas(xcb, x_window, &visual, colormap, visual_set.black_pixel, bounds.size)?;
 
         // Collect errors during setup, so that window can be destroyed on failure.
         let setup_result = maybe!({
@@ -648,13 +717,13 @@ impl X11WindowState {
                         xcb,
                     ) as *mut _,
                     screen_id: x_screen_index,
-                    window_id: x_window,
+                    window_id: canvas,
                     visual_id: visual.id,
                 };
                 let config = BladeSurfaceConfig {
                     // Note: this has to be done after the GPU init, or otherwise
                     // the sizes are immediately invalidated.
-                    size: query_render_extent(xcb, x_window)?,
+                    size: query_render_extent(xcb, canvas)?,
                     // We set it to transparent by default, even if we have client-side
                     // decorations, since those seem to work on X11 even without `true` here.
                     // If the window appearance changes, then the renderer will get updated
@@ -667,6 +736,7 @@ impl X11WindowState {
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
             Ok(Self {
+                canvas,
                 client,
                 executor,
                 display,
@@ -1090,7 +1160,17 @@ impl X11WindowStatePtr {
                 state.bounds = bounds;
             }
 
-            let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
+            let window_size = query_render_extent(&self.xcb, self.x_window)?;
+            check_reply(
+                || "X11 ConfigureWindow for the canvas failed.",
+                self.xcb.configure_window(
+                    state.canvas,
+                    &xproto::ConfigureWindowAux::new()
+                        .width(window_size.width)
+                        .height(canvas_height(window_size.height as i32) as u32),
+                ),
+            )?;
+            let gpu_size = query_render_extent(&self.xcb, state.canvas)?;
             if true {
                 state.renderer.update_drawable_size(size(
                     DevicePixels(gpu_size.width as i32),
@@ -1351,10 +1431,13 @@ impl PlatformWindow for X11Window {
     }
 
     fn set_app_id(&mut self, app_id: &str) {
-        let mut data = Vec::with_capacity(app_id.len() * 2 + 1);
+        let mut data = Vec::with_capacity(app_id.len() * 2 + 2);
         data.extend(app_id.bytes()); // instance https://unix.stackexchange.com/a/494170
         data.push(b'\0');
         data.extend(app_id.bytes()); // class
+        // Deck patch: both strings end in a NUL, as ICCCM has it; without the
+        // last one the compositor read the class as "dec".
+        data.push(b'\0');
 
         check_reply(
             || "X11 ChangeProperty8 for WM_CLASS failed.",

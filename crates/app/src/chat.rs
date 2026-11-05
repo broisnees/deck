@@ -1963,7 +1963,7 @@ impl ChatPane {
                     div()
                         .flex_none()
                         .w(u(14.))
-                        .font_family(theme::MONO)
+                        .font_family(theme::mono())
                         .text_size(u(11.))
                         .text_color(rgb(theme::dim()))
                         .child(format!("{}", i + 1)),
@@ -2602,24 +2602,28 @@ impl ChatPane {
                 .px(u(16.))
                 .pt(u(8.))
                 .child(
+                    // A small pill sized to the question, floating over the
+                    // thread: what this part answers, and a way back to it.
                     div()
                         .id("sticky-prompt")
                         .flex()
                         .items_center()
-                        .gap(u(8.))
-                        .max_w(u(720.))
-                        .w_full()
-                        .h(u(32.))
-                        .px(u(12.))
-                        .rounded(u(8.))
-                        .bg(rgb(theme::raised()))
+                        .gap(u(6.))
+                        .max_w(u(520.))
+                        .min_w_0()
+                        .h(u(28.))
+                        .pl(u(10.))
+                        .pr(u(12.))
+                        .rounded_full()
+                        .bg(rgb(theme::menu()))
                         .border_1()
-                        .border_color(rgba(theme::hairline()))
-                        .text_size(u(12.5))
+                        .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+                        .shadow_md()
+                        .text_size(u(12.))
                         .cursor_pointer()
-                        .hover(|s| s.border_color(rgba(theme::input_edge())))
-                        .child(icon(Icon::ArrowUp, 12., theme::dim()))
-                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text_2())).child(first))
+                        .hover(|s| s.bg(rgb(theme::raised())))
+                        .child(icon(Icon::ArrowUp, 11., theme::dim()))
+                        .child(div().min_w_0().one_line().text_color(rgb(theme::text_2())).child(first))
                         .on_click(cx.listener(move |c, _, _, cx| {
                             c.list.scroll_to(gpui::ListOffset { item_ix: asked, offset_in_item: px(0.) });
                             cx.notify();
@@ -2849,7 +2853,7 @@ impl ChatPane {
                                 }),
                             )
                             .child({
-                                let runs = plain_runs(text.len(), theme::UI, theme::text());
+                                let runs = plain_runs(text.len(), theme::ui(), theme::text());
                                 let (t, rec) = self.unit_text(text.into(), runs, "\n\n", "");
                                 selectable(t.into_any_element(), rec)
                             }),
@@ -3408,7 +3412,7 @@ impl ChatPane {
                     div()
                         .w_full()
                         .one_line()
-                        .font_family(theme::MONO)
+                        .font_family(theme::mono())
                         .text_size(u(11.5))
                         .text_color(rgb(if running {
                             theme::text_2()
@@ -3445,7 +3449,7 @@ impl ChatPane {
                     d.child(
                         div()
                             .flex_none()
-                            .font_family(theme::MONO)
+                            .font_family(theme::mono())
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(step_duration(took)),
@@ -3587,7 +3591,7 @@ impl ChatPane {
                             .flex()
                             .flex_1()
                             .min_w_0()
-                            .font_family(theme::MONO)
+                            .font_family(theme::mono())
                             .text_size(u(11.5))
                             .child(div().flex_none().text_color(rgb(theme::text())).child(name))
                             .child(
@@ -4376,6 +4380,9 @@ impl ChatPane {
                     .justify_center()
                     .text_size(u(11.))
                     .text_color(rgb(theme::dim()))
+                    // Quiet until looked at: the keys are there when needed,
+                    // not a second toolbar under the composer.
+                    .opacity(0.75)
                     .child(if self.refining.is_some() {
                         crate::icon::shimmer("refining", hint)
                     } else {
@@ -5256,7 +5263,7 @@ impl ChatPane {
                     .overflow_x_scroll()
                     .px(u(12.))
                     .pb(u(10.))
-                    .font_family(theme::MONO)
+                    .font_family(theme::mono())
                     .text_size(u(12.))
                     .line_height(u(18.))
                     .text_color(rgb(theme::text()))
@@ -5265,9 +5272,9 @@ impl ChatPane {
                         let runs = match crate::syntax::for_lang(lang) {
                             Some(grammar) => crate::syntax::runs(
                                 &crate::syntax::spans(id, grammar, code),
-                                theme::MONO,
+                                theme::mono(),
                             ),
-                            None => plain_runs(code.len(), theme::MONO, theme::text()),
+                            None => plain_runs(code.len(), theme::mono(), theme::text()),
                         };
                         let (t, rec) = self.unit_text(code.to_string().into(), runs, "\n\n", "");
                         selectable(t.into_any_element(), rec)
@@ -5334,7 +5341,7 @@ fn diff_stat(added: usize, removed: usize) -> AnyElement {
         .flex_none()
         .flex()
         .gap(u(4.))
-        .font_family(theme::MONO)
+        .font_family(theme::mono())
         .text_size(u(11.))
         .when(added > 0, |d| {
             d.child(
@@ -5445,7 +5452,7 @@ pub fn compact_count(n: u64) -> String {
 /// linked and inline-code stretches over it.
 fn text_runs(spans: &Spans, color: u32, weight: FontWeight) -> Vec<TextRun> {
     let base = |st: markdown::Style| {
-        let mut f = gpui::font(if st.code { theme::MONO } else { theme::UI });
+        let mut f = gpui::font(if st.code { theme::mono() } else { theme::ui() });
         f.weight = if st.bold {
             FontWeight::SEMIBOLD
         } else {
@@ -5809,7 +5816,7 @@ fn render_command(command: &str, output: &str, failed: bool, running: bool) -> A
         } else {
             theme::hairline()
         }))
-        .font_family(theme::MONO)
+        .font_family(theme::mono())
         .text_size(u(11.5))
         .line_height(u(17.))
         .overflow_x_hidden();
@@ -5997,7 +6004,7 @@ fn render_output(text: &str, diff: bool, keep: usize) -> AnyElement {
         .py(u(8.))
         .rounded(u(8.))
         .bg(rgb(theme::raised()))
-        .font_family(theme::MONO)
+        .font_family(theme::mono())
         .text_size(u(11.5))
         .line_height(u(17.));
     if skip > 0 {
@@ -6044,7 +6051,7 @@ fn render_excerpt(key: &str, grammar: &'static crate::syntax::Grammar, text: &st
         .py(u(8.))
         .rounded(u(8.))
         .bg(rgb(theme::raised()))
-        .font_family(theme::MONO)
+        .font_family(theme::mono())
         .text_size(u(11.5))
         .line_height(u(17.));
     if skip > 0 {
@@ -6061,8 +6068,8 @@ fn render_excerpt(key: &str, grammar: &'static crate::syntax::Grammar, text: &st
             .flatten()
             .map(|(range, kind)| (range.len(), *kind))
             .collect();
-        let mut runs = plain_runs(numbers[i], theme::MONO, theme::dim());
-        runs.extend(crate::syntax::runs(&kinds, theme::MONO));
+        let mut runs = plain_runs(numbers[i], theme::mono(), theme::dim());
+        runs.extend(crate::syntax::runs(&kinds, theme::mono()));
         col = col.child(
             div()
                 .whitespace_nowrap()
@@ -6463,7 +6470,7 @@ mod tests {
         assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), s.text.len());
         let code = runs
             .iter()
-            .find(|r| r.font.family.as_ref() == theme::MONO)
+            .find(|r| r.font.family.as_ref() == theme::mono())
             .unwrap();
         assert_eq!(code.len, "code".len());
         assert!(runs.iter().any(|r| r.underline.is_some()));

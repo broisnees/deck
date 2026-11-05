@@ -245,7 +245,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
         ["cmd-i"],
         ToggleInspector
     ),
-    shortcut!("zoom-in", "Zoom in", "Window", ["cmd-=", "cmd-+"], ZoomIn),
+    shortcut!("zoom-in", "Zoom in", "Window", ["cmd-=", "cmd-+", "cmd-shift-="], ZoomIn),
     shortcut!("zoom-out", "Zoom out", "Window", ["cmd--"], ZoomOut),
     shortcut!("zoom-reset", "Actual size", "Window", ["cmd-0"], ZoomReset),
     shortcut!("lock", "Lock Deck", "Window", ["cmd-shift-l"], LockDeck),
@@ -334,49 +334,59 @@ pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
         .filter(|s| s.context.is_none())
         .flat_map(|s| s.keys(mine).into_iter().map(str::to_string))
         .filter(|k| !matches!(k.as_str(), "cmd-c" | "cmd-v" | "cmd-x" | "cmd-a" | "cmd-z" | "cmd-shift-z"))
+        // As this platform binds them (Ctrl+Shift off macOS).
+        .map(|k| crate::keys::native(&k, crate::keys::is_zoom(&k)))
         .collect();
     crate::browser::set_forward_keys(page_keys);
     cx.clear_key_bindings();
-    let mut keys = Vec::new();
+    type Bind = fn(&str, Option<&str>) -> KeyBinding;
+    let mut wanted: Vec<(String, Option<&'static str>, Bind)> = Vec::new();
     for s in SHORTCUTS {
         for k in s.keys(mine) {
-            // A key settings.json holds that does not parse is skipped, not
-            // a crash.
-            if gpui::Keystroke::parse(k).is_ok() {
-                keys.push((s.bind)(k, s.context));
-            }
+            wanted.push((k.to_string(), s.context, s.bind));
         }
     }
-    keys.extend([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-f", Find, Some("Terminal")),
-        KeyBinding::new("cmd-g", FindNext, Some("Terminal")),
-        KeyBinding::new("cmd-shift-g", FindPrevious, Some("Terminal")),
+    let fixed: [(&str, Option<&'static str>, Bind); 25] = [
+        ("cmd-q", None, |k, c| KeyBinding::new(k, Quit, c)),
+        ("cmd-f", Some("Terminal"), |k, c| KeyBinding::new(k, Find, c)),
+        ("cmd-g", Some("Terminal"), |k, c| KeyBinding::new(k, FindNext, c)),
+        ("cmd-shift-g", Some("Terminal"), |k, c| KeyBinding::new(k, FindPrevious, c)),
         // Anywhere else, find goes to the focused page.
-        KeyBinding::new("cmd-f", Find, None),
-        KeyBinding::new("cmd-g", FindNext, None),
-        KeyBinding::new("cmd-shift-g", FindPrevious, None),
-    ]);
-    for ctx in ["Terminal", "Field"] {
-        keys.push(KeyBinding::new("cmd-c", Copy, Some(ctx)));
-        keys.push(KeyBinding::new("cmd-v", Paste, Some(ctx)));
+        ("cmd-f", None, |k, c| KeyBinding::new(k, Find, c)),
+        ("cmd-g", None, |k, c| KeyBinding::new(k, FindNext, c)),
+        ("cmd-shift-g", None, |k, c| KeyBinding::new(k, FindPrevious, c)),
+        ("cmd-c", Some("Terminal"), |k, c| KeyBinding::new(k, Copy, c)),
+        ("cmd-v", Some("Terminal"), |k, c| KeyBinding::new(k, Paste, c)),
+        ("cmd-c", Some("Field"), |k, c| KeyBinding::new(k, Copy, c)),
+        ("cmd-v", Some("Field"), |k, c| KeyBinding::new(k, Paste, c)),
+        ("cmd-x", Some("Field"), |k, c| KeyBinding::new(k, Cut, c)),
+        ("cmd-a", Some("Field"), |k, c| KeyBinding::new(k, SelectAll, c)),
+        ("cmd-a", Some("Terminal"), |k, c| KeyBinding::new(k, SelectAll, c)),
+        ("cmd-z", Some("Field"), |k, c| KeyBinding::new(k, Undo, c)),
+        ("cmd-shift-z", Some("Field"), |k, c| KeyBinding::new(k, Redo, c)),
+        ("cmd-1", None, |k, c| KeyBinding::new(k, Tab1, c)),
+        ("cmd-2", None, |k, c| KeyBinding::new(k, Tab2, c)),
+        ("cmd-3", None, |k, c| KeyBinding::new(k, Tab3, c)),
+        ("cmd-4", None, |k, c| KeyBinding::new(k, Tab4, c)),
+        ("cmd-5", None, |k, c| KeyBinding::new(k, Tab5, c)),
+        ("cmd-6", None, |k, c| KeyBinding::new(k, Tab6, c)),
+        ("cmd-7", None, |k, c| KeyBinding::new(k, Tab7, c)),
+        ("cmd-8", None, |k, c| KeyBinding::new(k, Tab8, c)),
+        ("cmd-9", None, |k, c| KeyBinding::new(k, Tab9, c)),
+    ];
+    wanted.extend(fixed.into_iter().map(|(k, c, b)| (k.to_string(), c, b)));
+    let mut keys = Vec::new();
+    for (k, ctx, bind) in wanted {
+        // Text editing and zoom are plain Ctrl off macOS; Deck's other
+        // shortcuts take Ctrl+Shift there (see `keys::native`).
+        let plain = ctx == Some("Field") || crate::keys::is_zoom(&k);
+        let k = crate::keys::native(&k, plain);
+        // A key settings.json holds that does not parse is skipped, not
+        // a crash.
+        if gpui::Keystroke::parse(&k).is_ok() {
+            keys.push(bind(&k, ctx));
+        }
     }
-    keys.push(KeyBinding::new("cmd-x", Cut, Some("Field")));
-    keys.push(KeyBinding::new("cmd-a", SelectAll, Some("Field")));
-    keys.push(KeyBinding::new("cmd-a", SelectAll, Some("Terminal")));
-    keys.push(KeyBinding::new("cmd-z", Undo, Some("Field")));
-    keys.push(KeyBinding::new("cmd-shift-z", Redo, Some("Field")));
-    keys.extend([
-        KeyBinding::new("cmd-1", Tab1, None),
-        KeyBinding::new("cmd-2", Tab2, None),
-        KeyBinding::new("cmd-3", Tab3, None),
-        KeyBinding::new("cmd-4", Tab4, None),
-        KeyBinding::new("cmd-5", Tab5, None),
-        KeyBinding::new("cmd-6", Tab6, None),
-        KeyBinding::new("cmd-7", Tab7, None),
-        KeyBinding::new("cmd-8", Tab8, None),
-        KeyBinding::new("cmd-9", Tab9, None),
-    ]);
     cx.bind_keys(keys);
     // Menus are not decoration here: AppKit routes ⌘ shortcuts through them,
     // so they keep working while a webview holds the keyboard.
@@ -1364,7 +1374,15 @@ impl Workspace {
                 let mut session: Option<(String, u32)> = None;
                 if let Some((name, pid, _)) = reattach {
                     session = Some((name, pid));
-                } else if self.settings.keep_terminals && attach_cmd.is_some() && crate::daemon::ask(&json!({ "op": "ping" })).is_ok() {
+                // A pane that only shows a background job (`deck job
+                // attach`) is not kept as a session of its own: the job is
+                // already the service's, and a kept viewer came back as one
+                // more terminal tab after every relaunch.
+                } else if self.settings.keep_terminals
+                    && attach_cmd.is_some()
+                    && !cmd.as_deref().is_some_and(|c| c.contains(" job attach "))
+                    && crate::daemon::ask(&json!({ "op": "ping" })).is_ok()
+                {
                     let name = format!("tab-{}", &token[..12.min(token.len())]);
                     let mut job_env = crate::daemon::job_env();
                     job_env.extend(env.clone());
@@ -3057,12 +3075,13 @@ impl Workspace {
         q.split_whitespace().all(|w| hay.contains(w))
     }
 
-    /// A click on a sidebar row: ⌘ adds it to (or takes it from) the
-    /// selection, ⇧ selects the rows between the last one and it; a plain
-    /// click clears the selection and opens the row.
+    /// A click on a sidebar row: ⌘ (Ctrl off macOS) adds it to (or takes
+    /// it from) the selection, ⇧ selects the rows between the last one and
+    /// it; a plain click clears the selection and opens the row.
     fn row_click(&mut self, ix: usize, m: gpui::Modifiers, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.tabs.get(ix).map(|t| t.leaves()[0]) else { return };
-        if m.platform {
+        let toggle = if cfg!(target_os = "macos") { m.platform } else { m.control };
+        if toggle {
             if !self.picked.remove(&key) {
                 self.picked.insert(key);
             }
@@ -5779,6 +5798,9 @@ impl Workspace {
 
     /// Once, on a first launch: offer to make deck the Mac's terminal.
     fn offer_default_terminal(&mut self, cx: &mut Context<Self>) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
         if self.settings.asked_default_terminal || crate::handler::is_default() {
             return;
         }
@@ -5819,7 +5841,7 @@ impl Workspace {
     /// main thread; it may still be starting.
     fn offer_permissions(&mut self, cx: &mut Context<Self>) {
         use crate::privacy::{Permission, State};
-        if self.settings.asked_permissions || self.notice.is_some() {
+        if !cfg!(target_os = "macos") || self.settings.asked_permissions || self.notice.is_some() {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -7713,6 +7735,18 @@ impl Workspace {
             })
             .collect();
         self.daemon_jobs = jobs;
+        // A finished job's terminal keeps its output but loses its cursor.
+        for (name, id) in &self.named {
+            let ended = self.daemon_jobs.iter().any(|j| &j.name == name && j.exit.is_some());
+            if let Some(PaneKind::Terminal(t)) = self.panes.get(id).map(|p| &p.kind) {
+                t.update(cx, |t, cx| {
+                    if t.ended != ended {
+                        t.ended = ended;
+                        cx.notify();
+                    }
+                });
+            }
+        }
         for id in gone {
             self.named.retain(|_, v| *v != id);
             self.close_pane(id, window, cx);
@@ -8504,6 +8538,22 @@ impl Workspace {
         let body = view
             .cached(StyleRefinement::default().size_full())
             .into_any_element();
+        // A job's command that has finished: its output above, how it ended
+        // and what next below.
+        let ended = match pane.kind {
+            PaneKind::Terminal(_) => self.daemon_job(id).and_then(|j| Some((j.name.clone(), j.exit?))),
+            _ => None,
+        };
+        let body = match ended {
+            Some((name, code)) => div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(body))
+                .child(self.render_exit_bar(id, name, code, cx))
+                .into_any_element(),
+            None => body,
+        };
         div()
             .relative()
             .size_full()
@@ -8538,6 +8588,46 @@ impl Workspace {
                 }),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    /// Under a finished job's output: whether it worked, and Restart or
+    /// Close (which forgets the job).
+    fn render_exit_bar(&self, id: PaneId, name: String, code: i32, cx: &mut Context<Self>) -> AnyElement {
+        let ok = code == 0;
+        let tone = if ok { theme::dim() } else { theme::DANGER };
+        let action = |eid: &'static str, label: &'static str, strong: bool| {
+            div()
+                .id(eid)
+                .flex()
+                .items_center()
+                .h(u(24.))
+                .px(u(10.))
+                .rounded(u(6.))
+                .text_size(u(12.))
+                .cursor_pointer()
+                .when(strong, |d| d.bg(rgb(theme::surface())).text_color(rgb(theme::text())).hover(|s| s.bg(rgb(theme::row_hover()))))
+                .when(!strong, |d| d.text_color(rgb(theme::text_2())).hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(8.))
+            .h(u(36.))
+            .px(u(12.))
+            .border_t_1()
+            .border_color(rgba(theme::hairline()))
+            .text_size(u(12.))
+            .child(icon(if ok { Icon::Check } else { Icon::Close }, 13., tone))
+            .child(div().text_color(rgb(tone)).child(if ok { "Finished".to_string() } else { format!("Failed with exit code {code}") }))
+            .child(div().flex_1())
+            .child(action("exit-restart", "Restart", true).on_click(cx.listener(move |_, _, _, cx| {
+                let n = name.clone();
+                cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
+            })))
+            .child(action("exit-close", "Close", false).on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))))
             .into_any_element()
     }
 
@@ -8679,7 +8769,8 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_1()
-            .gap(u(2.))
+            // Room between rows, so a row's fill never meets its neighbour's.
+            .gap(u(4.))
             .overflow_y_scroll()
             .px(u(theme::GUTTER))
             .pb(u(theme::GUTTER))
@@ -8754,11 +8845,12 @@ impl Workspace {
             .child(
                 // The traffic lights live here; the native titlebar under it
                 // is the drag handle. Real pixels: the lights do not zoom.
+                // Elsewhere there are no lights to clear: the buttons lead.
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .justify_end()
+                    .when(cfg!(target_os = "macos"), |d| d.justify_end())
                     .h(px(theme::TITLEBAR_PX))
                     .px(u(theme::GUTTER))
                     .on_mouse_down(MouseButton::Left, |ev, window, _| {
@@ -8818,8 +8910,15 @@ impl Workspace {
             self.focused().is_some_and(|id| matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Page(_, kk)) if *kk == k))
         };
         let tool = |id: &'static str, glyph: Icon, on: bool| {
+            let tip: &'static str = match id {
+                "foot-packages" => "Packages",
+                "foot-usage" => "Usage",
+                "foot-settings" => "Settings",
+                _ => "",
+            };
             div()
                 .id(id)
+                .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| Tip::view(tip, cx)))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -8837,8 +8936,15 @@ impl Workspace {
         };
         let glance = self.usage_glance(cx);
         let count = |id: &'static str, mark: AnyElement, n: usize| {
+            let tip: &'static str = match id {
+                "foot-working" => "Working",
+                "foot-waiting" => "Waiting on you",
+                "foot-done" => "Done, not yet seen",
+                _ => "",
+            };
             div()
                 .id(id)
+                .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| Tip::view(tip, cx)))
                 .flex()
                 .items_center()
                 .gap(u(4.))
@@ -9233,8 +9339,10 @@ impl Workspace {
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
         let mut out = Vec::new();
         let mut last = None;
+        // One day's rows need no day over them: "Recent" says it.
+        let days = rows.iter().map(|r| r.0).collect::<std::collections::BTreeSet<_>>().len();
         for &(bucket, _, ix, thread, project) in &rows {
-            if last != Some(bucket) {
+            if days > 1 && last != Some(bucket) {
                 let first = last.is_none();
                 last = Some(bucket);
                 let n = rows.iter().filter(|r| r.0 == bucket).count();
@@ -9445,8 +9553,17 @@ impl Workspace {
             .and_then(|p| p.agent.as_ref())
             .and_then(|(cmd, _)| AGENTS.iter().find(|a| a.cmd == *cmd))
             .map(|a| a.name.to_string());
+        // An idle shell says what it ran last, so shells in one folder are
+        // told apart ("deck · cargo build").
+        let last = t
+            .job()
+            .filter(|b| !b.running())
+            .and_then(|b| b.command)
+            .map(|c| c.lines().next().unwrap_or("").trim().chars().take(40).collect::<String>())
+            .filter(|c| !c.is_empty());
         let sub = match (&running, place) {
             _ if agent.is_some() => agent.unwrap_or_default(),
+            (None, _) if last.is_some() => last.unwrap_or_default(),
             (Some(_), Some(p)) => p.label(),
             (None, Some(p)) if !p.sub.is_empty() && title != p.sub => p.label(),
             _ => "Terminal".into(),
@@ -9629,7 +9746,7 @@ impl Workspace {
                     // else, in Recent where no header names it, the project.
                     .children(
                         if working || wants { Some(who.to_string()) } else { place.map(str::to_string) }
-                            .filter(|p| !p.is_empty())
+                            .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case(&self.pane_title(tab.focused, cx)))
                             .map(|p| {
                                 div().flex_shrink().min_w_0().max_w(u(150.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p)
                             }),
@@ -9772,7 +9889,14 @@ impl Workspace {
             (Some(s), n) if n > 1 => Some(format!("{s} · {n} panes").into()),
             (s, _) => s,
         };
+        // A shell's own line (what it ran last) when its title is already
+        // the project's name; else the project.
+        let shell_sub = shell.as_ref().map(|(_, sub)| sub.clone()).filter(|s| s.as_ref() != "Terminal");
         let row_title = shell.map(|(t, _)| t).unwrap_or_else(|| self.pane_title(tab.focused, cx));
+        let tag: Option<String> = match place.filter(|p| !p.is_empty()) {
+            Some(p) if !p.eq_ignore_ascii_case(&row_title) => Some(p.to_string()),
+            _ => shell_sub.map(|s| s.to_string()),
+        };
         let is_page = matches!(
             self.panes.get(&first).map(|p| &p.kind),
             Some(PaneKind::Browser(_))
@@ -9863,9 +9987,11 @@ impl Workspace {
                     .flex_row()
                     .items_baseline()
                     .gap(u(6.))
-                    .child(div().flex_shrink().min_w_0().one_line().child(row_title))
-                    .children(place.filter(|p| !p.is_empty()).map(|p| {
-                        div().flex_none().max_w(u(90.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p.to_string())
+                    .child(div().flex_shrink().min_w_0().one_line().child(row_title.clone()))
+                    // The project, or what the shell ran last when the title
+                    // already names the project ("deck · cargo build").
+                    .children(tag.map(|p| {
+                        div().flex_shrink().min_w_0().max_w(u(140.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p)
                     })),
             )
             .child(
@@ -10856,7 +10982,7 @@ const ROW_SLOT: f32 = 16.;
 /// The trailing column of every row (time, state, close), right-aligned.
 const TRAIL_W: f32 = 30.;
 /// Every list row: one line, this tall, titles this size.
-const ROW_H: f32 = 34.;
+const ROW_H: f32 = 32.;
 const ROW_TEXT: f32 = 14.;
 const HEAD_TEXT: f32 = 12.5;
 const ROW_GAP: f32 = 10.;
@@ -11139,10 +11265,11 @@ fn sidebar_row(
         .rounded(u(theme::ROW_RADIUS))
         .border_1()
         .cursor_pointer()
-        // The open row: a faint fill inside a hairline, flat (no shadow).
+        // The open row: a fill alone, flat (no shadow, no outline), so it
+        // never reads as a box stacked on its hovered neighbour.
         .when(active, |d| {
-            d.bg(rgba(theme::alpha(theme::text(), 0x0a)))
-                .border_color(rgba(theme::hairline()))
+            d.bg(rgba(theme::alpha(theme::text(), 0x10)))
+                .border_color(gpui::transparent_black())
         })
         .when(!active, |d| {
             d.border_color(gpui::transparent_black())
@@ -11172,6 +11299,30 @@ fn lead(mark: AnyElement) -> AnyElement {
         .w(u(ROW_SLOT))
         .child(mark)
         .into_any_element()
+}
+
+/// A small label shown on hover, for controls that are only an icon.
+struct Tip(SharedString);
+
+impl Tip {
+    fn view(text: &'static str, cx: &mut App) -> AnyView {
+        cx.new(|_| Tip(text.into())).into()
+    }
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(u(8.))
+            .py(u(4.))
+            .rounded(u(6.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .text_size(u(12.))
+            .text_color(rgb(theme::text()))
+            .child(self.0.clone())
+    }
 }
 
 /// A part of the window chrome drawn as its own cached view.
@@ -11461,7 +11612,8 @@ impl Render for Workspace {
             // The title sits on the same edge as the text in the card below.
             .when(sidebar_shown, |d| d.pl(u(theme::PANE_PAD_X + 1.)))
             // Clear of the traffic lights, which do not zoom.
-            .when(!sidebar_shown, |d| d.pl(px(80.)))
+            .when(!sidebar_shown && cfg!(target_os = "macos"), |d| d.pl(px(80.)))
+            .when(!sidebar_shown && !cfg!(target_os = "macos"), |d| d.pl(u(theme::GUTTER)))
             .on_mouse_down(MouseButton::Left, |ev, window, _| {
                 if ev.click_count == 2 {
                     window.titlebar_double_click();
@@ -11604,7 +11756,7 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(theme::ground())
-            .font_family(theme::UI)
+            .font_family(theme::ui())
             .on_mouse_move(cx.listener(Self::drag_divider))
             .on_mouse_move(cx.listener(Self::drag_side))
             .on_mouse_up(
@@ -11693,11 +11845,30 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|ws, _: &FilterSidebar, w, cx| ws.open_filter(w, cx)))
+            // A click on Deck's own chrome takes the keyboard back from a
+            // page, which on X11 keeps it otherwise (clicks on the page go
+            // to the page's own window and never reach this).
+            .when(cfg!(target_os = "linux"), |d| {
+                d.capture_any_mouse_down(|_, window, _| crate::browser::reclaim_keyboard(window))
+            })
             .on_key_down(cx.listener(|ws, ev: &gpui::KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" && !ws.picked.is_empty() {
-                    ws.picked.clear();
-                    cx.notify();
+                if ws.picked.is_empty() {
+                    return;
                 }
+                let m = ev.keystroke.modifiers;
+                let command = if cfg!(target_os = "macos") { m.platform } else { m.control };
+                match ev.keystroke.key.as_str() {
+                    "escape" => ws.picked.clear(),
+                    // While rows are picked, ⌘A (Ctrl+A) picks every one
+                    // that can be closed.
+                    "a" if command && !m.shift && !m.alt => {
+                        let all: Vec<PaneId> = ws.tabs.iter().filter(|t| !t.pinned).map(|t| t.leaves()[0]).collect();
+                        ws.picked.extend(all);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+                cx.notify();
             }))
             .on_action(cx.listener(|ws, _: &OpenPackages, w, cx| ws.open_page(PageKind::Packages, w, cx)))
             .on_action(cx.listener(|ws, _: &ImportBrowserData, w, cx| ws.open_settings_at(crate::settings_pane::Page::Browser, w, cx)))
@@ -11871,12 +12042,18 @@ impl Render for Workspace {
 /// (traffic lights, menus, scrollbars, web pages), so nothing is left in
 /// the other mode. System leaves the appearance to macOS.
 fn wear(theme: crate::theme::Theme, window: &Window) {
-    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     let system_dark = matches!(
         window.appearance(),
         gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
     );
     crate::theme::set(theme, system_dark);
+    #[cfg(target_os = "macos")]
+    appkit_appearance(theme);
+}
+
+#[cfg(target_os = "macos")]
+fn appkit_appearance(theme: crate::theme::Theme) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return;
     };
@@ -11891,7 +12068,13 @@ fn wear(theme: crate::theme::Theme, window: &Window) {
     app.setAppearance(appearance.as_deref());
 }
 
+/// The Dock icon's badge: how many panes want you, or none. Off macOS
+/// there is no badge yet.
+#[cfg(not(target_os = "macos"))]
+fn set_badge(_n: usize) {}
+
 /// The Dock icon's badge: how many panes want you, or none.
+#[cfg(target_os = "macos")]
 fn set_badge(n: usize) {
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return;
@@ -12571,7 +12754,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .bg(rgb(theme::pane()))
-            .font_family(theme::UI)
+            .font_family(theme::ui())
             .child(div().flex_none().h(px(theme::TITLEBAR_PX)).on_mouse_down(
                 MouseButton::Left,
                 |ev, window, _| {

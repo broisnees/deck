@@ -132,11 +132,7 @@ fn cache_file(key: &str) -> Option<PathBuf> {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
         .collect();
-    Some(
-        PathBuf::from(std::env::var_os("HOME")?)
-            .join("Library/Caches/deck/help")
-            .join(format!("{name}.json")),
-    )
+    Some(agent_core::dirs::cache_dir().join("help").join(format!("{name}.json")))
 }
 
 #[derive(Serialize, Deserialize)]

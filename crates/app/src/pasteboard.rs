@@ -3,13 +3,16 @@
 //! browser). gpui's own clipboard reads text first and never sees file URLs,
 //! so this asks NSPasteboard directly.
 
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeFileURL,
     NSPasteboardTypeString, NSPasteboardTypeTIFF,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSString};
 use std::path::PathBuf;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum Pasted {
     Files(Vec<PathBuf>),
     /// Encoded image bytes and the extension they should be saved with.
@@ -34,6 +37,13 @@ pub fn read_for_terminal() -> Option<Pasted> {
     })
 }
 
+/// Off macOS only text is read yet; gpui's clipboard pastes it.
+#[cfg(not(target_os = "macos"))]
+fn read_with(_text_wins: impl Fn(&str) -> bool) -> Option<Pasted> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn read_with(text_wins: impl Fn(&str) -> bool) -> Option<Pasted> {
     let pb = NSPasteboard::generalPasteboard();
     let files: Vec<PathBuf> = pb
@@ -92,7 +102,7 @@ pub fn save_image(bytes: &[u8], ext: &str) -> std::io::Result<PathBuf> {
         .unwrap_or(0);
     let path = dir.join(format!("pasted-{stamp}.{ext}"));
     std::fs::write(&path, bytes)?;
-    if bytes.len() > 512 * 1024 && ext != "gif" {
+    if cfg!(target_os = "macos") && bytes.len() > 512 * 1024 && ext != "gif" {
         let edge = PASTE_MAX_EDGE.to_string();
         let _ = std::process::Command::new("/usr/bin/sips")
             .args(["-Z", &edge])
@@ -124,6 +134,7 @@ pub fn shell_paths(paths: &[PathBuf]) -> String {
 }
 
 /// `file:///Users/me/My%20Shot.png` → `/Users/me/My Shot.png`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn file_url_to_path(url: &str) -> Option<PathBuf> {
     let rest = url.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);

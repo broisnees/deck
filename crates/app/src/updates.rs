@@ -112,10 +112,12 @@ fn parse_github(body: &[u8]) -> Option<Release> {
     Some(Release {
         version: l.tag_name.trim_start_matches('v').to_string(),
         notes_url: l.html_url,
+        // The zip holds Deck.app: only macOS installs it in place. Elsewhere
+        // the release page is offered instead.
         download: l
             .assets
             .into_iter()
-            .find(|a| a.name.ends_with(".zip"))
+            .find(|a| cfg!(target_os = "macos") && a.name.ends_with(".zip"))
             .map(|a| a.browser_download_url),
     })
 }
@@ -247,7 +249,11 @@ mod tests {
         let gh = br#"{"tag_name":"v0.2.0","html_url":"https://x/r","assets":[{"name":"Deck.dmg","browser_download_url":"d"},{"name":"Deck-0.2.0.zip","browser_download_url":"z"}]}"#;
         let r = parse_github(gh).unwrap();
         assert_eq!(r.version, "0.2.0");
-        assert_eq!(r.download.as_deref(), Some("z"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(r.download.as_deref(), Some("z"));
+        } else {
+            assert_eq!(r.download, None);
+        }
         let b = br#"{"version":"0.3.1","notes_url":"n"}"#;
         assert_eq!(parse_backend(b).unwrap().download, None);
     }

@@ -131,19 +131,11 @@ pub struct SessionCtx {
 
 /// Deck's own SSH config: the hosts added in Deck (each with its user, key
 /// and port), then the user's `~/.ssh/config` and the system's, included.
-/// Kept beside Deck's other data (`DECK_DATA_DIR`, else Application
-/// Support) and written by the app; here so every `ssh` Deck starts, an
-/// agent's included, reads the same hosts.
+/// Kept beside Deck's other data (`crate::dirs::data_dir`) and written by
+/// the app; here so every `ssh` Deck starts, an agent's included, reads the
+/// same hosts.
 pub fn ssh_config() -> std::path::PathBuf {
-    std::env::var_os("DECK_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("Library/Application Support/deck")
-        })
-        .join("ssh_config")
+    crate::dirs::data_dir().join("ssh_config")
 }
 
 /// `-F` and Deck's SSH config, once there is one; nothing before any host

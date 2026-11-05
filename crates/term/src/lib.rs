@@ -1140,13 +1140,18 @@ impl AlacTerminal {
             working_directory: spawn.cwd,
             drain_on_exit: true,
             env,
+            #[cfg(windows)]
+            escape_args: true,
         };
 
         let shared = Arc::new(Shared::new(window));
         let proxy = Proxy(shared.clone());
 
         let pty = tty::new(&options, window, 0)?;
+        #[cfg(not(windows))]
         let pid = pty.child().id();
+        #[cfg(windows)]
+        let pid = pty.child_watcher().pid().map_or(0, |p| p.get());
         let pty = tap::Tapped::new(pty, shared.clone())?;
         let config = Config {
             scrolling_history: SCROLLBACK,

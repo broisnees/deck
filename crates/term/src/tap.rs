@@ -4,15 +4,14 @@
 //! ConEmu and Windows Terminal have it). That is how an agent CLI says it
 //! needs you, or that it is working.
 //!
-//! The PTY is wrapped, not replaced: alacritty still owns it and polls its
-//! descriptor; the reader it is handed reads through a duplicate of that
-//! descriptor (the same open file, so the same bytes) and scans them first.
+//! The PTY is wrapped, not replaced: alacritty still polls it and writes
+//! to it; the reader it is handed reads the PTY's own output (a descriptor
+//! on Unix, ConPTY's pipe on Windows) and scans the bytes first.
 
 use crate::Shared;
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty::{ChildEvent, EventedPty, EventedReadWrite, Pty};
 use polling::{Event, PollMode, Poller};
-use std::fs::File;
 use std::io::{self, Read};
 use std::sync::Arc;
 
@@ -388,7 +387,8 @@ fn percent_decode(s: &str) -> String {
 
 /// The reader alacritty is handed: what the PTY says, after the scanner.
 pub struct Tap {
-    file: File,
+    /// alacritty's PTY, read here and handed back for polling and writes.
+    pty: Pty,
     scan: Scanner,
     found: Vec<Signal>,
     /// Read from the PTY, before the scanner.
@@ -415,7 +415,7 @@ impl Read for Tap {
             // Nothing to hand over: read more. All of it can be held back
             // (an OSC split across reads), and 0 would mean the end, so
             // read again until there is something, or nothing to read.
-            let n = self.file.read(&mut self.raw)?;
+            let n = self.pty.reader().read(&mut self.raw)?;
             if n == 0 {
                 return Ok(0);
             }
@@ -429,17 +429,14 @@ impl Read for Tap {
 
 /// alacritty's PTY with [`Tap`] as its reader.
 pub struct Tapped {
-    pty: Pty,
     reader: Tap,
 }
 
 impl Tapped {
     pub fn new(pty: Pty, shared: Arc<Shared>) -> io::Result<Tapped> {
-        let file = pty.file().try_clone()?;
         Ok(Tapped {
-            pty,
             reader: Tap {
-                file,
+                pty,
                 scan: Scanner::default(),
                 found: Vec::new(),
                 raw: vec![0; 64 * 1024],
@@ -453,7 +450,7 @@ impl Tapped {
 
 impl EventedReadWrite for Tapped {
     type Reader = Tap;
-    type Writer = File;
+    type Writer = <Pty as EventedReadWrite>::Writer;
 
     unsafe fn register(
         &mut self,
@@ -463,35 +460,35 @@ impl EventedReadWrite for Tapped {
     ) -> io::Result<()> {
         // SAFETY: the PTY is owned here and outlives its registration, as
         // alacritty's own contract asks.
-        unsafe { self.pty.register(poll, event, mode) }
+        unsafe { self.reader.pty.register(poll, event, mode) }
     }
 
     fn reregister(&mut self, poll: &Arc<Poller>, event: Event, mode: PollMode) -> io::Result<()> {
-        self.pty.reregister(poll, event, mode)
+        self.reader.pty.reregister(poll, event, mode)
     }
 
     fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
-        self.pty.deregister(poll)
+        self.reader.pty.deregister(poll)
     }
 
     fn reader(&mut self) -> &mut Tap {
         &mut self.reader
     }
 
-    fn writer(&mut self) -> &mut File {
-        self.pty.writer()
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.reader.pty.writer()
     }
 }
 
 impl EventedPty for Tapped {
     fn next_child_event(&mut self) -> Option<ChildEvent> {
-        self.pty.next_child_event()
+        self.reader.pty.next_child_event()
     }
 }
 
 impl OnResize for Tapped {
     fn on_resize(&mut self, size: WindowSize) {
-        self.pty.on_resize(size);
+        self.reader.pty.on_resize(size);
     }
 }
 

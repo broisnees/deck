@@ -60,6 +60,9 @@ pub enum TerminalEvent {
 }
 
 pub struct TerminalPane {
+    /// The job this pane shows has exited: its output stays, with no cursor
+    /// left blinking in it.
+    pub ended: bool,
     /// The AI command box (⌘J): what you asked for, and whether the
     /// command is being written.
     ask: Option<(Entity<crate::field::Field>, Subscription)>,
@@ -288,6 +291,7 @@ impl TerminalPane {
 
         term.set_cursor_default(look.cursor, look.blink);
         Self {
+            ended: false,
             ask: None,
             asking: false,
             reported: None,
@@ -2257,10 +2261,10 @@ impl Element for Grid {
             }
         }
         let cursor = cursor_at
-            .filter(|_| pane.blink_on)
+            .filter(|_| pane.blink_on && !pane.ended)
             .map(|b| (b, snap.cursor_shape));
         let under_cursor = match (snap.cursor, snap.cursor_shape, self.focused) {
-            (Some((y, x)), term::CursorShape::Block, true) if pane.blink_on => snap
+            (Some((y, x)), term::CursorShape::Block, true) if pane.blink_on && !pane.ended => snap
                 .rows
                 .get(y)
                 .and_then(|r| row_cols(r).chars().nth(x))
@@ -2420,6 +2424,20 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
             "delete" => Some(vec![0x0b]),
             _ => None,
         };
+    }
+    // Off macOS, Ctrl+⌫ deletes the word before the cursor and Ctrl+Alt+⌫
+    // the line before it, and Ctrl+← / Ctrl+→ move by word, as GTK and Qt
+    // terminals do; the bytes are the ones ⌥ and ⌘ send on macOS.
+    let linux = !cfg!(target_os = "macos");
+    if linux && m.control && !m.shift {
+        match ks.key.as_str() {
+            "backspace" if m.alt => return Some(vec![0x15]),
+            "backspace" => return Some(vec![0x17]),
+            "left" if !m.alt => return Some(b"\x1bb".to_vec()),
+            "right" if !m.alt => return Some(b"\x1bf".to_vec()),
+            "delete" if !m.alt => return Some(b"\x1bd".to_vec()),
+            _ => {}
+        }
     }
     let arrow = |c: u8| -> Vec<u8> {
         match (m.alt, c) {
@@ -2723,6 +2741,13 @@ fn mouse_log(what: &str, bytes: &[u8]) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn mouse_held() -> bool {
     objc2_app_kit::NSEvent::pressedMouseButtons() != 0
+}
+
+/// gpui has no global button state off macOS; drags end on mouse up.
+#[cfg(not(target_os = "macos"))]
+fn mouse_held() -> bool {
+    false
 }

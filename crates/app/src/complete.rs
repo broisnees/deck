@@ -37,6 +37,9 @@ pub struct Item {
     /// Added to its match score: what you ran lately and the commands
     /// people use rank above the hundreds of tools in /usr/bin.
     boost: i32,
+    /// Offered for what the word means, not how it is spelled: `clear` for
+    /// `cls`, `git` for `gti`. Goes first whatever the letters.
+    meant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +71,12 @@ pub fn complete(line: &str, cursor: usize, cwd: &Path) -> Option<Found> {
         .into_iter()
         .enumerate()
         .filter_map(|(order, mut it)| {
-            let (score, matched) = score(&it.label, &typed)?;
+            let (score, matched) = if it.meant { (4000, Vec::new()) } else { score(&it.label, &typed)? };
+            // Letters scattered through a name from the rest of PATH match
+            // half of /usr/bin on a short word; they wait for a fourth.
+            if score < 2000 && it.boost == 0 && typed.chars().count() < 4 && it.kind == Kind::Command {
+                return None;
+            }
             it.matched = matched;
             Some((score, order, it))
         })
@@ -214,6 +222,7 @@ fn item(label: impl Into<String>, kind: Kind, detail: Option<&str>) -> Item {
         matched: Vec::new(),
         space: true,
         boost: 0,
+        meant: false,
     }
 }
 
@@ -427,6 +436,7 @@ fn paths(typed: &str, cwd: &Path, filter: PathFilter) -> Vec<Item> {
             matched: Vec::new(),
             space: !dir,
             boost: 0,
+            meant: false,
         });
     }
     // Folders first, then by name, before scoring reorders.
@@ -478,6 +488,28 @@ fn commands(typed: &str) -> Vec<Item> {
     out.extend(defined.iter().map(|(d, what)| boosted(d, Some(what), 350)));
     out.extend(BUILTINS.iter().map(|(b, d)| boosted(b, Some(d), 300)));
     out.extend(COMMON.iter().filter(|c| names.binary_search_by(|n| n.as_str().cmp(c)).is_ok()).map(|c| boosted(c, None, 200)));
+    // What the word means: another system's command for the same thing,
+    // or a slip of one letter from one you use.
+    if !typed.is_empty() && !runs(typed) {
+        let meant = |label: &str, detail: String| Item { meant: true, ..item(label, Kind::Command, Some(&detail)) };
+        for (from, to) in INTENT {
+            if *from == typed && runs(to) {
+                out.push(meant(to, format!("for {from}")));
+            }
+        }
+        if typed.chars().count() >= 3 {
+            let mut known: Vec<&str> = recent.iter().map(String::as_str).collect();
+            known.extend(defined.iter().map(|(d, _)| d.as_str()));
+            known.extend(BUILTINS.iter().map(|(b, _)| *b));
+            known.extend(COMMON.iter().copied().filter(|c| runs(c)));
+            let mut seen = std::collections::HashSet::new();
+            for k in known {
+                if seen.insert(k) && one_edit(k, typed) {
+                    out.push(meant(k, "did you mean".into()));
+                }
+            }
+        }
+    }
     // The rest of PATH (lskq, lsbom…) only once a word is specific enough
     // to be looking for one of them.
     if typed.chars().count() >= 2 {
@@ -525,6 +557,48 @@ fn shell_defined() -> Vec<(String, &'static str)> {
     out.retain(|(n, _)| seen.insert(n.clone()));
     *cache = Some((Instant::now(), out.clone()));
     out
+}
+
+/// Other systems' commands for what a Unix one does, offered when typed:
+/// (typed, meant).
+const INTENT: &[(&str, &str)] = &[
+    ("cls", "clear"),
+    ("dir", "ls"),
+    ("md", "mkdir"),
+    ("rd", "rmdir"),
+    ("del", "rm"),
+    ("erase", "rm"),
+    ("copy", "cp"),
+    ("move", "mv"),
+    ("ren", "mv"),
+    ("tasklist", "ps"),
+    ("taskkill", "kill"),
+    ("findstr", "grep"),
+    ("tracert", "traceroute"),
+    ("ipconfig", "ip"),
+    ("pbcopy", "wl-copy"),
+    ("pbpaste", "wl-paste"),
+    ("open", "xdg-open"),
+    ("explorer", "xdg-open"),
+    ("notepad", "nano"),
+];
+
+/// Whether `a` and `b` differ by one letter added, dropped, changed, or
+/// two neighbours swapped.
+fn one_edit(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a == b || a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let first = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Equal => {
+            a[first + 1..] == b[first + 1..]
+                || (first + 1 < a.len() && a[first] == b[first + 1] && a[first + 1] == b[first] && a[first + 2..] == b[first + 2..])
+        }
+        std::cmp::Ordering::Greater => a[first + 1..] == b[first..],
+        std::cmp::Ordering::Less => a[first..] == b[first + 1..],
+    }
 }
 
 /// Commands worth offering from the first letter.
@@ -963,6 +1037,22 @@ mod tests {
 
     fn labels(f: &Option<Found>) -> Vec<&str> {
         f.as_ref().map(|f| f.items.iter().map(|i| i.label.as_str()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn one_edit_catches_slips() {
+        assert!(one_edit("git", "gti"));
+        assert!(one_edit("clear", "claer"));
+        assert!(one_edit("make", "mak"));
+        assert!(one_edit("ls", "lss"));
+        assert!(!one_edit("git", "git"));
+        assert!(!one_edit("clear", "cls"));
+    }
+
+    #[test]
+    fn cls_means_clear() {
+        let f = complete("cls", 3, Path::new("/"));
+        assert_eq!(labels(&f).first(), Some(&"clear"), "{:?}", labels(&f));
     }
 
     #[test]

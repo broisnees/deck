@@ -69,13 +69,7 @@ fn newest_socket() -> Option<PathBuf> {
 /// Where deck keeps its socket, settings and threads. `DECK_DATA_DIR` moves
 /// it, so a test instance never touches the user's own.
 pub fn socket_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("DECK_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Library/Application Support/deck")
+    agent_core::dirs::data_dir()
 }
 
 pub fn stable_socket() -> PathBuf {

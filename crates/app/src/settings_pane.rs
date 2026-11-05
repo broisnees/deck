@@ -147,8 +147,8 @@ fn monospace_families(installed: &[String], current: &str) -> Vec<SharedString> 
     nerd.dedup();
     out.extend(nerd.into_iter().map(|n| SharedString::from(n.clone())));
     // Menlo ships with every Mac and is the default; never leave it out.
-    if !out.iter().any(|f| f.as_ref() == theme::MONO) {
-        out.insert(0, theme::MONO.into());
+    if !out.iter().any(|f| f.as_ref() == theme::mono()) {
+        out.insert(0, theme::mono().into());
     }
     if !out.iter().any(|f| f.as_ref() == current) {
         out.push(SharedString::from(current.to_string()));
@@ -376,6 +376,9 @@ impl SettingsPane {
     fn outline(&self, window: &Window, cx: &mut Context<Self>) -> Vec<(Page, Vec<Section>)> {
         Page::ALL
             .iter()
+            // Permissions are macOS's privacy panes; Linux and Windows
+            // have nothing like them to grant.
+            .filter(|p| cfg!(target_os = "macos") || **p != Page::Permissions)
             .map(|p| (*p, self.sections(*p, window, cx)))
             .collect()
     }
@@ -1077,7 +1080,7 @@ impl SettingsPane {
                 .child(
                     div()
                         .mr(u(4.))
-                        .font_family(theme::MONO)
+                        .font_family(theme::mono())
                         .text_size(u(12.))
                         .text_color(rgb(p.fg))
                         .child("~ $"),
@@ -1735,11 +1738,9 @@ impl SettingsPane {
     fn page_general(&self, cx: &mut Context<Self>) -> Vec<Section> {
         let path = settings::path();
         let shown = tilde(&path.display().to_string());
-        let reveal = button("reveal", "Show in Finder").on_click(move |_, _, _| {
-            let _ = std::process::Command::new("/usr/bin/open")
-                .arg("-R")
-                .arg(&path)
-                .spawn();
+        let reveal_label = if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Files" };
+        let reveal = button("reveal", reveal_label).on_click(move |_, _, _| {
+            let _ = crate::desktop::reveal(&path);
         });
         let reset = button("defaults", "Restore Defaults").on_click(self.on(
             |s| {
@@ -1760,7 +1761,7 @@ impl SettingsPane {
             },
         )
         .on_click(cx.listener(move |_, _, _, cx| cx.emit(SettingsEvent::DefaultTerminal(!on))));
-        vec![
+        let mut sections = vec![
             self.account_section(cx),
             self.updates_section(cx),
             group(
@@ -1787,7 +1788,13 @@ impl SettingsPane {
                 ],
                 None,
             ),
-        ]
+        ];
+        // Being the default terminal is Launch Services' on macOS; on Linux
+        // the desktop file the package installs claims it.
+        if !cfg!(target_os = "macos") {
+            sections.remove(2);
+        }
+        sections
     }
 
     fn page_appearance(&self, window: &Window, cx: &mut Context<Self>) -> Vec<Section> {
@@ -2545,6 +2552,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn fonts_offered_are_installed_ones_plus_menlo_and_the_current() {
         let installed: Vec<String> = [
             "Monaco",

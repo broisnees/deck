@@ -689,7 +689,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                         div()
                             .flex_none()
                             .w(u(12.))
-                            .font_family(theme::MONO)
+                            .font_family(theme::mono())
                             .text_size(u(11.))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(color))
@@ -806,7 +806,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                                     .gap(u(6.))
                                     .text_size(u(11.))
                                     .text_color(rgb(theme::dim()))
-                                    .child(div().font_family(theme::MONO).child(c.short.clone()))
+                                    .child(div().font_family(theme::mono()).child(c.short.clone()))
                                     .child(div().min_w_0().one_line().child(c.author.clone()))
                                     .children(refs.into_iter().map(ref_pill)),
                             ),

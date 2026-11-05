@@ -188,7 +188,14 @@ fn claude_creds() -> Option<Creds> {
         })
 }
 
+/// Off macOS Claude Code keeps no keychain item; the file is all there is.
+#[cfg(not(target_os = "macos"))]
+fn keychain_creds() -> Option<Vec<u8>> {
+    None
+}
+
 /// Read with `security`, as Claude Code does, so no keychain prompt shows.
+#[cfg(target_os = "macos")]
 fn keychain_creds() -> Option<Vec<u8>> {
     let out = std::process::Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", &keychain_service(), "-w"])
@@ -202,6 +209,7 @@ fn keychain_creds() -> Option<Vec<u8>> {
 /// "Claude Code-credentials", with "-" and the first 8 hex digits of the
 /// SHA-256 of the config folder after it when `CLAUDE_CONFIG_DIR` (or
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR`) moves it, as Claude Code names it.
+#[cfg(target_os = "macos")]
 fn keychain_service() -> String {
     let dir = match std::env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
         Ok(d) => Some(d).filter(|d| !d.is_empty()),
@@ -216,6 +224,7 @@ fn keychain_service() -> String {
 }
 
 /// The first 4 bytes of a SHA-256, in hex, through CommonCrypto.
+#[cfg(target_os = "macos")]
 fn sha256_hex8(s: &str) -> String {
     extern "C" {
         fn CC_SHA256(data: *const std::ffi::c_void, len: u32, md: *mut u8) -> *mut u8;
@@ -1818,6 +1827,7 @@ mod tests {
         );
         assert_eq!(claude_plan(Some("pro"), None).as_deref(), Some("Pro"));
         assert!(parse_creds(br#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
+        #[cfg(target_os = "macos")]
         assert_eq!(sha256_hex8("abc"), "ba7816bf");
     }
 }

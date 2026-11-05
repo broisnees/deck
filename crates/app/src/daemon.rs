@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 const LABEL: &str = "com.broisnischal.deckd";
 /// What a newly attached client is sent of the job's past output.
 const RING: usize = 512 * 1024;
@@ -181,13 +182,44 @@ pub fn inherited_agent_marker(k: &str) -> bool {
 }
 
 /// Make sure the LaunchAgent is installed and the daemon running: through
-/// launchd when it can be, else started directly, detached.
+/// launchd when it can be, else started directly, detached. Off macOS it
+/// is always started directly; a systemd user unit is still to come.
 pub fn ensure_running() -> Result<(), String> {
     let exe = service_exe()?;
+    #[cfg(target_os = "macos")]
     let rewrote = install_agent(&exe).unwrap_or(false);
     if ask(&json!({ "op": "ping" })).is_ok() {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if start_with_launchd(&exe, rewrote) {
+        return Ok(());
+    }
+    // No launchd (Linux, a test, a sandbox), or it would not run it: run it
+    // ourselves, in its own session.
+    use std::os::unix::process::CommandExt;
+    let mut c = std::process::Command::new(&exe);
+    c.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    c.spawn().map_err(|e| e.to_string())?;
+    if until(Duration::from_secs(5), || ask(&json!({ "op": "ping" })).is_ok()) {
+        Ok(())
+    } else {
+        Err(format!("the background service did not start; see {}", crate::control::socket_dir().join("deckd.log").display()))
+    }
+}
+
+/// Start the service through launchd; whether it then answers.
+#[cfg(target_os = "macos")]
+fn start_with_launchd(exe: &Path, rewrote: bool) -> bool {
     // Not running, so reloading it costs nothing: no job or tab is lost.
     let uid = unsafe { libc::getuid() };
     let domain = format!("gui/{uid}");
@@ -230,29 +262,7 @@ pub fn ensure_running() -> Result<(), String> {
     };
     // launchctl succeeding means launchd started something, not that it
     // serves: wait for the socket to answer.
-    if started && until(Duration::from_secs(5), || ask(&json!({ "op": "ping" })).is_ok()) {
-        return Ok(());
-    }
-    // No launchd (a test, a sandbox), or it would not run it: run it
-    // ourselves, in its own session.
-    use std::os::unix::process::CommandExt;
-    let mut c = std::process::Command::new(&exe);
-    c.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    unsafe {
-        c.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    c.spawn().map_err(|e| e.to_string())?;
-    if until(Duration::from_secs(5), || ask(&json!({ "op": "ping" })).is_ok()) {
-        Ok(())
-    } else {
-        Err(format!("the background service did not start; see {}", crate::control::socket_dir().join("deckd.log").display()))
-    }
+    started && until(Duration::from_secs(5), || ask(&json!({ "op": "ping" })).is_ok())
 }
 
 /// Poll `done` every 100 ms for up to `limit`; whether it came true.
@@ -297,6 +307,7 @@ fn service_exe() -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+#[cfg(target_os = "macos")]
 fn agent_plist() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     home.join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
@@ -305,6 +316,7 @@ fn agent_plist() -> PathBuf {
 /// Write the LaunchAgent: started at login, started again if it crashes,
 /// left stopped after a clean exit (Quit in its menu). Rewritten only when
 /// it changes; launchd reads it at the next login or bootstrap.
+#[cfg(target_os = "macos")]
 fn install_agent(exe: &Path) -> std::io::Result<bool> {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let path = std::env::var("PATH").unwrap_or_default();
@@ -1019,14 +1031,18 @@ fn quit_all() -> ! {
     std::process::exit(0);
 }
 
+/// The menu bar icon's actions, which only macOS has yet.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn quit() -> ! {
     quit_all()
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn stop_named(name: &str) {
     kill_job(name, true);
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn restart_named(name: &str) {
     let _ = restart_job(name);
 }
