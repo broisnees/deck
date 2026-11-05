@@ -65,3 +65,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# gpui 0.2.2 with two fixes, each marked "Deck patch": a truncated text
+# measured twice could panic in Core Text on a multi-byte character
+# (vendor/gpui/src/elements/text.rs), and a spurious key-window event
+# deadlocked the main thread at launch (vendor/gpui/src/platform/mac/window.rs).
+# Drop this when a release carries both fixes.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
