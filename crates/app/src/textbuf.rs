@@ -462,6 +462,36 @@ impl TextInput {
         Some((at, query))
     }
 
+    /// The `/command` being typed: a `/` at the very start of the text, no
+    /// space typed after it yet.
+    pub fn slash_token(&self) -> Option<(usize, &str)> {
+        let before = &self.text[..self.cursor];
+        let rest = before.strip_prefix('/')?;
+        (!rest.contains(char::is_whitespace)).then_some((0, rest))
+    }
+
+    /// The `$skill` being typed: a `$` at a word's start on this line.
+    pub fn dollar_token(&self) -> Option<(usize, &str)> {
+        let line_start = self.line_start(self.cursor);
+        let before = &self.text[line_start..self.cursor];
+        let at = before.rfind('$')? + line_start;
+        if let Some(p) = self.prev_boundary(at) {
+            if !self.char_at(p).is_whitespace() {
+                return None;
+            }
+        }
+        let query = &self.text[at + 1..self.cursor];
+        (!query.contains(char::is_whitespace)).then_some((at, query))
+    }
+
+    /// Replace the token from `start` to the cursor with `with` and a space.
+    pub fn replace_token(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.anchor = start;
+        self.insert(&format!("{with} "));
+    }
+
     /// Replace an `@…` token with a concrete path plus a trailing space.
     pub fn replace_mention(&mut self, start: usize, path: &str) {
         self.text.replace_range(start..self.cursor, "");
