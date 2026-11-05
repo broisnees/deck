@@ -58,6 +58,43 @@ exec 3<&-
 wait "$pid"
 kill -TERM 0"#;
 
+/// OpenCode's permission keys for its tools that read, change or run
+/// anything on this machine (`edit` covers write and apply_patch).
+const LOCAL_TOOLS: &[&str] = &["bash", "read", "edit", "glob", "grep", "list", "lsp"];
+
+/// The chat's MCP servers, and in a chat on another machine its local tools
+/// denied, as `OPENCODE_CONFIG_CONTENT`: merged over the user's own config by
+/// both `opencode serve` and `opencode run`. None when there is nothing to add.
+fn inline_config(ctx: &SessionCtx) -> Option<String> {
+    let mut mcp = serde_json::Map::new();
+    for server in ctx.mcp.iter().filter(|s| s.enabled) {
+        let entry = match &server.transport {
+            agent_core::McpTransport::Stdio { command, args, env } => json!({
+                "type": "local",
+                "command": std::iter::once(command).chain(args).collect::<Vec<_>>(),
+                "environment": env.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
+                "enabled": true,
+            }),
+            agent_core::McpTransport::Http { url, headers } => json!({
+                "type": "remote",
+                "url": url,
+                "headers": headers.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
+                "enabled": true,
+            }),
+        };
+        mcp.insert(server.name.to_string(), entry);
+    }
+    let mut config = serde_json::Map::new();
+    if !mcp.is_empty() {
+        config.insert("mcp".into(), Value::Object(mcp));
+    }
+    if ctx.host_only {
+        let deny = LOCAL_TOOLS.iter().map(|t| (t.to_string(), Value::from("deny"))).collect();
+        config.insert("permission".into(), Value::Object(deny));
+    }
+    (!config.is_empty()).then(|| Value::Object(config).to_string())
+}
+
 /// One running `opencode serve`.
 struct Server {
     child: Child,
@@ -612,7 +649,10 @@ pub struct OpenCodeSession {
 impl OpenCodeSession {
     /// Starts the chat's server right away, so it is warm by the time the
     /// first message is typed.
-    pub fn start(spec: &'static CliSpec, ctx: SessionCtx) -> Self {
+    pub fn start(spec: &'static CliSpec, mut ctx: SessionCtx) -> Self {
+        if let Some(config) = inline_config(&ctx) {
+            ctx.env.push(("OPENCODE_CONFIG_CONTENT".into(), config));
+        }
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let (cmd, cmds) = mpsc::unbounded_channel();
         let native = Arc::new(Mutex::new(ctx.resume.clone()));
@@ -932,11 +972,17 @@ impl Worker {
         }
         // A headless chat cannot answer opencode's question tool or its plan
         // mode switches; `opencode run` denies them the same way.
-        let body = json!({ "permission": [
-            { "permission": "question", "action": "deny", "pattern": "*" },
-            { "permission": "plan_enter", "action": "deny", "pattern": "*" },
-            { "permission": "plan_exit", "action": "deny", "pattern": "*" },
-        ]});
+        let mut rules = vec![
+            json!({ "permission": "question", "action": "deny", "pattern": "*" }),
+            json!({ "permission": "plan_enter", "action": "deny", "pattern": "*" }),
+            json!({ "permission": "plan_exit", "action": "deny", "pattern": "*" }),
+        ];
+        // Working on another machine: the tools that act on this one are off
+        // here too, not only in the config the server started with.
+        if self.ctx.host_only {
+            rules.extend(LOCAL_TOOLS.iter().map(|t| json!({ "permission": t, "action": "deny", "pattern": "*" })));
+        }
+        let body = json!({ "permission": rules });
         let created = self.call("POST", "/session", Some(&body)).await;
         let id = match &created {
             Ok(r) if r.ok() => r
@@ -1107,6 +1153,46 @@ fn describe(r: &io::Result<http::Response>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_chat_on_a_host_gets_its_servers_and_no_local_tools() {
+        let mut ctx = SessionCtx {
+            session_id: agent_core::SessionId::new(),
+            cwd: "/tmp".into(),
+            system_prompt: "".into(),
+            model: None,
+            mcp: Arc::new(vec![agent_core::McpServerSpec {
+                name: "host".into(),
+                transport: agent_core::McpTransport::Stdio {
+                    command: "deck".into(),
+                    args: vec!["mcp".into(), "--host".into(), "dinq".into()],
+                    env: vec![("DECK_TOKEN".into(), "t".into())],
+                },
+                enabled: true,
+            }]),
+            skills_dir: None,
+            runtime_dir: "/tmp".into(),
+            resume: None,
+            permission_mode: PermissionMode::Ask,
+            env: Vec::new(),
+            allowed_tools: Vec::new(),
+            remote: None,
+            disallowed_tools: Vec::new(),
+            host_only: true,
+        };
+        let v: Value = serde_json::from_str(&inline_config(&ctx).unwrap()).unwrap();
+        assert_eq!(v["mcp"]["host"]["type"], "local");
+        assert_eq!(v["mcp"]["host"]["command"], json!(["deck", "mcp", "--host", "dinq"]));
+        assert_eq!(v["mcp"]["host"]["environment"]["DECK_TOKEN"], "t");
+        for t in LOCAL_TOOLS {
+            assert_eq!(v["permission"][t], "deny", "{t}");
+        }
+        ctx.host_only = false;
+        let v: Value = serde_json::from_str(&inline_config(&ctx).unwrap()).unwrap();
+        assert!(v.get("permission").is_none());
+        ctx.mcp = Arc::new(vec![]);
+        assert!(inline_config(&ctx).is_none());
+    }
     use super::*;
 
     const LS_TURN: &str = include_str!("testdata/opencode_serve_ls.jsonl");
