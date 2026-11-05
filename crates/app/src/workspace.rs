@@ -894,6 +894,12 @@ pub struct Workspace {
     /// A side panel's edge is being dragged: which one, where the drag
     /// started and the width then.
     side_drag: Option<(bool, f32, f32)>,
+    /// The job drawer's height, and its drag (pointer y at the start, the
+    /// height then); folded to its header, or as tall as it goes.
+    drawer_h: f32,
+    drawer_drag: Option<(f32, f32)>,
+    drawer_min: bool,
+    drawer_max: bool,
     /// Claude Code terminals deck has unstuck from an API wait: how many
     /// times in a row, and when last.
     stalls: HashMap<PaneId, (u32, Instant)>,
@@ -1129,6 +1135,10 @@ impl Workspace {
             sidebar_px: theme::SIDEBAR_PX,
             inspector_px: theme::INSPECTOR_PX,
             side_drag: None,
+            drawer_h: DRAWER_H,
+            drawer_drag: None,
+            drawer_min: false,
+            drawer_max: false,
             working_since: HashMap::new(),
             stalls: HashMap::new(),
             cells: Default::default(),
@@ -8470,6 +8480,20 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn drag_drawer(&mut self, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((start, from)) = self.drawer_drag else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.drawer_drag = None;
+            cx.notify();
+            return;
+        }
+        let moved = (start - f32::from(ev.position.y)) / self.settings.zoom;
+        self.drawer_h = (from + moved).clamp(DRAWER_MIN, DRAWER_MAX).round();
+        cx.notify();
+    }
+
     fn drag_side(&mut self, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some((left, start, from)) = self.side_drag else {
             return;
@@ -10785,64 +10809,111 @@ impl Workspace {
         let name = self.named.iter().find(|(_, v)| **v == id).map(|(n, _)| n.clone());
         let dj = self.daemon_job(id).cloned();
         let cmd = dj.as_ref().map(|j| j.cmd.clone()).unwrap_or_default();
-        let status = match dj.as_ref() {
-            Some(j) if j.running => "running · keeps going when Deck quits".to_string(),
-            Some(crate::daemon::JobInfo { exit: Some(c), .. }) => format!("exited {c}"),
-            _ => "starting".to_string(),
+        let running = dj.as_ref().is_some_and(|j| j.running);
+        let (dot, state) = match dj.as_ref() {
+            Some(j) if j.running => (theme::palette().ansi[2], "running".to_string()),
+            Some(crate::daemon::JobInfo { exit: Some(0), .. }) => (theme::dim(), "finished".to_string()),
+            Some(crate::daemon::JobInfo { exit: Some(c), .. }) => (theme::DANGER, format!("exited {c}")),
+            _ => (theme::dim(), "starting".to_string()),
         };
-        let restart_name = dj.as_ref().map(|j| j.name.clone());
-        let button = |id: &'static str, glyph: Icon| icon_button(id, glyph).size(u(22.));
+        let job_name = dj.as_ref().map(|j| j.name.clone());
+        let (min, max) = (self.drawer_min, self.drawer_max);
+        // Each control says what it does on hover.
+        let button = |eid: &'static str, glyph: Icon, tip: &'static str| {
+            icon_button(eid, glyph).size(u(24.)).tooltip(move |_, cx| Tip::view(tip, cx))
+        };
+        let (n1, n2) = (job_name.clone(), job_name);
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(8.))
+            .h(u(32.))
+            .pl(u(12.))
+            .pr(u(4.))
+            .text_size(u(12.))
+            .when(!min, |d| d.border_b_1().border_color(rgba(theme::hairline())))
+            .child(div().flex_none().size(u(7.)).rounded_full().bg(rgb(dot)))
+            .child(div().flex_none().font_weight(FontWeight::MEDIUM).child(name.unwrap_or_else(|| format!("job {id}"))))
+            .child(div().flex_1().min_w_0().one_line().font_family(theme::mono()).text_size(u(11.5)).text_color(rgb(theme::dim())).child(cmd))
+            .child(div().flex_none().text_size(u(11.)).text_color(rgb(theme::dim())).child(state))
+            // Run again or stop: the job and its output stay either way.
+            .when(running, |d| {
+                d.child(button("job-halt", Icon::Stop, "Stop").on_click(cx.listener(move |_, _, _, cx| {
+                    if let Some(n) = n1.clone() {
+                        cx.background_executor().spawn(async move { crate::daemon::halt(&n) }).detach();
+                    }
+                })))
+            })
+            .child(
+                button("job-restart", Icon::Refresh, if running { "Restart" } else { "Run again" }).on_click(cx.listener(
+                    move |_, _, _, cx| {
+                        if let Some(n) = n2.clone() {
+                            cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
+                        }
+                    },
+                )),
+            )
+            .child(div().flex_none().w(u(1.)).h(u(14.)).mx(u(2.)).bg(rgba(theme::hairline())))
+            .child(button("job-tab", Icon::PanelRight, "Open as a tab").on_click(cx.listener(move |ws, _, w, cx| ws.job_to_tab(id, w, cx))))
+            .child(
+                button("job-min", if min { Icon::ChevronUp } else { Icon::ChevronDown }, if min { "Restore" } else { "Minimize" })
+                    .on_click(cx.listener(|ws, _, _, cx| {
+                        ws.drawer_min = !ws.drawer_min;
+                        ws.drawer_max = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button("job-max", Icon::Maximize, if max { "Restore size" } else { "Maximize" }).on_click(cx.listener(|ws, _, _, cx| {
+                    ws.drawer_max = !ws.drawer_max;
+                    ws.drawer_min = false;
+                    cx.notify();
+                })),
+            )
+            .child(button("job-forget", Icon::Close, "Stop and remove").on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))));
+        // The top edge drags the drawer taller or shorter; a double click
+        // puts it back.
+        let grip = div()
+            .id("drawer-grip")
+            .absolute()
+            .top(u(-3.))
+            .left_0()
+            .right_0()
+            .h(u(6.))
+            .cursor_row_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, ev: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if ev.click_count == 2 {
+                        ws.drawer_h = DRAWER_H;
+                    } else {
+                        ws.drawer_drag = Some((f32::from(ev.position.y), ws.drawer_h));
+                    }
+                    ws.drawer_min = false;
+                    ws.drawer_max = false;
+                    cx.notify();
+                }),
+            );
+        let height = if max { DRAWER_MAX } else { self.drawer_h };
         Some(
             div()
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_none()
-                .h(u(300.))
+                .when(!min, |d| d.h(u(height)))
                 .mx(u(theme::GUTTER))
                 .mb(u(theme::GUTTER))
                 .rounded(u(theme::CARD_RADIUS))
                 .overflow_hidden()
+                .bg(rgb(theme::pane()))
                 .border_1()
                 .border_color(rgba(theme::hairline()))
-                .bg(rgb(theme::pane()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(u(8.))
-                        .h(u(32.))
-                        .pl(u(12.))
-                        .pr(u(4.))
-                        .border_b_1()
-                        .border_color(rgba(theme::hairline()))
-                        .text_size(u(12.))
-                        .child(icon(Icon::Terminal, 13., theme::text_2()))
-                        .child(div().font_weight(FontWeight::MEDIUM).child(name.unwrap_or_else(|| format!("job {id}"))))
-                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::dim())).child(cmd))
-                        .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(status))
-                        .child(
-                            button("job-restart", Icon::Refresh)
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    if let Some(n) = restart_name.clone() {
-                                        cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
-                                    }
-                                })),
-                        )
-                        .child(
-                            button("job-tab", Icon::Maximize)
-                                .on_click(cx.listener(move |ws, _, w, cx| ws.job_to_tab(id, w, cx))),
-                        )
-                        .child(
-                            button("job-stop", Icon::Stop)
-                                .on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))),
-                        )
-                        .child(button("job-hide", Icon::ChevronDown).on_click(cx.listener(|ws, _, _, cx| {
-                            ws.job_open = None;
-                            cx.notify();
-                        }))),
-                )
-                .child(div().flex_1().min_h_0().child(t.clone()))
+                .when(!min, |d| d.child(grip))
+                .child(header)
+                .when(!min, |d| d.child(div().flex_1().min_h_0().child(t.clone())))
                 .into_any_element(),
         )
     }
@@ -10982,6 +11053,10 @@ pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui
 /// The content area never gets narrower than this to make room for chrome:
 /// past it the inspector folds away (and comes back when there is room).
 const MIN_CONTENT_PX: f32 = 520.;
+/// The job drawer's height to start with, and how far it drags.
+const DRAWER_H: f32 = 300.;
+const DRAWER_MIN: f32 = 120.;
+const DRAWER_MAX: f32 = 720.;
 /// How far the side panels can be dragged.
 const SIDEBAR_MIN: f32 = 200.;
 const SIDEBAR_MAX: f32 = 440.;
@@ -11808,7 +11883,18 @@ impl Render for Workspace {
                     ),
                 )
             })
-            .child(main)
+            // The job drawer under the panes only: the sidebar and the
+            // inspector keep the window's full height beside it.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(main)
+                    .children(self.render_job_drawer(cx)),
+            )
             .when(inspector_shown, |d| {
                 d.child(
                     AnyView::from(inspector).cached(
@@ -11830,10 +11916,11 @@ impl Render for Workspace {
             .font_family(theme::ui())
             .on_mouse_move(cx.listener(Self::drag_divider))
             .on_mouse_move(cx.listener(Self::drag_side))
+            .on_mouse_move(cx.listener(Self::drag_drawer))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|ws, _, _, cx| {
-                    if ws.resizing.take().is_some() | ws.side_drag.take().is_some() {
+                    if ws.resizing.take().is_some() | ws.side_drag.take().is_some() | ws.drawer_drag.take().is_some() {
                         cx.notify();
                     }
                 }),
@@ -12047,7 +12134,6 @@ impl Render for Workspace {
             // The side panels' edges (in `body`): drag to size them,
             // double-click for the usual width.
             .child(body)
-            .children(self.render_job_drawer(cx))
             .children(bar)
             .children(self.menu.as_ref().map(crate::menu::Open::render))
             // The palette floats over everything, a little above centre,

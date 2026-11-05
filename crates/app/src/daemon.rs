@@ -164,6 +164,11 @@ pub fn stop(name: &str) -> Result<(), String> {
     ask(&json!({ "op": "stop", "name": name })).map(|_| ())
 }
 
+/// Stop a job's process but keep the job, to run again with `restart`.
+pub fn halt(name: &str) -> Result<(), String> {
+    ask(&json!({ "op": "halt", "name": name })).map(|_| ())
+}
+
 pub fn restart(name: &str) -> Result<(), String> {
     ask(&json!({ "op": "restart", "name": name })).map(|_| ())
 }
@@ -813,6 +818,14 @@ fn handle(mut conn: UnixStream) {
         "stop" => {
             if kill_job(&name, true) {
                 Ok(json!({ "stopped": name }))
+            } else {
+                Err(format!("no job {name:?}"))
+            }
+        }
+        // Stopped but kept: its output stays and Restart runs it again.
+        "halt" => {
+            if kill_job(&name, false) {
+                Ok(json!({ "halted": name }))
             } else {
                 Err(format!("no job {name:?}"))
             }

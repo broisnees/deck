@@ -2137,14 +2137,13 @@ impl BrowserPane {
             .min_w_0()
             .items_center()
             .gap(u(8.))
-            .h(u(28.))
+            .h(u(26.))
             .pl(u(10.))
-            .rounded(u(8.))
-            // Quiet at rest, a tint the address sits in; raised with a thin
-            // edge only while you type in it.
+            .rounded_full()
+            // Part of the capsule at rest; raised with a thin edge only
+            // while you type in it.
             .when(!editing, |d| {
-                d.bg(rgba(theme::tint()))
-                    .border_1()
+                d.border_1()
                     .border_color(rgba(0xffffff00))
                     .hover(|s| s.bg(rgb(theme::surface())))
             })
@@ -2202,15 +2201,23 @@ impl BrowserPane {
                 })
         });
 
-        div()
+        // One floating capsule over the page, as dev toolbars float: the
+        // controls, the address, close; nothing else.
+        let capsule = div()
             .relative()
             .flex()
-            .flex_none()
+            .flex_1()
+            .min_w_0()
+            .max_w(u(820.))
             .items_center()
             .gap(u(2.))
-            .h(u(theme::TOOLBAR_PX))
-            .px(u(6.))
-            .bg(rgb(theme::pane()))
+            .h(u(32.))
+            .px(u(3.))
+            .rounded_full()
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_md()
             .child(
                 nav("back", Icon::ArrowLeft, self.can_back)
                     .on_click(cx.listener(|p, _, _, _| p.back())),
@@ -2230,13 +2237,6 @@ impl BrowserPane {
                 )
                 .on_click(cx.listener(|p, _, _, cx| {
                     p.reload();
-                    cx.notify();
-                })),
-            )
-            .child(
-                // Home: Deck's start page, your frequent sites and dev servers.
-                icon_button("home", Icon::Home).mr(u(4.)).on_click(cx.listener(|p, _, _, cx| {
-                    let _ = p.navigate("about:blank", cx);
                     cx.notify();
                 })),
             )
@@ -2273,7 +2273,16 @@ impl BrowserPane {
                         .rounded(u(1.))
                         .bg(rgba(theme::alpha(theme::text(), 0xcc))),
                 )
-            })
+            });
+        div()
+            .flex()
+            .flex_none()
+            .justify_center()
+            .items_center()
+            .h(u(theme::TOOLBAR_PX))
+            .px(u(8.))
+            .bg(rgb(theme::pane()))
+            .child(capsule)
     }
 
     fn render_find(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
