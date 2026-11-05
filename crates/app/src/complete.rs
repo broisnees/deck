@@ -70,9 +70,16 @@ pub fn complete(line: &str, cursor: usize, cwd: &Path) -> Option<Found> {
         .filter_map(|(order, mut it)| {
             let (score, matched) = score(&it.label, &typed)?;
             it.matched = matched;
-            Some((score + it.boost, order, it))
+            Some((score, order, it))
         })
         .collect();
+    // Names that start with what was typed say what was meant; letters
+    // scattered through other names ("calendar" for "cle") are offered
+    // only when nothing starts that way.
+    if scored.iter().any(|(sc, ..)| *sc >= 2000) {
+        scored.retain(|(sc, ..)| *sc >= 2000);
+    }
+    let mut scored: Vec<(i32, usize, Item)> = scored.into_iter().map(|(sc, o, it)| (sc + it.boost, o, it)).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let mut seen = std::collections::HashSet::new();
     let items: Vec<Item> = scored
@@ -454,16 +461,69 @@ fn commands(typed: &str) -> Vec<Item> {
             }
         }
     };
-    let recent = recent_commands();
+    let defined = shell_defined();
+    // Only what would run: a program on PATH, a builtin, an alias or a
+    // function. History also holds typos ("clea", "cdlear") and commands
+    // since removed; those are not offered.
+    let runs = |c: &str| {
+        names.binary_search_by(|n| n.as_str().cmp(c)).is_ok()
+            || BUILTINS.iter().any(|(b, _)| *b == c)
+            || defined.iter().any(|(d, _)| d == c)
+    };
+    // Or one you ran more than once: programs your shell finds through its
+    // own rc files (bun, cargo installs) that Deck's PATH may not list.
+    let recent: Vec<String> = recent_commands().into_iter().filter(|(c, n)| *n >= 2 || runs(c)).map(|(c, _)| c).collect();
     let boosted = |label: &str, detail: Option<&str>, boost: i32| Item { boost, ..item(label, Kind::Command, detail) };
     let mut out: Vec<Item> = recent.iter().map(|c| boosted(c, Some("recent"), 400)).collect();
+    out.extend(defined.iter().map(|(d, what)| boosted(d, Some(what), 350)));
     out.extend(BUILTINS.iter().map(|(b, d)| boosted(b, Some(d), 300)));
     out.extend(COMMON.iter().filter(|c| names.binary_search_by(|n| n.as_str().cmp(c)).is_ok()).map(|c| boosted(c, None, 200)));
     // The rest of PATH (lskq, lsbom…) only once a word is specific enough
     // to be looking for one of them.
-    if typed.chars().count() >= 3 {
+    if typed.chars().count() >= 2 {
         out.extend(names.iter().map(|n| item(n.as_str(), Kind::Command, None)));
     }
+    out
+}
+
+/// The user's aliases and functions, read from their shell startup files
+/// (not by running a shell): (name, "alias" or "function"). Kept a minute.
+fn shell_defined() -> Vec<(String, &'static str)> {
+    static CACHE: Mutex<Option<(Instant, Vec<(String, &'static str)>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = cache.as_ref() {
+        if at.elapsed() < Duration::from_secs(60) {
+            return v.clone();
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for f in [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".bash_aliases", ".zsh_aliases", ".aliases"] {
+        let Ok(text) = std::fs::read_to_string(home.join(f)) else { continue };
+        for line in text.lines() {
+            let l = line.trim_start();
+            let ok = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c));
+            if let Some(rest) = l.strip_prefix("alias ") {
+                let name = rest.trim_start_matches("-g ").split('=').next().unwrap_or("").trim();
+                if ok(name) {
+                    out.push((name.to_string(), "alias"));
+                }
+            } else if let Some(rest) = l.strip_prefix("function ") {
+                let name = rest.split(|c: char| c == '(' || c == '{' || c.is_whitespace()).next().unwrap_or("");
+                if ok(name) {
+                    out.push((name.to_string(), "function"));
+                }
+            } else if let Some((name, _)) = l.split_once("()") {
+                let name = name.trim();
+                if ok(name) && !name.contains(' ') {
+                    out.push((name.to_string(), "function"));
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(n, _)| seen.insert(n.clone()));
+    *cache = Some((Instant::now(), out.clone()));
     out
 }
 
@@ -497,24 +557,34 @@ fn scan_path() -> Vec<String> {
 }
 
 /// First words of recent history, newest first, each once.
-fn recent_commands() -> Vec<String> {
-    static RECENT: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+fn recent_commands() -> Vec<(String, usize)> {
+    static RECENT: Mutex<Option<(Instant, Vec<(String, usize)>)>> = Mutex::new(None);
     let mut cache = RECENT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, v)) = cache.as_ref() {
         if at.elapsed() < Duration::from_secs(20) {
             return v.clone();
         }
     }
-    let mut seen = std::collections::HashSet::new();
-    let v: Vec<String> = crate::shell::zsh_history(2000)
+    let firsts: Vec<String> = crate::shell::zsh_history(2000)
         .into_iter()
         .filter_map(|(cmd, _)| {
             let (args, word) = split(&format!("{cmd} "));
             let first = args.into_iter().next().or(Some(word.text).filter(|w| !w.is_empty()))?;
             (!first.contains('/') && !first.contains('=')).then_some(first)
         })
-        .filter(|c| seen.insert(c.clone()))
-        .take(30)
+        .collect();
+    // How often each ran (history keeps each line once, so this counts the
+    // different lines it started).
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in &firsts {
+        *counts.entry(f.as_str()).or_default() += 1;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let v: Vec<(String, usize)> = firsts
+        .iter()
+        .filter(|c| seen.insert(c.as_str()))
+        .take(40)
+        .map(|c| (c.clone(), counts.get(c.as_str()).copied().unwrap_or(1)))
         .collect();
     *cache = Some((Instant::now(), v.clone()));
     v
