@@ -174,20 +174,9 @@ pub fn billing_url() -> Option<String> {
 }
 
 fn random_hex(n: usize) -> String {
-    use std::io::Read;
-    let mut buf = vec![0u8; n];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_err()
-    {
-        // Never reached on a Mac; the state still differs per attempt.
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        buf = t.to_le_bytes()[..n.min(16)].to_vec();
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    // OS CSPRNG on every platform; one UUID covers up to 16 bytes.
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    hex[..(2 * n).min(hex.len())].to_string()
 }
 
 /// `deck://auth/callback?code=…&state=…`: the one-time code, when the state

@@ -1530,13 +1530,25 @@ impl ChatPane {
         }
         self.remote = Some(host);
         self.cwd = dir;
-        if let Some(old) = self.conn.take() {
-            old.shutdown();
-        }
-        self.warmed = false;
+        self.restart_elsewhere();
         self.schedule_save(cx);
         cx.emit(ChatEvent::Moved);
         cx.notify();
+    }
+
+    /// Stop the agent warmed up in the old place. Its session id goes too:
+    /// Claude keeps sessions by folder, so `--resume` of it elsewhere fails
+    /// with "No conversation found".
+    fn restart_elsewhere(&mut self) {
+        if let Some(old) = self.conn.take() {
+            old.shutdown();
+        }
+        self.native_id = None;
+        self.error = None;
+        if self.status == ChatStatus::Failed {
+            self.status = ChatStatus::Idle;
+        }
+        self.warmed = false;
     }
 
     pub fn set_cwd(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
@@ -1544,10 +1556,7 @@ impl ChatPane {
             return;
         }
         self.cwd = dir;
-        if let Some(old) = self.conn.take() {
-            old.shutdown();
-        }
-        self.warmed = false;
+        self.restart_elsewhere();
         self.schedule_save(cx);
         cx.emit(ChatEvent::Moved);
         cx.notify();
@@ -2418,6 +2427,17 @@ impl ChatPane {
                         }
                         AgentEvent::Fatal { message, .. } => {
                             failed_resume |= self.resuming.is_some();
+                            // A session Claude does not have (made in another
+                            // folder): the next start begins a fresh one.
+                            // The connection goes too: it would restart with
+                            // the same `--resume` and fail the same way.
+                            if message.contains("No conversation found") {
+                                self.native_id = None;
+                                if let Some(old) = self.conn.take() {
+                                    old.shutdown();
+                                }
+                                self.warmed = false;
+                            }
                             self.error = Some(message.clone().into());
                             self.status = ChatStatus::Failed;
                         }

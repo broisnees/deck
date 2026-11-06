@@ -32,6 +32,8 @@ pub enum Pick {
     SaveSnippet(String),
     /// Type this command at the terminal's prompt, as it was (not run).
     Command(String),
+    /// Continue this Claude Code conversation (its transcript file) in a chat.
+    ClaudeSession(PathBuf),
 }
 
 impl Clone for Pick {
@@ -46,6 +48,7 @@ impl Clone for Pick {
             Pick::Snippet(t) => Pick::Snippet(t.clone()),
             Pick::SaveSnippet(t) => Pick::SaveSnippet(t.clone()),
             Pick::Command(t) => Pick::Command(t.clone()),
+            Pick::ClaudeSession(p) => Pick::ClaudeSession(p.clone()),
         }
     }
 }
@@ -117,6 +120,8 @@ pub struct Palette {
     /// Opened with ⌃R in a terminal: the commands run there and in your
     /// shell's history, newest first, all shown before anything is typed.
     history_only: bool,
+    /// What an empty history list says.
+    empty: &'static str,
     /// (item index, matched byte positions), best first.
     shown: Vec<(Ref, Vec<usize>)>,
     selected: usize,
@@ -167,6 +172,15 @@ impl Palette {
         p
     }
 
+    /// Claude Code's conversations, to continue one in a chat.
+    pub fn sessions(items: Vec<Item>, cx: &mut Context<Self>) -> Self {
+        let mut p = Self::build(items, false, false, "Continue a Claude Code session…", cx);
+        p.history_only = true;
+        p.empty = "No Claude Code sessions found";
+        p.refilter(cx);
+        p
+    }
+
     /// The snippets alone (⌘;).
     pub fn snippets(items: Vec<Item>, cx: &mut Context<Self>) -> Self {
         Self::build(
@@ -211,6 +225,7 @@ impl Palette {
             tasks,
             snippets_only,
             history_only: false,
+            empty: "No commands yet",
             shown: Vec::new(),
             selected: 0,
             child_of: Vec::new(),
@@ -526,7 +541,7 @@ impl Render for Palette {
                     .child(if self.snippets_only {
                         "No snippets yet. Type one and press ⏎ to keep it."
                     } else if self.history_only {
-                        "No commands yet"
+                        self.empty
                     } else {
                         "Nothing matches"
                     }),

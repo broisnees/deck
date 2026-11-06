@@ -21,6 +21,7 @@ ghostty = ["term/ghostty"]
 
 [dependencies]
 smol_str.workspace = true
+uuid.workspace = true
 term.workspace = true
 agent-core.workspace = true
 agent-claude.workspace = true

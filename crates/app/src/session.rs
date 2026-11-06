@@ -431,6 +431,121 @@ fn titles_in(path: &Path) -> ConvTitles {
     out
 }
 
+/// Claude Code's conversations from every folder, newest first, at most
+/// `limit`: (transcript file, the folder it ran in, its title).
+// ponytail: reads each listed file whole for its title; fine at tens of
+// sessions, cache titles by (path, mtime) if the list grows.
+pub fn claude_all_sessions(limit: usize) -> Vec<(PathBuf, PathBuf, String)> {
+    let root = agent_core::dirs::home_dir().unwrap_or_default().join(".claude/projects");
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let cwd = claude_cwd(&path)?;
+            let title = titles_in(&path).pick("")?;
+            Some((path, cwd, title))
+        })
+        .take(limit)
+        .collect()
+}
+
+/// The folder a Claude Code conversation ran in, from the first line that
+/// says (the directory name is lossy: `-` stands for any punctuation).
+fn claude_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .take(200)
+        .filter(|l| l.contains("\"cwd\""))
+        .find_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(&l).ok()?;
+            v.get("cwd")?.as_str().map(PathBuf::from)
+        })
+}
+
+/// A Claude Code conversation as a Deck thread that continues it: its
+/// folder, title and the words said both ways, with Claude's session id so
+/// the next message resumes the real session (tools, files and all).
+pub fn import_claude(path: &Path) -> Option<crate::threads::Saved> {
+    use agent_core::transcript::{Block, Message, Role};
+    let id = path.file_stem()?.to_str()?.to_string();
+    let cwd = claude_cwd(path)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let when = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64);
+    let claude = agent_core::AgentId::new("claude");
+    let mut transcript = agent_core::Transcript::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("isSidechain").is_some_and(|s| s == true) || v.get("isMeta").is_some_and(|m| m == true) {
+            continue;
+        }
+        let words = message_text(&v["message"]["content"]);
+        if words.trim().is_empty() {
+            continue;
+        }
+        match v.get("type").and_then(|t| t.as_str()) {
+            // Slash commands, hook output and caveats are Claude Code's own.
+            Some("user") if !words.trim_start().starts_with('<') && !words.starts_with("Caveat:") => {
+                transcript.push_user(words, vec![], when);
+            }
+            // One reply is spread over many lines (text, tool, text…): they
+            // go into one message until you speak again.
+            Some("assistant") => {
+                let last = transcript.messages.last_mut().filter(|m| m.role == Role::Assistant);
+                let block = Block::Text { text: words, open: false };
+                match last {
+                    Some(m) => m.blocks.push(block),
+                    None => {
+                        let mut m = Message::new(Role::Assistant, Some(claude.clone()), when);
+                        m.blocks.push(block);
+                        transcript.messages.push(m);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let title = titles_in(path).pick("").unwrap_or_else(|| "Claude Code session".into());
+    Some(crate::threads::Saved {
+        id: agent_core::SessionId::new().0.to_string(),
+        agent: "claude".into(),
+        cwd,
+        title,
+        transcript,
+        native_id: Some(id),
+        updated: when,
+        ..Default::default()
+    })
+}
+
+/// The text parts of a message's content, tool calls and results left out.
+fn message_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
 /// A user message's first line, when it is something you asked rather
 /// than a slash command or a caveat Claude Code wrote.
 fn ask_of(line: &str) -> Option<String> {
@@ -459,6 +574,36 @@ fn ask_of(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_code_session_imports_as_a_resumable_thread() {
+        use agent_core::transcript::{Block, Role};
+        let dir = std::env::temp_dir().join(format!("deck-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abc-123.jsonl");
+        let lines = [
+            r#"{"type":"mode","mode":"normal"}"#,
+            r#"{"type":"user","cwd":"/work/app","message":{"role":"user","content":"<command-name>/init</command-name>"}}"#,
+            r#"{"type":"user","cwd":"/work/app","message":{"role":"user","content":"fix the login bug please"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"file"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Fixed it."}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let s = import_claude(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(s.native_id.as_deref(), Some("abc-123"));
+        assert_eq!(s.cwd, PathBuf::from("/work/app"));
+        assert_eq!(s.agent, "claude");
+        assert_eq!(s.title, "fix the login bug please");
+        let m = &s.transcript.messages;
+        assert_eq!(m.len(), 2, "the ask, then one reply");
+        assert_eq!(m[0].role, Role::User);
+        assert_eq!(m[1].role, Role::Assistant);
+        let said: Vec<&str> = m[1].blocks.iter().filter_map(|b| match b { Block::Text { text, .. } => Some(text.as_str()), _ => None }).collect();
+        assert_eq!(said, ["Looking.", "Fixed it."]);
+    }
 
     fn argv(words: &str) -> Vec<String> {
         words.split(' ').map(str::to_string).collect()

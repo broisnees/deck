@@ -23,7 +23,6 @@ use gpui::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,6 +40,7 @@ actions!(
         AskCommand,
         CloseIdleTabs,
         ImportBrowserData,
+        ContinueClaudeSession,
         NewTab,
         NewTerminal,
         NewBrowser,
@@ -1401,12 +1401,7 @@ impl Workspace {
                 seed = Some(cwd.clone());
                 // In the background service when it can be: the shell (and
                 // any agent in it) outlives Deck, and this pane attaches.
-                let attach_cmd = std::env::current_exe().ok().map(|exe| {
-                    move |name: &str| {
-                        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-                        format!("exec {} job attach {}", q(&exe.to_string_lossy()), q(name))
-                    }
-                });
+                let attach_cmd = std::env::current_exe().ok().map(|exe| move |name: &str| job_attach_cmd(&exe, name));
                 let mut session: Option<(String, u32)> = None;
                 if let Some((name, pid, _)) = reattach {
                     session = Some((name, pid));
@@ -5384,6 +5379,69 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Claude Code's recent conversations, from every folder, to continue
+    /// one in a chat.
+    fn open_claude_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        }
+        let home = agent_core::dirs::home_dir().unwrap_or_default();
+        let items: Vec<Item> = crate::session::claude_all_sessions(60)
+            .into_iter()
+            .map(|(path, cwd, title)| {
+                let when = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| format!(" · {} ago", short_secs(d.as_secs())))
+                    .unwrap_or_default();
+                let place = cwd.strip_prefix(&home).map(|p| format!("~/{}", p.display())).unwrap_or_else(|_| cwd.display().to_string());
+                Item {
+                    kind: crate::palette::Kind::Command,
+                    title: title.into(),
+                    detail: format!("{place}{when}").into(),
+                    icon: Icon::agent("claude"),
+                    hint: None,
+                    pick: crate::palette::Pick::ClaudeSession(path),
+                }
+            })
+            .collect();
+        let palette = cx.new(|cx| Palette::sessions(items, cx));
+        let sub = cx.subscribe_in(&palette, window, move |ws, _, ev: &PaletteEvent, window, cx| match ev {
+            PaletteEvent::Close => ws.close_palette(window, cx),
+            PaletteEvent::Run(pick) => {
+                let pick = pick.clone();
+                ws.close_palette(window, cx);
+                ws.run_pick(pick, window, cx);
+            }
+            PaletteEvent::Query(_) => {}
+        });
+        let focus = palette.read(cx).focus(cx);
+        self.palette = Some((palette, None, sub));
+        window.focus(&focus);
+        crate::browser::reclaim_keyboard(window);
+        cx.notify();
+    }
+
+    /// A Claude Code conversation as a chat that resumes it, or the chat
+    /// already continuing it.
+    fn continue_claude_session(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+        let open = self.panes.iter().find_map(|(&pane, p)| match &p.kind {
+            PaneKind::Chat(c) if c.read(cx).native_id().is_some() && c.read(cx).native_id().map(str::to_string) == id => Some(pane),
+            _ => None,
+        });
+        if let Some(pane) = open {
+            return self.focus_pane(pane, window, cx);
+        }
+        let Some(saved) = crate::session::import_claude(path) else {
+            return self.flash("Couldn't read that Claude Code session.", cx);
+        };
+        if let Err(e) = self.new_tab(Open::Thread(Box::new(saved)), None, window, cx) {
+            self.flash(format!("Couldn't open it: {e}"), cx);
+        }
+    }
+
     /// ⌃K (actions) or ⌘P (tabs): the palette narrowed to one kind. Its
     /// own key again closes it; another palette's key switches to that one.
     fn toggle_scoped_palette(&mut self, scope: crate::palette::Scope, window: &mut Window, cx: &mut Context<Self>) {
@@ -5732,6 +5790,13 @@ impl Workspace {
                 Box::new(ImportBrowserData),
             ),
             action(
+                "Continue Claude Code Session",
+                "Pick a conversation from Claude Code and go on with it here",
+                Icon::Import,
+                None,
+                Box::new(ContinueClaudeSession),
+            ),
+            action(
                 "Split Right",
                 "",
                 Icon::Split,
@@ -5866,6 +5931,7 @@ impl Workspace {
                     self.flash("Command copied. ⌘V to paste it.", cx);
                 }
             },
+            P::ClaudeSession(path) => self.continue_claude_session(&path, window, cx),
             P::SaveSnippet(text) => {
                 let name = crate::snippets::add(&text);
                 self.flash(format!("Kept \"{name}\" as a snippet. ⌘; puts it in."), cx);
@@ -7949,9 +8015,7 @@ impl Workspace {
     /// runs `deck job attach NAME`, so closing it (or quitting Deck) leaves
     /// the job running.
     fn attach_pane(&mut self, name: &str, cwd: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<PaneId> {
-        let exe = std::env::current_exe()?;
-        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        let cmd = format!("exec {} job attach {}", q(&exe.to_string_lossy()), q(name));
+        let cmd = job_attach_cmd(&std::env::current_exe()?, name);
         let id = self.make_pane(Open::Terminal { cmd: Some(cmd), cwd: Some(cwd.to_path_buf()) }, None, window, cx)?;
         self.jobs.push(id);
         self.named.insert(name.to_string(), id);
@@ -12577,6 +12641,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &OpenPackages, w, cx| ws.open_page(PageKind::Packages, w, cx)))
             .on_action(cx.listener(|ws, _: &ImportBrowserData, w, cx| ws.open_settings_at(crate::settings_pane::Page::Browser, w, cx)))
+            .on_action(cx.listener(|ws, _: &ContinueClaudeSession, w, cx| ws.open_claude_sessions(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleAgents, w, cx| {
                 ws.sidebar = true;
                 let at = ws.agent_menu_at();
@@ -13068,14 +13133,27 @@ fn host(url: &str) -> String {
         .to_string()
 }
 
+/// The shell line a pane runs to show background job `name`; the pane ends
+/// with the attach.
+fn job_attach_cmd(exe: &std::path::Path, name: &str) -> String {
+    let exe = exe.to_string_lossy();
+    #[cfg(windows)]
+    {
+        // ponytail: PowerShell syntax, the default Windows shell; a DECK_SHELL
+        // of cmd.exe would need its own quoting.
+        let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        format!("& {} job attach {}; exit", q(&exe), q(name))
+    }
+    #[cfg(not(windows))]
+    {
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        format!("exec {} job attach {}", q(&exe), q(name))
+    }
+}
+
 fn new_token() -> String {
-    let mut bytes = [0u8; 16];
-    // /dev/urandom cannot run dry; failing to open it means a broken system,
-    // and an all-zero token would be guessable, so that is fatal.
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("read /dev/urandom");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    // 122 bits from the OS CSPRNG on every platform (Windows has no /dev/urandom).
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Your snippets and the project's as palette rows.
