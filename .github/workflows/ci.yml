@@ -7,7 +7,13 @@ on:
     # as a GitHub Release, which the in-app updater reads.
     tags: ["v*"]
   pull_request:
+  # A manual run can build one platform: gh workflow run ci.yml -f only=windows
   workflow_dispatch:
+    inputs:
+      only:
+        type: choice
+        options: [all, linux, macos, windows]
+        default: all
 
 # A newer push to the same branch or PR cancels the run still going.
 # Version tags always finish, since they publish.
@@ -22,6 +28,7 @@ env:
 
 jobs:
   linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +55,7 @@ jobs:
       - run: cargo test --workspace
 
   macos:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'macos'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +70,7 @@ jobs:
       - run: cargo test --workspace
 
   windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-latest
     permissions:
       contents: write
