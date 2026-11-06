@@ -8407,6 +8407,13 @@ impl Workspace {
                     Axis::Row => d.flex_row(),
                     Axis::Column => d.flex_col(),
                 };
+                // Weights scaled to add up to the number of panes. Flexbox
+                // hands out only that share of the room when grow factors
+                // sum below one, and removing a pane (or an older saved
+                // layout) can leave them there: the split then stopped short
+                // of the window's edge with an empty strip beside it.
+                let sum: f32 = sizes.iter().take(children.len()).sum();
+                let scale = if sum > f32::EPSILON { children.len() as f32 / sum } else { 1. };
                 for (i, c) in children.iter().enumerate() {
                     if i > 0 {
                         d = d.child(self.render_divider(
@@ -8440,7 +8447,7 @@ impl Workspace {
                             .left_0()
                             .size_full(),
                         );
-                    cell.style().flex_grow = Some(sizes.get(i).copied().unwrap_or(1.));
+                    cell.style().flex_grow = Some(sizes.get(i).map_or(1., |w| w * scale));
                     cell.style().flex_shrink = Some(1.);
                     d = d.child(cell);
                 }
