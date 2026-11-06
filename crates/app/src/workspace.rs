@@ -9805,16 +9805,19 @@ impl Workspace {
         };
         let (_, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
+        let picked = self.row_picked(ix);
         let row = sidebar_row(
             div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
             indent,
             active,
             !loud,
         )
-        .when(self.row_picked(ix), picked_row)
+        .when(picked, picked_row)
         .group(group.clone())
         .h(u(ROW_H))
-            .child(lead(if working {
+            .child(lead(if picked {
+                pick_check()
+            } else if working {
                 thinking(
                     ElementId::NamedInteger("thread-think".into(), ix as u64),
                     glyph,
@@ -9850,7 +9853,7 @@ impl Workspace {
                             .one_line()
                             .text_size(u(ROW_TEXT))
                             .when(loud && !working && !wants, |d| d.font_weight(FontWeight::SEMIBOLD))
-                            .text_color(rgb(if active || loud {
+                            .text_color(rgb(if active || loud || picked {
                                 theme::text()
                             } else {
                                 theme::text_2()
@@ -10111,22 +10114,23 @@ impl Workspace {
             _ => icon(glyph, 15., tone),
         };
 
+        let picked = self.row_picked(ix);
         sidebar_row(
             div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
             indent,
             active,
             !busy && !wants,
         )
-        .when(self.row_picked(ix), picked_row)
+        .when(picked, picked_row)
         .group(group.clone())
         .h(u(ROW_H))
         .text_size(u(ROW_TEXT))
-        .text_color(rgb(if active || busy || wants {
+        .text_color(rgb(if active || busy || wants || picked {
             theme::text()
         } else {
             theme::text_2()
         }))
-            .child(lead(mark))
+            .child(lead(if picked { pick_check() } else { mark }))
             // Definite-width boxes, so gpui knows where to put the ellipsis.
             .child(
                 div()
@@ -12398,26 +12402,26 @@ pub struct BranchPicker {
     at: gpui::Point<gpui::Pixels>,
 }
 
-/// A row picked with ⌘-click: the accent's tint and edge, full strength.
+/// A row picked with ⌘-click: the accent's tint, a fill alone like the
+/// open row (no outline), at full strength. Hover keeps the tint, so the
+/// row doesn't flicker to the plain hover fill under the pointer.
 fn picked_row(d: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
-    d.relative()
-        .bg(rgba(theme::alpha(theme::accent(), 0x1f)))
-        .border_color(rgba(theme::alpha(theme::accent(), 0x59)))
-        .opacity(1.)
-        // A check on the row's leading edge: picked, not just open.
-        .child(
-            div()
-                .absolute()
-                .left(u(-3.))
-                .top(u(-3.))
-                .size(u(14.))
-                .rounded_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgb(theme::accent()))
-                .child(icon(Icon::Check, 9., theme::pane())),
-        )
+    let fill = rgba(theme::alpha(theme::accent(), 0x1f));
+    d.bg(fill).opacity(1.).hover(move |s| s.bg(fill).opacity(1.))
+}
+
+/// What a picked row shows in its icon's place: a filled check, inside
+/// the row, on the icons' line.
+fn pick_check() -> AnyElement {
+    div()
+        .size(u(16.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(theme::accent()))
+        .child(icon(Icon::Check, 10., theme::on_accent()))
+        .into_any_element()
 }
 
 #[derive(Clone, Copy, PartialEq)]
