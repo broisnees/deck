@@ -618,12 +618,18 @@ const COMMON: &[&str] = &[
 
 fn scan_path() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    let path = std::env::var("PATH").unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
-    for dir in path.split(':').filter(|d| !d.is_empty()) {
+    for dir in std::env::split_paths(&path).filter(|d| !d.as_os_str().is_empty()) {
         let Ok(read) = std::fs::read_dir(dir) else { continue };
         for e in read.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
+            let mut name = e.file_name().to_string_lossy().into_owned();
+            // Typed without its extension on Windows: `git`, not `git.exe`.
+            if cfg!(windows) {
+                if let Some((stem, _)) = name.rsplit_once('.') {
+                    name = stem.to_string();
+                }
+            }
             if name.starts_with('.') || !seen.insert(name.clone()) {
                 continue;
             }
@@ -1055,6 +1061,7 @@ mod tests {
         assert!(!one_edit("clear", "cls"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn cls_means_clear() {
         let f = complete("cls", 3, Path::new("/"));
@@ -1095,6 +1102,7 @@ mod tests {
         assert!(complete("git status", 10, &tmp).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn commands_rank_what_people_run_and_whole_words_close_the_menu() {
         let tmp = std::env::temp_dir();
