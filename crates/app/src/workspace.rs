@@ -552,13 +552,16 @@ impl Node {
     /// the same way, as i3 does, so three splits right are three equal columns
     /// rather than a staircase.
     fn split(&mut self, target: PaneId, new: PaneId, axis: Axis) -> bool {
+        self.place(target, new, axis, false)
+    }
+
+    /// Put `new` beside `target` along `axis`: after it (right or below),
+    /// or with `before`, ahead of it (left or above).
+    fn place(&mut self, target: PaneId, new: PaneId, axis: Axis, before: bool) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
-                *self = Node::Split(
-                    axis,
-                    vec![Node::Leaf(target), Node::Leaf(new)],
-                    vec![1., 1.],
-                );
+                let pair = if before { [new, target] } else { [target, new] };
+                *self = Node::Split(axis, pair.map(Node::Leaf).to_vec(), vec![1., 1.]);
                 true
             }
             Node::Leaf(_) => false,
@@ -568,12 +571,13 @@ impl Node {
                         // The new pane takes half of the one it splits.
                         let half = sizes[i] / 2.;
                         sizes[i] = half;
-                        sizes.insert(i + 1, half);
-                        children.insert(i + 1, Node::Leaf(new));
+                        let at = if before { i } else { i + 1 };
+                        sizes.insert(at, half);
+                        children.insert(at, Node::Leaf(new));
                         return true;
                     }
                 }
-                children.iter_mut().any(|c| c.split(target, new, axis))
+                children.iter_mut().any(|c| c.place(target, new, axis, before))
             }
         }
     }
@@ -918,6 +922,12 @@ pub struct Workspace {
     working_since: HashMap<PaneId, Instant>,
     /// Where each split cell was last laid out, by the pane it starts with.
     cells: std::rc::Rc<std::cell::RefCell<HashMap<PaneId, gpui::Bounds<gpui::Pixels>>>>,
+    /// A pane picked up by its grip, while the drag lasts.
+    pane_drag: Option<PaneId>,
+    /// Where it would land if let go now; drawn as a highlight.
+    pane_drop: Option<PaneDrop>,
+    /// Where the places it can land were drawn last frame.
+    drop_map: Rc<std::cell::RefCell<DropMap>>,
     /// The last notification each pane posted, so one prompt is one banner.
     alerted: HashMap<PaneId, (Instant, String)>,
     /// What the Dock badge says: how many panes want you.
@@ -1152,6 +1162,9 @@ impl Workspace {
             working_since: HashMap::new(),
             stalls: HashMap::new(),
             cells: Default::default(),
+            pane_drag: None,
+            pane_drop: None,
+            drop_map: Default::default(),
             alerted: HashMap::new(),
             badge: 0,
             restored: false,
@@ -3694,7 +3707,14 @@ impl Workspace {
     /// The focused pane, out of its split and into a tab of its own, in
     /// front: a page or terminal that needs the whole window.
     fn move_to_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.focused() else { return };
+        if let Some(id) = self.focused() {
+            self.pane_to_new_tab(id, window, cx);
+        }
+    }
+
+    /// Pane `id` out of its split into a tab of its own, right after the
+    /// one it was in, and in front.
+    fn pane_to_new_tab(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tab_of(id) else { return };
         if self.tabs[ix].root == Node::Leaf(id) {
             return self.flash("Already a tab of its own.".to_string(), cx);
@@ -3715,6 +3735,137 @@ impl Workspace {
         );
         self.focus_pane(id, window, cx);
         cx.notify();
+    }
+
+    /// Pane `id` out of its split and into tab `to`, to the right of the
+    /// pane in front there, and that tab in front.
+    fn pane_into_tab(&mut self, id: PaneId, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.tab_of(id) else { return };
+        if from == to || to >= self.tabs.len() || self.tabs[from].root == Node::Leaf(id) {
+            return;
+        }
+        let tab = &mut self.tabs[from];
+        tab.root.remove(id);
+        if tab.focused == id {
+            tab.focused = tab.leaves()[0];
+        }
+        let tab = &mut self.tabs[to];
+        let beside = tab.focused;
+        tab.root.split(beside, id, Axis::Row);
+        self.focus_pane(id, window, cx);
+    }
+
+    /// Pane `id` moved within its split to `side` of `target`.
+    fn pane_beside(&mut self, id: PaneId, target: PaneId, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_of(id) else { return };
+        if id == target || self.tab_of(target) != Some(ix) {
+            return;
+        }
+        let (axis, before) = match side {
+            Side::Left => (Axis::Row, true),
+            Side::Right => (Axis::Row, false),
+            Side::Top => (Axis::Column, true),
+            Side::Bottom => (Axis::Column, false),
+        };
+        let root = &mut self.tabs[ix].root;
+        root.remove(id);
+        root.place(target, id, axis, before);
+        self.focus_pane(id, window, cx);
+    }
+
+    /// Where a pane dragged from `src` would land with the pointer at `p`:
+    /// the sidebar's empty part makes it a tab of its own, a row there
+    /// moves it into that tab, and a pane of this split takes it on the
+    /// side nearest the pointer. Its own pane and its own row are no move.
+    fn pane_drop_at(&self, src: PaneId, p: gpui::Point<gpui::Pixels>) -> Option<PaneDrop> {
+        let map = self.drop_map.borrow();
+        let from = self.tab_of(src)?;
+        if map.sidebar.is_some_and(|b| b.contains(&p)) {
+            return match map.rows.iter().find(|(_, b)| b.contains(&p)).map(|(ix, _)| *ix) {
+                None => Some(PaneDrop::NewTab),
+                Some(ix) if ix != from && ix < self.tabs.len() && Some(ix) != self.settings_tab() => {
+                    Some(PaneDrop::IntoTab(ix))
+                }
+                Some(_) => None,
+            };
+        }
+        let (&id, b) = map.leaves.iter().find(|(id, b)| b.contains(&p) && self.tabs[from].root.contains(**id))?;
+        if id == src {
+            return None;
+        }
+        let fx = f32::from(p.x - b.origin.x) / f32::from(b.size.width).max(1.);
+        let fy = f32::from(p.y - b.origin.y) / f32::from(b.size.height).max(1.);
+        let side = [(fx, Side::Left), (1. - fx, Side::Right), (fy, Side::Top), (1. - fy, Side::Bottom)]
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, s)| s)?;
+        Some(PaneDrop::Beside(id, side))
+    }
+
+    /// The mouse came up: put a dragged pane where it was let go.
+    fn drop_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(src) = self.pane_drag.take() else { return };
+        match self.pane_drop.take() {
+            Some(PaneDrop::NewTab) => self.pane_to_new_tab(src, window, cx),
+            Some(PaneDrop::IntoTab(ix)) => self.pane_into_tab(src, ix, window, cx),
+            Some(PaneDrop::Beside(target, side)) => self.pane_beside(src, target, side, window, cx),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// Where a dragged pane would go, over the place itself: half of the
+    /// pane it would sit beside, the row of the tab it would join, or the
+    /// sidebar with "New tab" for a tab of its own.
+    fn render_drop_hint(&self) -> Option<AnyElement> {
+        let drop = self.pane_drop?;
+        let map = self.drop_map.borrow();
+        let (b, inset, label) = match drop {
+            PaneDrop::Beside(id, side) => {
+                let b = *map.leaves.get(&id)?;
+                let (w, h) = (b.size.width, b.size.height);
+                let (o, half) = match side {
+                    Side::Left => (b.origin, gpui::size(w / 2., h)),
+                    Side::Right => (gpui::point(b.origin.x + w / 2., b.origin.y), gpui::size(w / 2., h)),
+                    Side::Top => (b.origin, gpui::size(w, h / 2.)),
+                    Side::Bottom => (gpui::point(b.origin.x, b.origin.y + h / 2.), gpui::size(w, h / 2.)),
+                };
+                (gpui::Bounds::new(o, half), 6., None)
+            }
+            PaneDrop::IntoTab(ix) => (*map.rows.get(&ix)?, 0., None),
+            PaneDrop::NewTab => (map.sidebar?, 8., Some("New tab")),
+        };
+        Some(
+            div()
+                .absolute()
+                .left(b.origin.x)
+                .top(b.origin.y)
+                .w(b.size.width)
+                .h(b.size.height)
+                .p(u(inset))
+                .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(u(if inset > 0. { theme::CARD_RADIUS } else { theme::ROW_RADIUS }))
+                        .bg(rgba(theme::alpha(theme::accent(), 0x1f)))
+                        .border_1()
+                        .border_color(rgba(theme::alpha(theme::accent(), 0x8c)))
+                        .children(label.map(|l| {
+                            div()
+                                .px(u(10.))
+                                .py(u(4.))
+                                .rounded(u(6.))
+                                .bg(rgb(theme::menu()))
+                                .text_size(u(theme::TEXT_UI))
+                                .text_color(rgb(theme::text()))
+                                .child(l)
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -8674,9 +8825,12 @@ impl Workspace {
                 .into_any_element(),
             None => body,
         };
+        let map = self.drop_map.clone();
+        let group = SharedString::from(format!("pane-{id}"));
         div()
             .relative()
             .size_full()
+            .group(group.clone())
             .bg(rgb(theme::pane()))
             // In a split, the focused card has the brighter edge: where
             // keys go, without a stripe or fading the others.
@@ -8708,6 +8862,60 @@ impl Workspace {
                 }),
             )
             .child(body)
+            .child(mark_bounds(move |b| {
+                map.borrow_mut().leaves.insert(id, b);
+            }))
+            .when(multi, |d| d.child(self.render_grip(id, group, cx)))
+            .into_any_element()
+    }
+
+    /// A split pane's handle: a short bar at the top edge, shown while the
+    /// pane is hovered. Dragged, it takes the pane to the sidebar for a tab
+    /// of its own, to a tab's row to join it, or to a side of another pane.
+    fn render_grip(&self, id: PaneId, group: SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let ws = cx.entity().downgrade();
+        let title = self.pane_title(id, cx);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id(ElementId::NamedInteger("pane-grip".into(), id))
+                    // Its own: the press must not start a selection in the
+                    // terminal underneath.
+                    .occlude()
+                    .w(u(64.))
+                    .h(u(GRIP_H))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(gpui::CursorStyle::OpenHand)
+                    .tooltip(|_, cx| Tip::view("Drag to move · to the sidebar for a new tab", cx))
+                    .child(
+                        div()
+                            .w(u(32.))
+                            .h(u(4.))
+                            .rounded_full()
+                            .bg(rgba(theme::alpha(theme::text(), 0x59)))
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.)),
+                    )
+                    .on_drag(DraggedPane(id), move |d, _, _, cx| {
+                        if let Some(ws) = ws.upgrade() {
+                            ws.update(cx, |ws, cx| {
+                                ws.pane_drag = Some(d.0);
+                                ws.pane_drop = None;
+                                cx.notify();
+                            });
+                        }
+                        let title = title.clone();
+                        cx.new(|_| PaneGhost(title))
+                    }),
+            )
             .into_any_element()
     }
 
@@ -8881,6 +9089,8 @@ impl Workspace {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Rows note where they land as they draw; folded ones drop out.
+        self.drop_map.borrow_mut().rows.clear();
         let groups = self.project_groups(cx);
         let header = sidebar_header;
 
@@ -9828,6 +10038,12 @@ impl Workspace {
         .when(picked, picked_row)
         .group(group.clone())
         .h(u(ROW_H))
+        .child({
+            let map = self.drop_map.clone();
+            mark_bounds(move |b| {
+                map.borrow_mut().rows.insert(ix, b);
+            })
+        })
             .child(lead(if picked {
                 pick_check()
             } else if working {
@@ -10137,6 +10353,12 @@ impl Workspace {
         .when(picked, picked_row)
         .group(group.clone())
         .h(u(ROW_H))
+        .child({
+            let map = self.drop_map.clone();
+            mark_bounds(move |b| {
+                map.borrow_mut().rows.insert(ix, b);
+            })
+        })
         .text_size(u(ROW_TEXT))
         .text_color(rgb(if active || busy || wants || picked {
             theme::text()
@@ -11185,6 +11407,65 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// A pane picked up by its grip, as gpui carries it during the drag.
+struct DraggedPane(PaneId);
+
+/// Where a dragged pane would land if let go now.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PaneDrop {
+    /// Beside a pane of its split, on that side of it.
+    Beside(PaneId, Side),
+    /// Out into a tab of its own: the sidebar's empty part.
+    NewTab,
+    /// Into another tab, beside the pane in front there: its row.
+    IntoTab(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Where the places a pane can be dropped were drawn last frame, in
+/// window pixels.
+#[derive(Default)]
+struct DropMap {
+    leaves: HashMap<PaneId, gpui::Bounds<gpui::Pixels>>,
+    /// Sidebar rows, by tab index.
+    rows: HashMap<usize, gpui::Bounds<gpui::Pixels>>,
+    sidebar: Option<gpui::Bounds<gpui::Pixels>>,
+}
+
+/// Notes where the element it fills lands, through `put`.
+fn mark_bounds(put: impl Fn(gpui::Bounds<gpui::Pixels>) + 'static) -> impl IntoElement {
+    canvas(move |b, _, _| put(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+}
+
+/// The dragged pane under the pointer: its name on a small card.
+struct PaneGhost(SharedString);
+
+impl Render for PaneGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .font_family(theme::ui())
+            .max_w(u(220.))
+            .px(u(10.))
+            .py(u(5.))
+            .rounded(u(8.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
+            .shadow_md()
+            .text_size(u(theme::TEXT_UI))
+            .text_color(rgb(theme::text()))
+            .one_line()
+            .child(self.0.clone())
+    }
+}
+
 /// A divider held down: the two panes either side (by the pane each
 /// subtree starts with), where the drag began, their weights then, and the
 /// pixels they share.
@@ -11211,6 +11492,8 @@ const ROW_SLOT: f32 = 16.;
 const TRAIL_W: f32 = 30.;
 /// Every list row: one line, this tall, titles this size.
 const ROW_H: f32 = 32.;
+/// A split pane's grip: the strip at its top edge it is dragged by.
+const GRIP_H: f32 = 8.;
 const ROW_TEXT: f32 = theme::TEXT_UI;
 const HEAD_TEXT: f32 = theme::TEXT_SMALL;
 const ROW_GAP: f32 = 10.;
@@ -11776,7 +12059,24 @@ impl Render for Workspace {
         let screen = self.locked || !crate::account::allowed();
         // Pages are native views drawn above everything gpui paints: while a
         // menu, the palette or a whole-window screen is up, they step aside.
-        let cover = screen || self.menu.is_some() || self.palette.is_some() || self.usage_open;
+        // A pane drag ended somewhere nothing took it (gpui dropped it).
+        if self.pane_drag.is_some() && !cx.has_active_drag() {
+            self.pane_drag = None;
+            self.pane_drop = None;
+        }
+        // Panes and the sidebar note where they land again this frame.
+        {
+            let mut map = self.drop_map.borrow_mut();
+            map.leaves.clear();
+            map.sidebar = None;
+        }
+        // While a pane is dragged, pages step aside too, so the drop
+        // highlight shows over them.
+        let cover = screen
+            || self.menu.is_some()
+            || self.palette.is_some()
+            || self.usage_open
+            || self.pane_drag.is_some();
         if cover != self.screen_cover {
             self.screen_cover = cover;
             self.cover_pages(cover, cx);
@@ -11986,13 +12286,15 @@ impl Render for Workspace {
             .when(sidebar_shown, |d| d.child(self.side_handle(true, cx)))
             .when(inspector_shown, |d| d.child(self.side_handle(false, cx)))
             .when(sidebar_shown, |d| {
+                let map = self.drop_map.clone();
                 d.child(
-                    AnyView::from(sidebar).cached(
-                        StyleRefinement::default()
-                            .flex_none()
-                            .w(u(self.sidebar_px))
-                            .h_full(),
-                    ),
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(u(self.sidebar_px))
+                        .h_full()
+                        .child(AnyView::from(sidebar).cached(StyleRefinement::default().size_full()))
+                        .child(mark_bounds(move |b| map.borrow_mut().sidebar = Some(b))),
                 )
             })
             // The job drawer under the panes only: the sidebar and the
@@ -12029,6 +12331,16 @@ impl Render for Workspace {
             .on_mouse_move(cx.listener(Self::drag_divider))
             .on_mouse_move(cx.listener(Self::drag_side))
             .on_mouse_move(cx.listener(Self::drag_drawer))
+            .on_drag_move::<DraggedPane>(cx.listener(|ws, ev: &gpui::DragMoveEvent<DraggedPane>, _, cx| {
+                let Some(src) = ws.pane_drag else { return };
+                let to = ws.pane_drop_at(src, ev.event.position);
+                if to != ws.pane_drop {
+                    ws.pane_drop = to;
+                    cx.notify();
+                }
+            }))
+            // Before gpui ends the drag on this release.
+            .capture_any_mouse_up(cx.listener(|ws, _: &gpui::MouseUpEvent, w, cx| ws.drop_pane(w, cx)))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|ws, _, _, cx| {
@@ -12260,6 +12572,7 @@ impl Render for Workspace {
             // double-click for the usual width.
             .child(body)
             .children(bar)
+            .children(self.render_drop_hint())
             .children(self.menu.as_ref().map(crate::menu::Open::render))
             // The palette floats over everything, a little above centre,
             // on a scrim that closes it when clicked.
@@ -13505,6 +13818,33 @@ mod tests {
         let mut v = Vec::new();
         n.leaves(&mut v);
         v
+    }
+
+    #[test]
+    fn a_dragged_pane_lands_on_the_side_it_was_dropped() {
+        // Three columns; take the last and drop it left of the first.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Axis::Row);
+        t.split(2, 3, Axis::Row);
+        t.remove(3);
+        assert!(t.place(1, 3, Axis::Row, true));
+        assert_eq!(leaves(&t), vec![3, 1, 2]);
+        // Below the middle one: that column splits, the others stay.
+        t.remove(3);
+        assert!(t.place(2, 3, Axis::Column, false));
+        assert_eq!(
+            t,
+            Node::Split(
+                Axis::Row,
+                vec![Node::Leaf(1), Node::Split(Axis::Column, vec![Node::Leaf(2), Node::Leaf(3)], vec![1., 1.])],
+                vec![0.5, 0.5],
+            )
+        );
+        // Above a lone pane.
+        let mut t = Node::Leaf(1);
+        assert!(t.place(1, 2, Axis::Column, true));
+        assert_eq!(leaves(&t), vec![2, 1]);
+        assert!(!t.place(9, 3, Axis::Row, false));
     }
 
     #[test]
