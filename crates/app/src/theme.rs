@@ -545,6 +545,58 @@ pub fn add_fonts(cx: &gpui::App) {
     if let Err(e) = cx.text_system().add_fonts(fonts) {
         tracing::warn!("could not load the shipped fonts: {e}");
     }
+    if !cfg!(target_os = "macos") {
+        let installed = cx.text_system().all_font_names();
+        let first = |names: &[&'static str]| names.iter().copied().find(|n| installed.iter().any(|i| i == n));
+        let _ = UI_FONT.set(first(UI_FACES).unwrap_or("sans-serif"));
+        let _ = EMOJI_FONT.set(first(EMOJI_FACES).unwrap_or("Noto Color Emoji"));
+    }
+}
+
+/// Off macOS there is no one system face: the first of these installed.
+/// Inter and the desktops' own (GNOME's Adwaita Sans and Cantarell, KDE's
+/// Noto Sans, Ubuntu's), then Windows' Segoe UI.
+const UI_FACES: &[&str] = &[
+    "Inter",
+    "Inter Variable",
+    "Adwaita Sans",
+    "Cantarell",
+    "Noto Sans",
+    "Ubuntu",
+    "Segoe UI",
+    "DejaVu Sans",
+    "Liberation Sans",
+];
+const EMOJI_FACES: &[&str] = &["Noto Color Emoji", "Twemoji", "Segoe UI Emoji", "Apple Color Emoji"];
+
+static UI_FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+static EMOJI_FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The interface's face: the system's on macOS, else the one `add_fonts`
+/// found.
+pub fn ui() -> &'static str {
+    if cfg!(target_os = "macos") {
+        return ".SystemUIFont";
+    }
+    UI_FONT.get().copied().unwrap_or("sans-serif")
+}
+
+/// Code and paths: Menlo, which every Mac has; elsewhere the JetBrains Mono
+/// Deck ships, so the grid never falls back to a proportional face.
+pub fn mono() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        TERM_FONT
+    }
+}
+
+/// Colour emoji, behind every face.
+pub fn emoji() -> &'static str {
+    if cfg!(target_os = "macos") {
+        return "Apple Color Emoji";
+    }
+    EMOJI_FONT.get().copied().unwrap_or("Noto Color Emoji")
 }
 
 /// A terminal face with the symbol and emoji fallbacks behind it.
@@ -552,16 +604,24 @@ pub fn term_font(family: impl Into<gpui::SharedString>) -> gpui::Font {
     gpui::Font {
         fallbacks: Some(gpui::FontFallbacks::from_fonts(vec![
             SYMBOLS_FONT.into(),
-            "Apple Color Emoji".into(),
+            emoji().into(),
         ])),
         ..gpui::font(family)
     }
 }
 
-pub const UI: &str = ".SystemUIFont";
-/// Every Mac has Menlo, so the grid never falls back to a proportional face.
-pub const MONO: &str = "Menlo";
 pub const FONT_PX: f32 = 13.;
+
+// One type scale for the sidebar, chat, pages and settings. Anything
+// between two steps reads as a mistake, so there is nothing between them.
+/// Times, counts, hints, keycaps.
+pub const TEXT_META: f32 = 11.;
+/// Labels, notes, chips, section heads.
+pub const TEXT_SMALL: f32 = 12.;
+/// Sidebar rows, menus, buttons, popovers.
+pub const TEXT_UI: f32 = 13.;
+/// What you read and write: chat messages, the composer.
+pub const TEXT_READ: f32 = 14.;
 pub const TOOLBAR_PX: f32 = 40.;
 pub const SIDEBAR_PX: f32 = 256.;
 pub const INSPECTOR_PX: f32 = 320.;

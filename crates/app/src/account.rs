@@ -2,8 +2,9 @@
 //! sign in, through your browser since Google refuses sign-in inside an
 //! embedded web view, and runs while your plan is active. The backend sends
 //! the browser back to `deck://auth/callback` with a one-time code, which
-//! deck trades for a session token kept in your keychain. A build without a
-//! backend (one you made yourself) asks for nothing.
+//! deck trades for a session token kept by the system (Keychain, Credential
+//! Manager, Secret Service). A build without a backend (one you made
+//! yourself) asks for nothing.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -138,49 +139,18 @@ pub fn allowed() -> bool {
     })
 }
 
-// -- the session token, in the Keychain -------------------------------------------
+// -- the session token, kept by the system (see secret.rs) ----------------------------
 
 fn token() -> Option<String> {
-    let out = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", SERVICE, "-w"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!t.is_empty()).then_some(t)
+    crate::secret::get(SERVICE)
 }
 
-/// The token goes in through `security`'s arguments, so it shows in the
-/// process list for the moment the call takes, to this user only.
 fn store_token(t: &str) -> Result<(), String> {
-    let ok = std::process::Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-a",
-            "deck",
-            "-s",
-            SERVICE,
-            "-w",
-            t,
-        ])
-        .status()
-        .map_err(|e| e.to_string())?
-        .success();
-    if ok {
-        Ok(())
-    } else {
-        Err("the Keychain refused the session".into())
-    }
+    crate::secret::set(SERVICE, t).map_err(|e| format!("could not keep the session: {e}"))
 }
 
 fn clear_token() {
-    let _ = std::process::Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", SERVICE])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    crate::secret::delete(SERVICE);
 }
 
 // -- signing in -----------------------------------------------------------------------
@@ -204,20 +174,9 @@ pub fn billing_url() -> Option<String> {
 }
 
 fn random_hex(n: usize) -> String {
-    use std::io::Read;
-    let mut buf = vec![0u8; n];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_err()
-    {
-        // Never reached on a Mac; the state still differs per attempt.
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        buf = t.to_le_bytes()[..n.min(16)].to_vec();
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    // OS CSPRNG on every platform; one UUID covers up to 16 bytes.
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    hex[..(2 * n).min(hex.len())].to_string()
 }
 
 /// `deck://auth/callback?code=…&state=…`: the one-time code, when the state

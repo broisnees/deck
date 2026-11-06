@@ -37,6 +37,9 @@ pub struct Item {
     /// Added to its match score: what you ran lately and the commands
     /// people use rank above the hundreds of tools in /usr/bin.
     boost: i32,
+    /// Offered for what the word means, not how it is spelled: `clear` for
+    /// `cls`, `git` for `gti`. Goes first whatever the letters.
+    meant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +71,12 @@ pub fn complete(line: &str, cursor: usize, cwd: &Path) -> Option<Found> {
         .into_iter()
         .enumerate()
         .filter_map(|(order, mut it)| {
-            let (score, matched) = score(&it.label, &typed)?;
+            let (score, matched) = if it.meant { (4000, Vec::new()) } else { score(&it.label, &typed)? };
+            // Letters scattered through a name from the rest of PATH match
+            // half of /usr/bin on a short word; they wait for a fourth.
+            if score < 2000 && it.boost == 0 && typed.chars().count() < 4 && it.kind == Kind::Command {
+                return None;
+            }
             it.matched = matched;
             Some((score, order, it))
         })
@@ -214,6 +222,7 @@ fn item(label: impl Into<String>, kind: Kind, detail: Option<&str>) -> Item {
         matched: Vec::new(),
         space: true,
         boost: 0,
+        meant: false,
     }
 }
 
@@ -381,7 +390,7 @@ enum PathFilter {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    agent_core::dirs::home_dir()
 }
 
 /// Entries of the folder the word points into whose names start the way the
@@ -427,6 +436,7 @@ fn paths(typed: &str, cwd: &Path, filter: PathFilter) -> Vec<Item> {
             matched: Vec::new(),
             space: !dir,
             boost: 0,
+            meant: false,
         });
     }
     // Folders first, then by name, before scoring reorders.
@@ -443,8 +453,7 @@ fn quote_path(dir: &str) -> String {
 }
 
 fn executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    crate::os::is_executable(p)
 }
 
 /// Programs on PATH and shell builtins, the ones run lately first.
@@ -478,6 +487,28 @@ fn commands(typed: &str) -> Vec<Item> {
     out.extend(defined.iter().map(|(d, what)| boosted(d, Some(what), 350)));
     out.extend(BUILTINS.iter().map(|(b, d)| boosted(b, Some(d), 300)));
     out.extend(COMMON.iter().filter(|c| names.binary_search_by(|n| n.as_str().cmp(c)).is_ok()).map(|c| boosted(c, None, 200)));
+    // What the word means: another system's command for the same thing,
+    // or a slip of one letter from one you use.
+    if !typed.is_empty() && !runs(typed) {
+        let meant = |label: &str, detail: String| Item { meant: true, ..item(label, Kind::Command, Some(&detail)) };
+        for (from, to) in INTENT {
+            if *from == typed && runs(to) {
+                out.push(meant(to, format!("for {from}")));
+            }
+        }
+        if typed.chars().count() >= 3 {
+            let mut known: Vec<&str> = recent.iter().map(String::as_str).collect();
+            known.extend(defined.iter().map(|(d, _)| d.as_str()));
+            known.extend(BUILTINS.iter().map(|(b, _)| *b));
+            known.extend(COMMON.iter().copied().filter(|c| runs(c)));
+            let mut seen = std::collections::HashSet::new();
+            for k in known {
+                if seen.insert(k) && one_edit(k, typed) {
+                    out.push(meant(k, "did you mean".into()));
+                }
+            }
+        }
+    }
     // The rest of PATH (lskq, lsbom…) only once a word is specific enough
     // to be looking for one of them.
     if typed.chars().count() >= 2 {
@@ -496,7 +527,7 @@ fn shell_defined() -> Vec<(String, &'static str)> {
             return v.clone();
         }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = agent_core::dirs::home_dir().unwrap_or_default();
     let mut out: Vec<(String, &'static str)> = Vec::new();
     for f in [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".bash_aliases", ".zsh_aliases", ".aliases"] {
         let Ok(text) = std::fs::read_to_string(home.join(f)) else { continue };
@@ -527,6 +558,55 @@ fn shell_defined() -> Vec<(String, &'static str)> {
     out
 }
 
+/// What `word` was meant as, when it is not a command here: another
+/// system's name for one (`cls` for `clear`) or a slip of a letter from one
+/// in use (`gti` for `git`). For the terminal's offer after a command fails.
+pub fn meant(word: &str) -> Option<String> {
+    commands(word).into_iter().find(|i| i.meant).map(|i| i.label)
+}
+
+/// Other systems' commands for what a Unix one does, offered when typed:
+/// (typed, meant).
+const INTENT: &[(&str, &str)] = &[
+    ("cls", "clear"),
+    ("dir", "ls"),
+    ("md", "mkdir"),
+    ("rd", "rmdir"),
+    ("del", "rm"),
+    ("erase", "rm"),
+    ("copy", "cp"),
+    ("move", "mv"),
+    ("ren", "mv"),
+    ("tasklist", "ps"),
+    ("taskkill", "kill"),
+    ("findstr", "grep"),
+    ("tracert", "traceroute"),
+    ("ipconfig", "ip"),
+    ("pbcopy", "wl-copy"),
+    ("pbpaste", "wl-paste"),
+    ("open", "xdg-open"),
+    ("explorer", "xdg-open"),
+    ("notepad", "nano"),
+];
+
+/// Whether `a` and `b` differ by one letter added, dropped, changed, or
+/// two neighbours swapped.
+fn one_edit(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a == b || a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let first = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Equal => {
+            a[first + 1..] == b[first + 1..]
+                || (first + 1 < a.len() && a[first] == b[first + 1] && a[first + 1] == b[first] && a[first + 2..] == b[first + 2..])
+        }
+        std::cmp::Ordering::Greater => a[first + 1..] == b[first..],
+        std::cmp::Ordering::Less => a[first..] == b[first + 1..],
+    }
+}
+
 /// Commands worth offering from the first letter.
 const COMMON: &[&str] = &[
     "awk", "bat", "brew", "bun", "bunx", "cargo", "cat", "chmod", "claude", "clear", "code", "codex", "cp", "curl",
@@ -538,12 +618,18 @@ const COMMON: &[&str] = &[
 
 fn scan_path() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    let path = std::env::var("PATH").unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
-    for dir in path.split(':').filter(|d| !d.is_empty()) {
+    for dir in std::env::split_paths(&path).filter(|d| !d.as_os_str().is_empty()) {
         let Ok(read) = std::fs::read_dir(dir) else { continue };
         for e in read.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
+            let mut name = e.file_name().to_string_lossy().into_owned();
+            // Typed without its extension on Windows: `git`, not `git.exe`.
+            if cfg!(windows) {
+                if let Some((stem, _)) = name.rsplit_once('.') {
+                    name = stem.to_string();
+                }
+            }
             if name.starts_with('.') || !seen.insert(name.clone()) {
                 continue;
             }
@@ -966,6 +1052,23 @@ mod tests {
     }
 
     #[test]
+    fn one_edit_catches_slips() {
+        assert!(one_edit("git", "gti"));
+        assert!(one_edit("clear", "claer"));
+        assert!(one_edit("make", "mak"));
+        assert!(one_edit("ls", "lss"));
+        assert!(!one_edit("git", "git"));
+        assert!(!one_edit("clear", "cls"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cls_means_clear() {
+        let f = complete("cls", 3, Path::new("/"));
+        assert_eq!(labels(&f).first(), Some(&"clear"), "{:?}", labels(&f));
+    }
+
+    #[test]
     fn words_split_like_the_shell() {
         let (args, w) = split("FOO=1 sudo git commit -m 'a b' && npm r");
         assert_eq!(args, vec!["npm"]);
@@ -999,6 +1102,7 @@ mod tests {
         assert!(complete("git status", 10, &tmp).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn commands_rank_what_people_run_and_whole_words_close_the_menu() {
         let tmp = std::env::temp_dir();

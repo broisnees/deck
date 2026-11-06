@@ -18,12 +18,11 @@ use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, div, px, Animation, AnimationExt, rgb, rgba, AnyElement, AnyView, App, Context, ElementId, Entity,
-    FontWeight, KeyBinding, Menu, MenuItem, MouseButton, OsAction, SharedString, StyleRefinement,
+    FontWeight, KeyBinding, WindowControlArea, Menu, MenuItem, MouseButton, OsAction, SharedString, StyleRefinement,
     Subscription, Task, WeakEntity, Window,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,6 +40,7 @@ actions!(
         AskCommand,
         CloseIdleTabs,
         ImportBrowserData,
+        ContinueClaudeSession,
         NewTab,
         NewTerminal,
         NewBrowser,
@@ -245,7 +245,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
         ["cmd-i"],
         ToggleInspector
     ),
-    shortcut!("zoom-in", "Zoom in", "Window", ["cmd-=", "cmd-+"], ZoomIn),
+    shortcut!("zoom-in", "Zoom in", "Window", ["cmd-=", "cmd-+", "cmd-shift-="], ZoomIn),
     shortcut!("zoom-out", "Zoom out", "Window", ["cmd--"], ZoomOut),
     shortcut!("zoom-reset", "Actual size", "Window", ["cmd-0"], ZoomReset),
     shortcut!("lock", "Lock Deck", "Window", ["cmd-shift-l"], LockDeck),
@@ -334,49 +334,59 @@ pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
         .filter(|s| s.context.is_none())
         .flat_map(|s| s.keys(mine).into_iter().map(str::to_string))
         .filter(|k| !matches!(k.as_str(), "cmd-c" | "cmd-v" | "cmd-x" | "cmd-a" | "cmd-z" | "cmd-shift-z"))
+        // As this platform binds them (Ctrl+Shift off macOS).
+        .map(|k| crate::keys::native(&k, crate::keys::is_zoom(&k)))
         .collect();
     crate::browser::set_forward_keys(page_keys);
     cx.clear_key_bindings();
-    let mut keys = Vec::new();
+    type Bind = fn(&str, Option<&str>) -> KeyBinding;
+    let mut wanted: Vec<(String, Option<&'static str>, Bind)> = Vec::new();
     for s in SHORTCUTS {
         for k in s.keys(mine) {
-            // A key settings.json holds that does not parse is skipped, not
-            // a crash.
-            if gpui::Keystroke::parse(k).is_ok() {
-                keys.push((s.bind)(k, s.context));
-            }
+            wanted.push((k.to_string(), s.context, s.bind));
         }
     }
-    keys.extend([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-f", Find, Some("Terminal")),
-        KeyBinding::new("cmd-g", FindNext, Some("Terminal")),
-        KeyBinding::new("cmd-shift-g", FindPrevious, Some("Terminal")),
+    let fixed: [(&str, Option<&'static str>, Bind); 25] = [
+        ("cmd-q", None, |k, c| KeyBinding::new(k, Quit, c)),
+        ("cmd-f", Some("Terminal"), |k, c| KeyBinding::new(k, Find, c)),
+        ("cmd-g", Some("Terminal"), |k, c| KeyBinding::new(k, FindNext, c)),
+        ("cmd-shift-g", Some("Terminal"), |k, c| KeyBinding::new(k, FindPrevious, c)),
         // Anywhere else, find goes to the focused page.
-        KeyBinding::new("cmd-f", Find, None),
-        KeyBinding::new("cmd-g", FindNext, None),
-        KeyBinding::new("cmd-shift-g", FindPrevious, None),
-    ]);
-    for ctx in ["Terminal", "Field"] {
-        keys.push(KeyBinding::new("cmd-c", Copy, Some(ctx)));
-        keys.push(KeyBinding::new("cmd-v", Paste, Some(ctx)));
+        ("cmd-f", None, |k, c| KeyBinding::new(k, Find, c)),
+        ("cmd-g", None, |k, c| KeyBinding::new(k, FindNext, c)),
+        ("cmd-shift-g", None, |k, c| KeyBinding::new(k, FindPrevious, c)),
+        ("cmd-c", Some("Terminal"), |k, c| KeyBinding::new(k, Copy, c)),
+        ("cmd-v", Some("Terminal"), |k, c| KeyBinding::new(k, Paste, c)),
+        ("cmd-c", Some("Field"), |k, c| KeyBinding::new(k, Copy, c)),
+        ("cmd-v", Some("Field"), |k, c| KeyBinding::new(k, Paste, c)),
+        ("cmd-x", Some("Field"), |k, c| KeyBinding::new(k, Cut, c)),
+        ("cmd-a", Some("Field"), |k, c| KeyBinding::new(k, SelectAll, c)),
+        ("cmd-a", Some("Terminal"), |k, c| KeyBinding::new(k, SelectAll, c)),
+        ("cmd-z", Some("Field"), |k, c| KeyBinding::new(k, Undo, c)),
+        ("cmd-shift-z", Some("Field"), |k, c| KeyBinding::new(k, Redo, c)),
+        ("cmd-1", None, |k, c| KeyBinding::new(k, Tab1, c)),
+        ("cmd-2", None, |k, c| KeyBinding::new(k, Tab2, c)),
+        ("cmd-3", None, |k, c| KeyBinding::new(k, Tab3, c)),
+        ("cmd-4", None, |k, c| KeyBinding::new(k, Tab4, c)),
+        ("cmd-5", None, |k, c| KeyBinding::new(k, Tab5, c)),
+        ("cmd-6", None, |k, c| KeyBinding::new(k, Tab6, c)),
+        ("cmd-7", None, |k, c| KeyBinding::new(k, Tab7, c)),
+        ("cmd-8", None, |k, c| KeyBinding::new(k, Tab8, c)),
+        ("cmd-9", None, |k, c| KeyBinding::new(k, Tab9, c)),
+    ];
+    wanted.extend(fixed.into_iter().map(|(k, c, b)| (k.to_string(), c, b)));
+    let mut keys = Vec::new();
+    for (k, ctx, bind) in wanted {
+        // Text editing and zoom are plain Ctrl off macOS; Deck's other
+        // shortcuts take Ctrl+Shift there (see `keys::native`).
+        let plain = ctx == Some("Field") || crate::keys::is_zoom(&k);
+        let k = crate::keys::native(&k, plain);
+        // A key settings.json holds that does not parse is skipped, not
+        // a crash.
+        if gpui::Keystroke::parse(&k).is_ok() {
+            keys.push(bind(&k, ctx));
+        }
     }
-    keys.push(KeyBinding::new("cmd-x", Cut, Some("Field")));
-    keys.push(KeyBinding::new("cmd-a", SelectAll, Some("Field")));
-    keys.push(KeyBinding::new("cmd-a", SelectAll, Some("Terminal")));
-    keys.push(KeyBinding::new("cmd-z", Undo, Some("Field")));
-    keys.push(KeyBinding::new("cmd-shift-z", Redo, Some("Field")));
-    keys.extend([
-        KeyBinding::new("cmd-1", Tab1, None),
-        KeyBinding::new("cmd-2", Tab2, None),
-        KeyBinding::new("cmd-3", Tab3, None),
-        KeyBinding::new("cmd-4", Tab4, None),
-        KeyBinding::new("cmd-5", Tab5, None),
-        KeyBinding::new("cmd-6", Tab6, None),
-        KeyBinding::new("cmd-7", Tab7, None),
-        KeyBinding::new("cmd-8", Tab8, None),
-        KeyBinding::new("cmd-9", Tab9, None),
-    ]);
     cx.bind_keys(keys);
     // Menus are not decoration here: AppKit routes ⌘ shortcuts through them,
     // so they keep working while a webview holds the keyboard.
@@ -486,12 +496,22 @@ pub const AGENTS: &[Agent] = &[
         cmd: "codex",
     },
     Agent {
-        name: "Gemini CLI",
-        cmd: "gemini",
-    },
-    Agent {
         name: "OpenCode",
         cmd: "opencode",
+    },
+    Agent {
+        name: "Copilot",
+        cmd: "copilot",
+    },
+    // Interactive only (no headless prompt mode), so a terminal agent and
+    // not a chat one.
+    Agent {
+        name: "Freebuff",
+        cmd: "freebuff",
+    },
+    Agent {
+        name: "Qwen Code",
+        cmd: "qwen",
     },
     Agent {
         name: "Cursor Agent",
@@ -532,13 +552,16 @@ impl Node {
     /// the same way, as i3 does, so three splits right are three equal columns
     /// rather than a staircase.
     fn split(&mut self, target: PaneId, new: PaneId, axis: Axis) -> bool {
+        self.place(target, new, axis, false)
+    }
+
+    /// Put `new` beside `target` along `axis`: after it (right or below),
+    /// or with `before`, ahead of it (left or above).
+    fn place(&mut self, target: PaneId, new: PaneId, axis: Axis, before: bool) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
-                *self = Node::Split(
-                    axis,
-                    vec![Node::Leaf(target), Node::Leaf(new)],
-                    vec![1., 1.],
-                );
+                let pair = if before { [new, target] } else { [target, new] };
+                *self = Node::Split(axis, pair.map(Node::Leaf).to_vec(), vec![1., 1.]);
                 true
             }
             Node::Leaf(_) => false,
@@ -548,12 +571,13 @@ impl Node {
                         // The new pane takes half of the one it splits.
                         let half = sizes[i] / 2.;
                         sizes[i] = half;
-                        sizes.insert(i + 1, half);
-                        children.insert(i + 1, Node::Leaf(new));
+                        let at = if before { i } else { i + 1 };
+                        sizes.insert(at, half);
+                        children.insert(at, Node::Leaf(new));
                         return true;
                     }
                 }
-                children.iter_mut().any(|c| c.split(target, new, axis))
+                children.iter_mut().any(|c| c.place(target, new, axis, before))
             }
         }
     }
@@ -884,6 +908,12 @@ pub struct Workspace {
     /// A side panel's edge is being dragged: which one, where the drag
     /// started and the width then.
     side_drag: Option<(bool, f32, f32)>,
+    /// The job drawer's height, and its drag (pointer y at the start, the
+    /// height then); folded to its header, or as tall as it goes.
+    drawer_h: f32,
+    drawer_drag: Option<(f32, f32)>,
+    drawer_min: bool,
+    drawer_max: bool,
     /// Claude Code terminals deck has unstuck from an API wait: how many
     /// times in a row, and when last.
     stalls: HashMap<PaneId, (u32, Instant)>,
@@ -892,6 +922,12 @@ pub struct Workspace {
     working_since: HashMap<PaneId, Instant>,
     /// Where each split cell was last laid out, by the pane it starts with.
     cells: std::rc::Rc<std::cell::RefCell<HashMap<PaneId, gpui::Bounds<gpui::Pixels>>>>,
+    /// A pane picked up by its grip, while the drag lasts.
+    pane_drag: Option<PaneId>,
+    /// Where it would land if let go now; drawn as a highlight.
+    pane_drop: Option<PaneDrop>,
+    /// Where the places it can land were drawn last frame.
+    drop_map: Rc<std::cell::RefCell<DropMap>>,
     /// The last notification each pane posted, so one prompt is one banner.
     alerted: HashMap<PaneId, (Instant, String)>,
     /// What the Dock badge says: how many panes want you.
@@ -1119,9 +1155,16 @@ impl Workspace {
             sidebar_px: theme::SIDEBAR_PX,
             inspector_px: theme::INSPECTOR_PX,
             side_drag: None,
+            drawer_h: DRAWER_H,
+            drawer_drag: None,
+            drawer_min: false,
+            drawer_max: false,
             working_since: HashMap::new(),
             stalls: HashMap::new(),
             cells: Default::default(),
+            pane_drag: None,
+            pane_drop: None,
+            drop_map: Default::default(),
             alerted: HashMap::new(),
             badge: 0,
             restored: false,
@@ -1347,24 +1390,30 @@ impl Workspace {
                 // quit, then starts fresh beneath it.
                 let key = self.pending_scroll.take().unwrap_or_else(|| new_token()[..16].to_string());
                 let saved = crate::session::scrollback_file(&key);
-                if cmd.is_none() && saved.exists() && env.contains_key("ZDOTDIR") && reattach.is_none() {
+                // Only shells with Deck's integration print it: zsh, PowerShell.
+                let restores = env.contains_key("ZDOTDIR") || env.contains_key("DECK_PWSH_INTEGRATION");
+                if cmd.is_none() && saved.exists() && restores && reattach.is_none() {
                     env.insert("DECK_RESTORE".into(), saved.display().to_string());
                 }
                 self.scroll_keys.insert(id, key);
+                let chosen_shell = env.get("DECK_SHELL").cloned();
                 let cwd = cwd.unwrap_or_else(|| self.cwd.clone());
                 seed = Some(cwd.clone());
                 // In the background service when it can be: the shell (and
                 // any agent in it) outlives Deck, and this pane attaches.
-                let attach_cmd = std::env::current_exe().ok().map(|exe| {
-                    move |name: &str| {
-                        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-                        format!("exec {} job attach {}", q(&exe.to_string_lossy()), q(name))
-                    }
-                });
+                let attach_cmd = std::env::current_exe().ok().map(|exe| move |name: &str| job_attach_cmd(&exe, name));
                 let mut session: Option<(String, u32)> = None;
                 if let Some((name, pid, _)) = reattach {
                     session = Some((name, pid));
-                } else if self.settings.keep_terminals && attach_cmd.is_some() && crate::daemon::ask(&json!({ "op": "ping" })).is_ok() {
+                // A pane that only shows a background job (`deck job
+                // attach`) is not kept as a session of its own: the job is
+                // already the service's, and a kept viewer came back as one
+                // more terminal tab after every relaunch.
+                } else if self.settings.keep_terminals
+                    && attach_cmd.is_some()
+                    && !cmd.as_deref().is_some_and(|c| c.contains(" job attach "))
+                    && crate::daemon::ask(&json!({ "op": "ping" })).is_ok()
+                {
                     let name = format!("tab-{}", &token[..12.min(token.len())]);
                     let mut job_env = crate::daemon::job_env();
                     job_env.extend(env.clone());
@@ -1402,9 +1451,10 @@ impl Workspace {
                     .map(|a| a.name.to_string())
                     .or(cmd)
                     .or_else(|| {
-                        std::env::var("SHELL")
-                            .ok()
-                            .map(|s| s.rsplit('/').next().unwrap_or("shell").to_string())
+                        chosen_shell
+                            .clone()
+                            .or_else(|| std::env::var("SHELL").ok())
+                            .map(|s| shell_name(&s))
                     })
                     .unwrap_or_else(|| "shell".into());
                 let look = self.settings.term_look();
@@ -1436,9 +1486,9 @@ impl Workspace {
                                 ws.command_done(id, command.clone(), *exit, *took, window, cx);
                             }
                             TerminalEvent::History => ws.open_history(id, window, cx),
-                            TerminalEvent::Ask { request, cwd } => {
+                            TerminalEvent::Ask { request, cwd, run } => {
                                 let (request, cwd) = (request.clone(), cwd.clone());
-                                ws.write_command(id, request, cwd, cx);
+                                ws.write_command(id, request, cwd, *run, cx);
                             }
                             TerminalEvent::AskAgent { prompt, cwd } => {
                                 let (prompt, cwd) = (prompt.clone(), cwd.clone());
@@ -1480,6 +1530,11 @@ impl Workspace {
                         window,
                         move |ws, _, ev: &ChatEvent, window, cx| match ev {
                             ChatEvent::Focused => ws.mark_focused(id, cx),
+                            ChatEvent::DefaultAgent(agent) => {
+                                let mut next = ws.settings.clone();
+                                next.default_agent = Some(agent.clone());
+                                ws.apply_settings(next, window, cx);
+                            }
                             ChatEvent::StartTask { brief, agent, cwd } => {
                                 let (brief, agent, cwd) = (brief.clone(), agent.clone(), cwd.clone());
                                 ws.spawn_task(brief, cwd, Some(agent), None, None, window, cx);
@@ -2307,7 +2362,7 @@ impl Workspace {
                 let path = std::env::var("PATH").unwrap_or_default();
                 env.insert(
                     "PATH".into(),
-                    crate::tidy_path(&format!("{}:{path}", dir.display())),
+                    crate::tidy_path(&format!("{}{}{path}", dir.display(), crate::PATH_SEP)),
                 );
             }
             env.insert("BROWSER".into(), exe.display().to_string());
@@ -2345,9 +2400,15 @@ impl Workspace {
                 t.update(cx, |t, cx| t.seen(cx));
             }
             Some(PaneKind::Browser(b)) => {
-                b.update(cx, |b, _| b.set_visible(true));
                 window.blur();
-                b.read(cx).focus_native();
+                // Shown with the frame that draws its tab, not now: a page
+                // shown from a click lands a refresh before the toolbar
+                // and the rest of the tab, a flash over the old tab.
+                let b = b.clone();
+                window.on_next_frame(move |_, cx| {
+                    b.update(cx, |b, _| b.set_visible(true));
+                    b.read(cx).focus_native();
+                });
             }
             Some(PaneKind::Chat(c)) => {
                 window.focus(&c.read(cx).composer.read(cx).focus);
@@ -2597,7 +2658,7 @@ impl Workspace {
                                         .child(h.name.clone()),
                                 )
                                 .children((!h.detail.is_empty()).then(|| {
-                                    div().one_line().text_size(u(11.5)).text_color(rgb(theme::dim())).child(h.detail.clone())
+                                    div().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(h.detail.clone())
                                 })),
                         )
                         .when(!selected, |d| d.child(icon(Icon::Terminal, 13., theme::dim()))),
@@ -2643,7 +2704,7 @@ impl Workspace {
                     .gap(u(6.))
                     .px(u(12.))
                     .py(u(18.))
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .text_color(rgb(theme::dim()))
                     .child(div().text_color(rgb(theme::text_2())).child("No hosts yet"))
                     .child("Add a Host to ~/.ssh/config, or run `deck remote add user@host --name box --key ~/box.pem`."),
@@ -2677,7 +2738,7 @@ impl Workspace {
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
                     .child(icon(Icon::Folder, 14., theme::dim()))
-                    .child(div().flex_1().text_size(u(13.5)).child(p.field.clone()))
+                    .child(div().flex_1().text_size(u(theme::TEXT_READ)).child(p.field.clone()))
                     .child(crate::kbd::key("esc")),
             )
             .child(
@@ -2817,7 +2878,7 @@ impl Workspace {
                                 .items_center()
                                 .rounded(u(4.))
                                 .bg(rgba(theme::alpha(theme::accent(), 0x22)))
-                                .text_size(u(10.5))
+                                .text_size(u(theme::TEXT_META))
                                 .text_color(rgb(theme::accent()))
                                 .child("Current"),
                         )
@@ -2827,7 +2888,7 @@ impl Workspace {
             );
         }
         if matches.is_empty() && !can_create {
-            list = list.child(div().h(u(36.)).flex().items_center().justify_center().text_size(u(12.5)).text_color(rgb(theme::dim())).child("No branch matches"));
+            list = list.child(div().h(u(36.)).flex().items_center().justify_center().text_size(u(theme::TEXT_UI)).text_color(rgb(theme::dim())).child("No branch matches"));
         }
         let action = |id: &'static str, glyph: Icon, label: String| {
             div()
@@ -2839,7 +2900,7 @@ impl Workspace {
                 .px(u(8.))
                 .rounded(u(6.))
                 .cursor_pointer()
-                .text_size(u(12.5))
+                .text_size(u(theme::TEXT_UI))
                 .text_color(rgb(theme::text_2()))
                 .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                 .child(icon(glyph, 13., theme::dim()))
@@ -3057,12 +3118,13 @@ impl Workspace {
         q.split_whitespace().all(|w| hay.contains(w))
     }
 
-    /// A click on a sidebar row: ⌘ adds it to (or takes it from) the
-    /// selection, ⇧ selects the rows between the last one and it; a plain
-    /// click clears the selection and opens the row.
+    /// A click on a sidebar row: ⌘ (Ctrl off macOS) adds it to (or takes
+    /// it from) the selection, ⇧ selects the rows between the last one and
+    /// it; a plain click clears the selection and opens the row.
     fn row_click(&mut self, ix: usize, m: gpui::Modifiers, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.tabs.get(ix).map(|t| t.leaves()[0]) else { return };
-        if m.platform {
+        let toggle = if cfg!(target_os = "macos") { m.platform } else { m.control };
+        if toggle {
             if !self.picked.remove(&key) {
                 self.picked.insert(key);
             }
@@ -3644,7 +3706,14 @@ impl Workspace {
     /// The focused pane, out of its split and into a tab of its own, in
     /// front: a page or terminal that needs the whole window.
     fn move_to_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.focused() else { return };
+        if let Some(id) = self.focused() {
+            self.pane_to_new_tab(id, window, cx);
+        }
+    }
+
+    /// Pane `id` out of its split into a tab of its own, right after the
+    /// one it was in, and in front.
+    fn pane_to_new_tab(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tab_of(id) else { return };
         if self.tabs[ix].root == Node::Leaf(id) {
             return self.flash("Already a tab of its own.".to_string(), cx);
@@ -3665,6 +3734,137 @@ impl Workspace {
         );
         self.focus_pane(id, window, cx);
         cx.notify();
+    }
+
+    /// Pane `id` out of its split and into tab `to`, to the right of the
+    /// pane in front there, and that tab in front.
+    fn pane_into_tab(&mut self, id: PaneId, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.tab_of(id) else { return };
+        if from == to || to >= self.tabs.len() || self.tabs[from].root == Node::Leaf(id) {
+            return;
+        }
+        let tab = &mut self.tabs[from];
+        tab.root.remove(id);
+        if tab.focused == id {
+            tab.focused = tab.leaves()[0];
+        }
+        let tab = &mut self.tabs[to];
+        let beside = tab.focused;
+        tab.root.split(beside, id, Axis::Row);
+        self.focus_pane(id, window, cx);
+    }
+
+    /// Pane `id` moved within its split to `side` of `target`.
+    fn pane_beside(&mut self, id: PaneId, target: PaneId, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_of(id) else { return };
+        if id == target || self.tab_of(target) != Some(ix) {
+            return;
+        }
+        let (axis, before) = match side {
+            Side::Left => (Axis::Row, true),
+            Side::Right => (Axis::Row, false),
+            Side::Top => (Axis::Column, true),
+            Side::Bottom => (Axis::Column, false),
+        };
+        let root = &mut self.tabs[ix].root;
+        root.remove(id);
+        root.place(target, id, axis, before);
+        self.focus_pane(id, window, cx);
+    }
+
+    /// Where a pane dragged from `src` would land with the pointer at `p`:
+    /// the sidebar's empty part makes it a tab of its own, a row there
+    /// moves it into that tab, and a pane of this split takes it on the
+    /// side nearest the pointer. Its own pane and its own row are no move.
+    fn pane_drop_at(&self, src: PaneId, p: gpui::Point<gpui::Pixels>) -> Option<PaneDrop> {
+        let map = self.drop_map.borrow();
+        let from = self.tab_of(src)?;
+        if map.sidebar.is_some_and(|b| b.contains(&p)) {
+            return match map.rows.iter().find(|(_, b)| b.contains(&p)).map(|(ix, _)| *ix) {
+                None => Some(PaneDrop::NewTab),
+                Some(ix) if ix != from && ix < self.tabs.len() && Some(ix) != self.settings_tab() => {
+                    Some(PaneDrop::IntoTab(ix))
+                }
+                Some(_) => None,
+            };
+        }
+        let (&id, b) = map.leaves.iter().find(|(id, b)| b.contains(&p) && self.tabs[from].root.contains(**id))?;
+        if id == src {
+            return None;
+        }
+        let fx = f32::from(p.x - b.origin.x) / f32::from(b.size.width).max(1.);
+        let fy = f32::from(p.y - b.origin.y) / f32::from(b.size.height).max(1.);
+        let side = [(fx, Side::Left), (1. - fx, Side::Right), (fy, Side::Top), (1. - fy, Side::Bottom)]
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, s)| s)?;
+        Some(PaneDrop::Beside(id, side))
+    }
+
+    /// The mouse came up: put a dragged pane where it was let go.
+    fn drop_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(src) = self.pane_drag.take() else { return };
+        match self.pane_drop.take() {
+            Some(PaneDrop::NewTab) => self.pane_to_new_tab(src, window, cx),
+            Some(PaneDrop::IntoTab(ix)) => self.pane_into_tab(src, ix, window, cx),
+            Some(PaneDrop::Beside(target, side)) => self.pane_beside(src, target, side, window, cx),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// Where a dragged pane would go, over the place itself: half of the
+    /// pane it would sit beside, the row of the tab it would join, or the
+    /// sidebar with "New tab" for a tab of its own.
+    fn render_drop_hint(&self) -> Option<AnyElement> {
+        let drop = self.pane_drop?;
+        let map = self.drop_map.borrow();
+        let (b, inset, label) = match drop {
+            PaneDrop::Beside(id, side) => {
+                let b = *map.leaves.get(&id)?;
+                let (w, h) = (b.size.width, b.size.height);
+                let (o, half) = match side {
+                    Side::Left => (b.origin, gpui::size(w / 2., h)),
+                    Side::Right => (gpui::point(b.origin.x + w / 2., b.origin.y), gpui::size(w / 2., h)),
+                    Side::Top => (b.origin, gpui::size(w, h / 2.)),
+                    Side::Bottom => (gpui::point(b.origin.x, b.origin.y + h / 2.), gpui::size(w, h / 2.)),
+                };
+                (gpui::Bounds::new(o, half), 6., None)
+            }
+            PaneDrop::IntoTab(ix) => (*map.rows.get(&ix)?, 0., None),
+            PaneDrop::NewTab => (map.sidebar?, 8., Some("New tab")),
+        };
+        Some(
+            div()
+                .absolute()
+                .left(b.origin.x)
+                .top(b.origin.y)
+                .w(b.size.width)
+                .h(b.size.height)
+                .p(u(inset))
+                .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(u(if inset > 0. { theme::CARD_RADIUS } else { theme::ROW_RADIUS }))
+                        .bg(rgba(theme::alpha(theme::accent(), 0x1f)))
+                        .border_1()
+                        .border_color(rgba(theme::alpha(theme::accent(), 0x8c)))
+                        .children(label.map(|l| {
+                            div()
+                                .px(u(10.))
+                                .py(u(4.))
+                                .rounded(u(6.))
+                                .bg(rgb(theme::menu()))
+                                .text_size(u(theme::TEXT_UI))
+                                .text_color(rgb(theme::text()))
+                                .child(l)
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3886,10 +4086,12 @@ impl Workspace {
 
     fn apply_places(&mut self, next: HashMap<PaneId, Place>, cx: &mut Context<Self>) {
         // Busy: something other than the shell is in front and printing.
-        let shell = std::env::var("SHELL")
-            .ok()
-            .and_then(|s| s.rsplit('/').next().map(str::to_string))
-            .unwrap_or_else(|| "zsh".into());
+        let shell = std::env::var("SHELL").ok().map(|s| shell_name(&s)).unwrap_or_else(|| "zsh".into());
+        // Windows sets no SHELL; Deck runs one of these there.
+        let is_shell = |f: &str| {
+            let f = shell_name(f);
+            f == shell || (cfg!(windows) && matches!(f.as_str(), "pwsh" | "powershell" | "cmd" | "wsl" | "bash"))
+        };
         let busy: std::collections::HashSet<PaneId> = self
             .panes
             .iter()
@@ -3904,7 +4106,7 @@ impl Workspace {
                             && next
                                 .get(id)
                                 .and_then(|pl| pl.front.as_deref())
-                                .is_some_and(|f| f != shell && !f.starts_with('-'))
+                                .is_some_and(|f| !is_shell(f) && !f.starts_with('-'))
                     }
                 },
                 _ => false,
@@ -4138,10 +4340,38 @@ impl Workspace {
                 if let Some(o) = others {
                     u.others = o;
                 }
+                ws.push_limit_notes(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Each chat on an agent at 90% or more of a plan limit says so under
+    /// its composer, with when it resets; the rest say nothing.
+    fn push_limit_notes(&self, cx: &mut Context<Self>) {
+        let note = |l: &crate::usage::Limits, name: &str| -> Option<SharedString> {
+            let top = l.limits.iter().filter(|x| x.used_pct >= 90.).max_by(|a, b| a.used_pct.total_cmp(&b.used_pct))?;
+            let reset = top.resets_at.map(|t| format!(" · {}", resets_in(t))).unwrap_or_default();
+            Some(format!("{name} has used {} of its {} limit{reset}", pct_text(top.used_pct), top.label).into())
+        };
+        let claude = self.usage.claude.as_ref().and_then(|r| r.as_ref().ok()).and_then(|l| note(l, "Claude"));
+        let codex = self.usage.codex.as_ref().and_then(|l| note(l, "Codex"));
+        for pane in self.panes.values() {
+            if let PaneKind::Chat(c) = &pane.kind {
+                c.update(cx, |c, cx| {
+                    let want = match c.agent.as_str() {
+                        "claude" => claude.clone(),
+                        "codex" => codex.clone(),
+                        _ => None,
+                    };
+                    if c.limit_note != want {
+                        c.limit_note = want;
+                        cx.notify();
+                    }
+                });
+            }
+        }
     }
 
     /// The meter at the status bar's end: the plan limit nearest its cap
@@ -4467,14 +4697,6 @@ impl Workspace {
         const PAD: f32 = 14.;
         const BODY_H: f32 = 330.;
         let us = &self.usage;
-        let label = |text: &str| {
-            div()
-                .pb(u(6.))
-                .text_size(u(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::dim()))
-                .child(text.to_string())
-        };
         let meter_row = |name: SharedString, pct: f32, note: Option<String>| {
             div()
                 .flex()
@@ -4552,7 +4774,7 @@ impl Workspace {
                     .flex_col()
                     .gap(u(4.))
                     .child(agent_head(mark, a.name, Some("No plan limits".into())))
-                    .child(div().pl(u(22.)).text_size(u(11.5)).text_color(rgb(theme::dim())).child(note)),
+                    .child(div().pl(u(22.)).text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(note)),
             );
         }
 
@@ -4647,12 +4869,12 @@ impl Workspace {
                                 .flex_1()
                                 .min_w_0()
                                 .child(div().w_full().one_line().text_color(rgb(theme::text())).child(c.title.clone()))
-                                .child(div().w_full().one_line().text_size(u(10.5)).text_color(rgb(theme::dim())).child(match &c.model {
+                                .child(div().w_full().one_line().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child(match &c.model {
                                     Some(m) => format!("{} · {m}", c.agent),
                                     None => c.agent.to_string(),
                                 })),
                         )
-                        .child(div().flex_none().text_size(u(11.5)).text_color(rgb(theme::text_2())).child(figure))
+                        .child(div().flex_none().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::text_2())).child(figure))
                         .on_click(cx.listener(move |ws, _, window, cx| {
                             ws.usage_open = false;
                             ws.focus_pane(pane, window, cx);
@@ -4773,7 +4995,8 @@ impl Workspace {
             .h(u(BODY_H))
             .pt(u(16.))
             .overflow_y_scroll()
-            .child(div().flex().flex_col().min_h_full().child(label(names[tab])).child(content))
+            // The tab above already names what this is.
+            .child(div().flex().flex_col().min_h_full().pt(u(4.)).child(content))
 ;
 
         let updated = us.at.map(|t| match t.elapsed().as_secs() {
@@ -4814,7 +5037,8 @@ impl Workspace {
                     .bg(rgb(theme::menu()))
                     .border_1()
                     .border_color(rgba(theme::alpha(theme::text(), 0x14)))
-                    .text_size(u(12.5))
+                    .shadow_lg()
+                    .text_size(u(theme::TEXT_UI))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(tabs)
                     .child(body)
@@ -5153,6 +5377,69 @@ impl Workspace {
         window.focus(&focus);
         crate::browser::reclaim_keyboard(window);
         cx.notify();
+    }
+
+    /// Claude Code's recent conversations, from every folder, to continue
+    /// one in a chat.
+    fn open_claude_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        }
+        let home = agent_core::dirs::home_dir().unwrap_or_default();
+        let items: Vec<Item> = crate::session::claude_all_sessions(60)
+            .into_iter()
+            .map(|(path, cwd, title)| {
+                let when = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| format!(" · {} ago", short_secs(d.as_secs())))
+                    .unwrap_or_default();
+                let place = cwd.strip_prefix(&home).map(|p| format!("~/{}", p.display())).unwrap_or_else(|_| cwd.display().to_string());
+                Item {
+                    kind: crate::palette::Kind::Command,
+                    title: title.into(),
+                    detail: format!("{place}{when}").into(),
+                    icon: Icon::agent("claude"),
+                    hint: None,
+                    pick: crate::palette::Pick::ClaudeSession(path),
+                }
+            })
+            .collect();
+        let palette = cx.new(|cx| Palette::sessions(items, cx));
+        let sub = cx.subscribe_in(&palette, window, move |ws, _, ev: &PaletteEvent, window, cx| match ev {
+            PaletteEvent::Close => ws.close_palette(window, cx),
+            PaletteEvent::Run(pick) => {
+                let pick = pick.clone();
+                ws.close_palette(window, cx);
+                ws.run_pick(pick, window, cx);
+            }
+            PaletteEvent::Query(_) => {}
+        });
+        let focus = palette.read(cx).focus(cx);
+        self.palette = Some((palette, None, sub));
+        window.focus(&focus);
+        crate::browser::reclaim_keyboard(window);
+        cx.notify();
+    }
+
+    /// A Claude Code conversation as a chat that resumes it, or the chat
+    /// already continuing it.
+    fn continue_claude_session(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+        let id = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+        let open = self.panes.iter().find_map(|(&pane, p)| match &p.kind {
+            PaneKind::Chat(c) if c.read(cx).native_id().is_some() && c.read(cx).native_id().map(str::to_string) == id => Some(pane),
+            _ => None,
+        });
+        if let Some(pane) = open {
+            return self.focus_pane(pane, window, cx);
+        }
+        let Some(saved) = crate::session::import_claude(path) else {
+            return self.flash("Couldn't read that Claude Code session.", cx);
+        };
+        if let Err(e) = self.new_tab(Open::Thread(Box::new(saved)), None, window, cx) {
+            self.flash(format!("Couldn't open it: {e}"), cx);
+        }
     }
 
     /// ⌃K (actions) or ⌘P (tabs): the palette narrowed to one kind. Its
@@ -5503,6 +5790,13 @@ impl Workspace {
                 Box::new(ImportBrowserData),
             ),
             action(
+                "Continue Claude Code Session",
+                "Pick a conversation from Claude Code and go on with it here",
+                Icon::Import,
+                None,
+                Box::new(ContinueClaudeSession),
+            ),
+            action(
                 "Split Right",
                 "",
                 Icon::Split,
@@ -5637,6 +5931,7 @@ impl Workspace {
                     self.flash("Command copied. ⌘V to paste it.", cx);
                 }
             },
+            P::ClaudeSession(path) => self.continue_claude_session(&path, window, cx),
             P::SaveSnippet(text) => {
                 let name = crate::snippets::add(&text);
                 self.flash(format!("Kept \"{name}\" as a snippet. ⌘; puts it in."), cx);
@@ -5779,6 +6074,9 @@ impl Workspace {
 
     /// Once, on a first launch: offer to make deck the Mac's terminal.
     fn offer_default_terminal(&mut self, cx: &mut Context<Self>) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
         if self.settings.asked_default_terminal || crate::handler::is_default() {
             return;
         }
@@ -5819,7 +6117,7 @@ impl Workspace {
     /// main thread; it may still be starting.
     fn offer_permissions(&mut self, cx: &mut Context<Self>) {
         use crate::privacy::{Permission, State};
-        if self.settings.asked_permissions || self.notice.is_some() {
+        if !cfg!(target_os = "macos") || self.settings.asked_permissions || self.notice.is_some() {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -6978,7 +7276,7 @@ impl Workspace {
 
     /// "# …" at a terminal's prompt: a command for it, typed at the prompt
     /// (not run) once the model has written it.
-    fn write_command(&mut self, id: PaneId, request: String, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn write_command(&mut self, id: PaneId, request: String, cwd: Option<PathBuf>, run: bool, cx: &mut Context<Self>) {
         let cwd = cwd.filter(|c| c.is_dir()).or_else(|| self.cwd_of(id, cx)).unwrap_or_else(|| self.cwd.clone());
         let model = crate::refine::model();
         cx.spawn(async move |this, cx| {
@@ -6991,7 +7289,10 @@ impl Workspace {
                     if let Some(PaneKind::Terminal(t)) = ws.panes.get(&id).map(|p| &p.kind) {
                         t.update(cx, |t, cx| {
                             t.ask_done(cx);
-                            t.paste_text(&cmd)
+                            t.paste_text(&cmd);
+                            if run {
+                                t.press_enter();
+                            }
                         });
                     }
                 }
@@ -7257,6 +7558,18 @@ impl Workspace {
                 };
                 return reply.send(r);
             }
+            // A `deck://` link Windows handed a second copy of Deck: the
+            // same as the system opening it here.
+            if req.method == "app.open_url" {
+                return reply.send(match str_param(p, "url").filter(|u| u.starts_with("deck://")) {
+                    Some(url) => {
+                        self.open_handled(url, window, cx);
+                        window.activate_window();
+                        Ok(json!({}))
+                    }
+                    None => Err("only deck:// links".into()),
+                });
+            }
             return reply.send(Err(
                 "unknown or expired token: run deck from a terminal inside a deck window".into(),
             ));
@@ -7346,7 +7659,30 @@ impl Workspace {
                 let (root, diff) = self.turn_diff(id)?;
                 Ok(json!({ "pane": id, "root": root, "diff": diff }))
             }),
+            // What a page holds is the agent's to read only when Settings
+            // allows it.
+            "browser.eval" | "browser.logs" | "browser.storage" | "browse.read" | "browser.shot" | "browser.snapshot"
+                if !self.settings.agents_read_pages =>
+            {
+                Err("Deck's settings don't let agents read pages (Settings › Browser › Let agents read pages); ask me to turn it on".into())
+            }
+            "browser.tabs" => Ok(self.browser_tabs(cx)),
+            "browser.storage" => {
+                let mut q = p.clone();
+                if let Some(o) = q.as_object_mut() {
+                    o.insert("js".into(), STORAGE_JS.into());
+                    o.insert("expr".into(), true.into());
+                }
+                return self.rpc_eval(&q, caller, reply, cx);
+            }
             "browser.open" => self.rpc_open(p, caller, window, cx),
+            "app.open_url" => match str_param(p, "url").filter(|u| u.starts_with("deck://")) {
+                Some(url) => {
+                    self.open_handled(url, window, cx);
+                    Ok(json!({}))
+                }
+                None => Err("only deck:// links".into()),
+            },
             "browser.eval" => return self.rpc_eval(p, caller, reply, cx),
             "browser.logs" => self.rpc_logs(p, caller, cx),
             "browser.shot" => self.rpc_browser_shot(p, caller, window, cx),
@@ -7679,9 +8015,7 @@ impl Workspace {
     /// runs `deck job attach NAME`, so closing it (or quitting Deck) leaves
     /// the job running.
     fn attach_pane(&mut self, name: &str, cwd: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<PaneId> {
-        let exe = std::env::current_exe()?;
-        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        let cmd = format!("exec {} job attach {}", q(&exe.to_string_lossy()), q(name));
+        let cmd = job_attach_cmd(&std::env::current_exe()?, name);
         let id = self.make_pane(Open::Terminal { cmd: Some(cmd), cwd: Some(cwd.to_path_buf()) }, None, window, cx)?;
         self.jobs.push(id);
         self.named.insert(name.to_string(), id);
@@ -7713,6 +8047,18 @@ impl Workspace {
             })
             .collect();
         self.daemon_jobs = jobs;
+        // A finished job's terminal keeps its output but loses its cursor.
+        for (name, id) in &self.named {
+            let ended = self.daemon_jobs.iter().any(|j| &j.name == name && j.exit.is_some());
+            if let Some(PaneKind::Terminal(t)) = self.panes.get(id).map(|p| &p.kind) {
+                t.update(cx, |t, cx| {
+                    if t.ended != ended {
+                        t.ended = ended;
+                        cx.notify();
+                    }
+                });
+            }
+        }
         for id in gone {
             self.named.retain(|_, v| *v != id);
             self.close_pane(id, window, cx);
@@ -8134,6 +8480,33 @@ impl Workspace {
     /// Content Security Policy forbids that gets it as an expression. A
     /// page that does not answer (a dialog is up, a script is spinning)
     /// fails the call after `timeout` seconds instead of holding it.
+    /// Every page open in this window: in a tab, a split or the status
+    /// bar's background pages.
+    fn browser_tabs(&self, cx: &App) -> Value {
+        let names: HashMap<PaneId, &str> = self.named.iter().map(|(n, id)| (*id, n.as_str())).collect();
+        let mut pages: Vec<Value> = self
+            .panes
+            .iter()
+            .filter_map(|(id, pane)| match &pane.kind {
+                PaneKind::Browser(b) if !b.read(cx).is_editor() => {
+                    let b = b.read(cx);
+                    Some(json!({
+                        "pane": id,
+                        "name": names.get(id).copied(),
+                        "url": b.url.to_string(),
+                        "title": b.title.to_string(),
+                        "loading": b.loading,
+                        "background": self.jobs.contains(id),
+                        "focused": self.focused() == Some(*id),
+                    }))
+                }
+                _ => None,
+            })
+            .collect();
+        pages.sort_by_key(|v| v["pane"].as_u64());
+        json!({ "pages": pages })
+    }
+
     fn rpc_eval(&mut self, p: &Value, caller: PaneId, reply: Reply, cx: &mut Context<Self>) {
         let res = self.browser_target(p, caller, cx).and_then(|id| {
             let js = str_param(p, "js").ok_or("missing JS")?;
@@ -8280,6 +8653,13 @@ impl Workspace {
                     Axis::Row => d.flex_row(),
                     Axis::Column => d.flex_col(),
                 };
+                // Weights scaled to add up to the number of panes. Flexbox
+                // hands out only that share of the room when grow factors
+                // sum below one, and removing a pane (or an older saved
+                // layout) can leave them there: the split then stopped short
+                // of the window's edge with an empty strip beside it.
+                let sum: f32 = sizes.iter().take(children.len()).sum();
+                let scale = if sum > f32::EPSILON { children.len() as f32 / sum } else { 1. };
                 for (i, c) in children.iter().enumerate() {
                     if i > 0 {
                         d = d.child(self.render_divider(
@@ -8313,7 +8693,7 @@ impl Workspace {
                             .left_0()
                             .size_full(),
                         );
-                    cell.style().flex_grow = Some(sizes.get(i).copied().unwrap_or(1.));
+                    cell.style().flex_grow = Some(sizes.get(i).map_or(1., |w| w * scale));
                     cell.style().flex_shrink = Some(1.);
                     d = d.child(cell);
                 }
@@ -8442,6 +8822,20 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn drag_drawer(&mut self, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((start, from)) = self.drawer_drag else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.drawer_drag = None;
+            cx.notify();
+            return;
+        }
+        let moved = (start - f32::from(ev.position.y)) / self.settings.zoom;
+        self.drawer_h = (from + moved).clamp(DRAWER_MIN, DRAWER_MAX).round();
+        cx.notify();
+    }
+
     fn drag_side(&mut self, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some((left, start, from)) = self.side_drag else {
             return;
@@ -8504,9 +8898,28 @@ impl Workspace {
         let body = view
             .cached(StyleRefinement::default().size_full())
             .into_any_element();
+        // A job's command that has finished: its output above, how it ended
+        // and what next below.
+        let ended = match pane.kind {
+            PaneKind::Terminal(_) => self.daemon_job(id).and_then(|j| Some((j.name.clone(), j.exit?))),
+            _ => None,
+        };
+        let body = match ended {
+            Some((name, code)) => div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(body))
+                .child(self.render_exit_bar(id, name, code, cx))
+                .into_any_element(),
+            None => body,
+        };
+        let map = self.drop_map.clone();
+        let group = SharedString::from(format!("pane-{id}"));
         div()
             .relative()
             .size_full()
+            .group(group.clone())
             .bg(rgb(theme::pane()))
             // In a split, the focused card has the brighter edge: where
             // keys go, without a stripe or fading the others.
@@ -8538,6 +8951,100 @@ impl Workspace {
                 }),
             )
             .child(body)
+            .child(mark_bounds(move |b| {
+                map.borrow_mut().leaves.insert(id, b);
+            }))
+            .when(multi, |d| d.child(self.render_grip(id, group, cx)))
+            .into_any_element()
+    }
+
+    /// A split pane's handle: a short bar at the top edge, shown while the
+    /// pane is hovered. Dragged, it takes the pane to the sidebar for a tab
+    /// of its own, to a tab's row to join it, or to a side of another pane.
+    fn render_grip(&self, id: PaneId, group: SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let ws = cx.entity().downgrade();
+        let title = self.pane_title(id, cx);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id(ElementId::NamedInteger("pane-grip".into(), id))
+                    // Its own: the press must not start a selection in the
+                    // terminal underneath.
+                    .occlude()
+                    .w(u(64.))
+                    .h(u(GRIP_H))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(gpui::CursorStyle::OpenHand)
+                    .tooltip(|_, cx| Tip::view("Drag to move · to the sidebar for a new tab", cx))
+                    .child(
+                        div()
+                            .w(u(32.))
+                            .h(u(4.))
+                            .rounded_full()
+                            .bg(rgba(theme::alpha(theme::text(), 0x59)))
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.)),
+                    )
+                    .on_drag(DraggedPane(id), move |d, _, _, cx| {
+                        if let Some(ws) = ws.upgrade() {
+                            ws.update(cx, |ws, cx| {
+                                ws.pane_drag = Some(d.0);
+                                ws.pane_drop = None;
+                                cx.notify();
+                            });
+                        }
+                        let title = title.clone();
+                        cx.new(|_| PaneGhost(title))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Under a finished job's output: whether it worked, and Restart or
+    /// Close (which forgets the job).
+    fn render_exit_bar(&self, id: PaneId, name: String, code: i32, cx: &mut Context<Self>) -> AnyElement {
+        let ok = code == 0;
+        let tone = if ok { theme::dim() } else { theme::DANGER };
+        let action = |eid: &'static str, label: &'static str, strong: bool| {
+            div()
+                .id(eid)
+                .flex()
+                .items_center()
+                .h(u(24.))
+                .px(u(10.))
+                .rounded(u(6.))
+                .text_size(u(12.))
+                .cursor_pointer()
+                .when(strong, |d| d.bg(rgb(theme::surface())).text_color(rgb(theme::text())).hover(|s| s.bg(rgb(theme::row_hover()))))
+                .when(!strong, |d| d.text_color(rgb(theme::text_2())).hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(8.))
+            .h(u(36.))
+            .px(u(12.))
+            .border_t_1()
+            .border_color(rgba(theme::hairline()))
+            .text_size(u(12.))
+            .child(icon(if ok { Icon::Check } else { Icon::Close }, 13., tone))
+            .child(div().text_color(rgb(tone)).child(if ok { "Finished".to_string() } else { format!("Failed with exit code {code}") }))
+            .child(div().flex_1())
+            .child(action("exit-restart", "Restart", true).on_click(cx.listener(move |_, _, _, cx| {
+                let n = name.clone();
+                cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
+            })))
+            .child(action("exit-close", "Close", false).on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))))
             .into_any_element()
     }
 
@@ -8671,6 +9178,8 @@ impl Workspace {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Rows note where they land as they draw; folded ones drop out.
+        self.drop_map.borrow_mut().rows.clear();
         let groups = self.project_groups(cx);
         let header = sidebar_header;
 
@@ -8679,7 +9188,8 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_1()
-            .gap(u(2.))
+            // Room between rows, so a row's fill never meets its neighbour's.
+            .gap(u(4.))
             .overflow_y_scroll()
             .px(u(theme::GUTTER))
             .pb(u(theme::GUTTER))
@@ -8754,11 +9264,12 @@ impl Workspace {
             .child(
                 // The traffic lights live here; the native titlebar under it
                 // is the drag handle. Real pixels: the lights do not zoom.
+                // Elsewhere there are no lights to clear: the buttons lead.
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .justify_end()
+                    .when(cfg!(target_os = "macos"), |d| d.justify_end())
                     .h(px(theme::TITLEBAR_PX))
                     .px(u(theme::GUTTER))
                     .on_mouse_down(MouseButton::Left, |ev, window, _| {
@@ -8768,6 +9279,7 @@ impl Workspace {
                     })
                     .gap(u(2.))
                     .child(self.new_chat_button("new-chat", cx))
+                    .child(self.new_terminal_button("new-terminal", cx))
                     .child(
                         icon_button("hide-sidebar", Icon::Sidebar).on_click(cx.listener(
                             |ws, _, _, cx| {
@@ -8775,7 +9287,8 @@ impl Workspace {
                                 cx.notify();
                             },
                         )),
-                    ),
+                    )
+                    .when(cfg!(windows), |d| d.child(drag_strip())),
             )
             .child(list)
             .children((!self.picked.is_empty()).then(|| self.render_pick_bar(cx)))
@@ -8818,8 +9331,15 @@ impl Workspace {
             self.focused().is_some_and(|id| matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Page(_, kk)) if *kk == k))
         };
         let tool = |id: &'static str, glyph: Icon, on: bool| {
+            let tip: &'static str = match id {
+                "foot-packages" => "Packages",
+                "foot-usage" => "Usage",
+                "foot-settings" => "Settings",
+                _ => "",
+            };
             div()
                 .id(id)
+                .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| Tip::view(tip, cx)))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -8837,8 +9357,15 @@ impl Workspace {
         };
         let glance = self.usage_glance(cx);
         let count = |id: &'static str, mark: AnyElement, n: usize| {
+            let tip: &'static str = match id {
+                "foot-working" => "Working",
+                "foot-waiting" => "Waiting on you",
+                "foot-done" => "Done, not yet seen",
+                _ => "",
+            };
             div()
                 .id(id)
+                .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| Tip::view(tip, cx)))
                 .flex()
                 .items_center()
                 .gap(u(4.))
@@ -8846,30 +9373,48 @@ impl Workspace {
                 .px(u(6.))
                 .rounded(u(6.))
                 .cursor_pointer()
-                .text_size(u(12.5))
+                .text_size(u(12.))
                 .text_color(rgb(theme::text_2()))
                 .hover(|s| s.bg(rgb(theme::row_hover())))
                 .child(mark)
                 .child(n.to_string())
         };
-        let done_mark = div()
-            .size(u(13.))
-            .rounded_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(theme::text()))
-            .child(icon(Icon::Check, 8., theme::sidebar()))
-            .into_any_element();
+        // The three counts are one family: outline marks at one size, the
+        // count beside each in the same quiet colour.
+        let done_mark = icon(Icon::Check, 13., theme::text_2());
         div()
             .flex()
             .items_center()
             .gap(u(2.))
             .h(u(34.))
+            // Tools on the leading edge, Settings first; what is going on
+            // (agents at work or waiting, the plan's usage) on the other.
+            .child(tool("foot-settings", Icon::Settings, settings_on).on_click(cx.listener(|ws, _, w, cx| ws.open_settings(w, cx))))
             .child(
                 tool("foot-packages", Icon::Package, page_on(PageKind::Packages))
                     .on_click(cx.listener(|ws, _, w, cx| ws.open_page(PageKind::Packages, w, cx))),
             )
+            .child(div().flex_1())
+            .when(working > 0, |d| {
+                d.child(
+                    count("foot-working", spinner("foot-spin", 13., theme::text_2()), working)
+                        .on_click(cx.listener(|ws, _, w, cx| ws.next_with(Status::Working, w, cx))),
+                )
+            })
+            .when(waiting > 0, |d| {
+                d.child(
+                    count("foot-waiting", icon(Icon::Bell, 13., theme::accent()), waiting)
+                        .on_click(cx.listener(|ws, _, w, cx| ws.next_needs_you(w, cx))),
+                )
+            })
+            .when(done > 0, |d| {
+                d.child(count("foot-done", done_mark, done).on_click(cx.listener(|ws, _, w, cx| {
+                    let next = ws.tabs.iter().flat_map(|t| t.leaves()).find(|id| ws.unseen.contains(id));
+                    if let Some(id) = next {
+                        ws.focus_pane(id, w, cx);
+                    }
+                })))
+            })
             .child(
                 // Hover: the numbers in a small card. Click: the full panel.
                 div()
@@ -8890,28 +9435,6 @@ impl Workspace {
                     )
                     .when(self.gauge_hover && !self.usage_open, |d| d.child(gpui::deferred(self.render_usage_card()).with_priority(2))),
             )
-            .child(tool("foot-settings", Icon::Settings, settings_on).on_click(cx.listener(|ws, _, w, cx| ws.open_settings(w, cx))))
-            .child(div().flex_1())
-            .when(working > 0, |d| {
-                d.child(
-                    count("foot-working", spinner("foot-spin", 12., theme::accent()), working)
-                        .on_click(cx.listener(|ws, _, w, cx| ws.next_with(Status::Working, w, cx))),
-                )
-            })
-            .when(waiting > 0, |d| {
-                d.child(
-                    count("foot-waiting", icon(Icon::Bell, 12., theme::accent()), waiting)
-                        .on_click(cx.listener(|ws, _, w, cx| ws.next_needs_you(w, cx))),
-                )
-            })
-            .when(done > 0, |d| {
-                d.child(count("foot-done", done_mark, done).on_click(cx.listener(|ws, _, w, cx| {
-                    let next = ws.tabs.iter().flat_map(|t| t.leaves()).find(|id| ws.unseen.contains(id));
-                    if let Some(id) = next {
-                        ws.focus_pane(id, w, cx);
-                    }
-                })))
-            })
             .into_any_element()
     }
 
@@ -8955,7 +9478,7 @@ impl Workspace {
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
-            .text_size(u(12.5))
+            .text_size(u(theme::TEXT_UI))
             .child(div().flex_1().text_color(rgb(theme::text())).child(format!("{n} selected")))
             .child(button("pick-clear", "Clear", false).on_click(cx.listener(|ws, _, _, cx| {
                 ws.picked.clear();
@@ -9233,8 +9756,10 @@ impl Workspace {
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
         let mut out = Vec::new();
         let mut last = None;
+        // One day's rows need no day over them: "Recent" says it.
+        let days = rows.iter().map(|r| r.0).collect::<std::collections::BTreeSet<_>>().len();
         for &(bucket, _, ix, thread, project) in &rows {
-            if last != Some(bucket) {
+            if days > 1 && last != Some(bucket) {
                 let first = last.is_none();
                 last = Some(bucket);
                 let n = rows.iter().filter(|r| r.0 == bucket).count();
@@ -9335,13 +9860,25 @@ impl Workspace {
             )))
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .min_w_0()
-                    .one_line()
-                    .text_size(u(12.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
-                    .child(label),
+                    .items_baseline()
+                    .gap(u(6.))
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w_0()
+                            .one_line()
+                            .text_size(u(theme::TEXT_UI))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
+                            .child(label),
+                    )
+                    // The branch the project is on, quiet beside its name.
+                    .children(g.root.as_deref().and_then(head_branch).map(|b| {
+                        div().flex_shrink().min_w_0().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(b)
+                    })),
             )
             // What's going on inside, readable even when folded.
             .when(wants, |d| d.child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(theme::DANGER))))
@@ -9445,8 +9982,17 @@ impl Workspace {
             .and_then(|p| p.agent.as_ref())
             .and_then(|(cmd, _)| AGENTS.iter().find(|a| a.cmd == *cmd))
             .map(|a| a.name.to_string());
+        // An idle shell says what it ran last, so shells in one folder are
+        // told apart ("deck · cargo build").
+        let last = t
+            .job()
+            .filter(|b| !b.running())
+            .and_then(|b| b.command)
+            .map(|c| c.lines().next().unwrap_or("").trim().chars().take(40).collect::<String>())
+            .filter(|c| !c.is_empty());
         let sub = match (&running, place) {
             _ if agent.is_some() => agent.unwrap_or_default(),
+            (None, _) if last.is_some() => last.unwrap_or_default(),
             (Some(_), Some(p)) => p.label(),
             (None, Some(p)) if !p.sub.is_empty() && title != p.sub => p.label(),
             _ => "Terminal".into(),
@@ -9535,6 +10081,17 @@ impl Workspace {
         }))
     }
 
+    /// A terminal beside the + in the titlebar: a shell in the focused
+    /// pane's folder, as New Terminal opens.
+    fn new_terminal_button(&self, id: &'static str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        icon_button(id, Icon::Terminal)
+            .tooltip(|_, cx| Tip::view("New terminal", cx))
+            .on_click(cx.listener(|ws, _, window, cx| {
+                let what = ws.shell_here(cx);
+                let _ = ws.new_tab(what, None, window, cx);
+            }))
+    }
+
     /// A thread: its title, then who is doing it and what it needs from you.
     /// A chat or agent's row. `place` is its project, for the Recent view,
     /// where rows stand flush and say which project they are in.
@@ -9573,16 +10130,25 @@ impl Workspace {
         };
         let (_, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
-        sidebar_row(
+        let picked = self.row_picked(ix);
+        let row = sidebar_row(
             div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
             indent,
             active,
             !loud,
         )
-        .when(self.row_picked(ix), picked_row)
+        .when(picked, picked_row)
         .group(group.clone())
         .h(u(ROW_H))
-            .child(lead(if working {
+        .child({
+            let map = self.drop_map.clone();
+            mark_bounds(move |b| {
+                map.borrow_mut().rows.insert(ix, b);
+            })
+        })
+            .child(lead(if picked {
+                pick_check()
+            } else if working {
                 thinking(
                     ElementId::NamedInteger("thread-think".into(), ix as u64),
                     glyph,
@@ -9618,7 +10184,7 @@ impl Workspace {
                             .one_line()
                             .text_size(u(ROW_TEXT))
                             .when(loud && !working && !wants, |d| d.font_weight(FontWeight::SEMIBOLD))
-                            .text_color(rgb(if active || loud {
+                            .text_color(rgb(if active || loud || picked {
                                 theme::text()
                             } else {
                                 theme::text_2()
@@ -9629,7 +10195,7 @@ impl Workspace {
                     // else, in Recent where no header names it, the project.
                     .children(
                         if working || wants { Some(who.to_string()) } else { place.map(str::to_string) }
-                            .filter(|p| !p.is_empty())
+                            .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case(&self.pane_title(tab.focused, cx)))
                             .map(|p| {
                                 div().flex_shrink().min_w_0().max_w(u(150.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p)
                             }),
@@ -9675,8 +10241,43 @@ impl Workspace {
                 cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
                     ws.open_tab_menu(ix, ev.position, window, cx)
                 }),
-            )
-            .into_any_element()
+            );
+        // The open chat lists what you asked in it, to jump back to.
+        let chat = match self.tabs.get(ix).and_then(|t| self.panes.get(&t.focused)).map(|p| &p.kind) {
+            Some(PaneKind::Chat(c)) if ix == self.active => Some(c.clone()),
+            _ => None,
+        };
+        let outline = chat.as_ref().map(|c| (c.read(cx).outline(), c.read(cx).outline_at())).filter(|(o, _)| o.len() > 1);
+        let Some((items, at)) = outline else {
+            return row.into_any_element();
+        };
+        let chat = chat.expect("outline came from it");
+        let mut col = div().flex().flex_col().gap(u(2.)).child(row);
+        for (ix_msg, text) in items {
+            let here = at == Some(ix_msg);
+            let c = chat.clone();
+            col = col.child(
+                div()
+                    .id(ElementId::NamedInteger("side-outline".into(), ix_msg as u64))
+                    .flex()
+                    .items_center()
+                    .h(u(24.))
+                    .ml(u(theme::ROW_PAD + ROW_SLOT / 2.))
+                    .pl(u(ROW_GAP + ROW_SLOT / 2. - 1.))
+                    .pr(u(ROW_END))
+                    .border_l_1()
+                    .border_color(rgba(if here { theme::focus_edge() } else { theme::hairline() }))
+                    .text_size(u(12.))
+                    .text_color(rgb(if here { theme::text() } else { theme::dim() }))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(theme::text())))
+                    .child(div().flex_1().min_w_0().one_line().child(text))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        c.update(cx, |c, cx| c.jump_to(ix_msg, cx));
+                    })),
+            );
+        }
+        col.into_any_element()
     }
 
     /// New agents as a menu: a chat with each one that has one, its own
@@ -9772,7 +10373,14 @@ impl Workspace {
             (Some(s), n) if n > 1 => Some(format!("{s} · {n} panes").into()),
             (s, _) => s,
         };
+        // A shell's own line (what it ran last) when its title is already
+        // the project's name; else the project.
+        let shell_sub = shell.as_ref().map(|(_, sub)| sub.clone()).filter(|s| s.as_ref() != "Terminal");
         let row_title = shell.map(|(t, _)| t).unwrap_or_else(|| self.pane_title(tab.focused, cx));
+        let tag: Option<String> = match place.filter(|p| !p.is_empty()) {
+            Some(p) if !p.eq_ignore_ascii_case(&row_title) => Some(p.to_string()),
+            _ => shell_sub.map(|s| s.to_string()),
+        };
         let is_page = matches!(
             self.panes.get(&first).map(|p| &p.kind),
             Some(PaneKind::Browser(_))
@@ -9837,22 +10445,29 @@ impl Workspace {
             _ => icon(glyph, 15., tone),
         };
 
+        let picked = self.row_picked(ix);
         sidebar_row(
             div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
             indent,
             active,
             !busy && !wants,
         )
-        .when(self.row_picked(ix), picked_row)
+        .when(picked, picked_row)
         .group(group.clone())
         .h(u(ROW_H))
+        .child({
+            let map = self.drop_map.clone();
+            mark_bounds(move |b| {
+                map.borrow_mut().rows.insert(ix, b);
+            })
+        })
         .text_size(u(ROW_TEXT))
-        .text_color(rgb(if active || busy || wants {
+        .text_color(rgb(if active || busy || wants || picked {
             theme::text()
         } else {
             theme::text_2()
         }))
-            .child(lead(mark))
+            .child(lead(if picked { pick_check() } else { mark }))
             // Definite-width boxes, so gpui knows where to put the ellipsis.
             .child(
                 div()
@@ -9863,9 +10478,11 @@ impl Workspace {
                     .flex_row()
                     .items_baseline()
                     .gap(u(6.))
-                    .child(div().flex_shrink().min_w_0().one_line().child(row_title))
-                    .children(place.filter(|p| !p.is_empty()).map(|p| {
-                        div().flex_none().max_w(u(90.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p.to_string())
+                    .child(div().flex_shrink().min_w_0().one_line().child(row_title.clone()))
+                    // The project, or what the shell ran last when the title
+                    // already names the project ("deck · cargo build").
+                    .children(tag.map(|p| {
+                        div().flex_shrink().min_w_0().max_w(u(140.)).one_line().text_size(u(12.)).text_color(rgb(theme::dim())).child(p)
                     })),
             )
             .child(
@@ -10147,7 +10764,7 @@ impl Workspace {
             .border_t_1()
             .border_color(rgba(theme::hairline()))
             .bg(theme::ground())
-            .text_size(u(11.5))
+            .text_size(u(theme::TEXT_SMALL))
             .text_color(rgb(theme::text_2()))
             .children(place)
             .when(chats.is_some(), |d| d.child(sep()).children(chats))
@@ -10210,7 +10827,7 @@ impl Workspace {
             .absolute()
             .bottom(u(32.))
             .left_0()
-            .w(u(340.))
+            .w(u(360.))
             .p(u(4.))
             .flex()
             .flex_col()
@@ -10219,6 +10836,7 @@ impl Workspace {
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .shadow_lg()
             .occlude()
             .on_hover(cx.listener(|ws, on: &bool, _, cx| {
                 ws.bar_chats_over_list = *on;
@@ -10233,8 +10851,8 @@ impl Workspace {
                     .text_size(u(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(theme::dim()))
-                    .child(div().flex_1().child("Chats in this window"))
-                    .child(div().font_weight(FontWeight::NORMAL).child("by spend")),
+                    .child(div().flex_1().child("Chats"))
+                    .child(div().child("Spend")),
             );
         // The conversation you are in comes first, marked: a chat here, or
         // the agent in the focused terminal (read from its own transcript).
@@ -10247,7 +10865,7 @@ impl Workspace {
             .filter(|id| !spend.iter().any(|c| c.pane == *id))
             .and(self.usage.session.as_ref());
         if let Some((title, su)) = here_terminal {
-            let figure = su.cost_usd.map_or_else(|| tokens(su.input + su.output + su.cache_read), |c| format!("${c:.2}"));
+            let figure = su.cost_usd.map_or_else(|| format!("{} tok", tokens(su.input + su.output + su.cache_read)), |c| format!("${c:.2}"));
             let pct = su.context_used as f32 / su.context_window.max(1) as f32 * 100.;
             list = list.child(
                 div()
@@ -10258,7 +10876,7 @@ impl Workspace {
                     .px(u(8.))
                     .rounded(u(6.))
                     .bg(rgb(theme::surface()))
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .child(icon(Icon::Claude, 13., Icon::Claude.brand().unwrap_or(theme::text_2())))
                     .child(
                         div()
@@ -10285,9 +10903,10 @@ impl Workspace {
         for c in spend.iter().take(10) {
             let pane = c.pane;
             let busy = self.status(pane, cx) == Some(Status::Working);
+            // Dollars when the agent reports them, else tokens, said so.
             let figure = match c.usage.cost_usd.filter(|v| *v >= 0.01) {
                 Some(v) => format!("${v:.2}"),
-                None => tokens(c.usage.tokens()),
+                None => format!("{} tok", tokens(c.usage.tokens())),
             };
             list = list.child(
                 div()
@@ -10300,7 +10919,7 @@ impl Workspace {
                     // Concentric: the list's 10 radius less its 4 padding.
                     .rounded(u(6.))
                     .cursor_pointer()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .when(focused == Some(pane), |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::row_hover())))
                     .child(if busy {
@@ -10469,7 +11088,7 @@ impl Workspace {
                     .px(u(8.))
                     .rounded(u(6.))
                     .cursor_pointer()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .when(r.open, |d| d.bg(rgb(theme::surface())))
                     .hover(|s| s.bg(rgb(theme::row_hover())))
                     .child(div().flex_none().flex().justify_center().w(u(14.)).child(self.bg_mark(id, 13., cx)))
@@ -10614,64 +11233,111 @@ impl Workspace {
         let name = self.named.iter().find(|(_, v)| **v == id).map(|(n, _)| n.clone());
         let dj = self.daemon_job(id).cloned();
         let cmd = dj.as_ref().map(|j| j.cmd.clone()).unwrap_or_default();
-        let status = match dj.as_ref() {
-            Some(j) if j.running => "running · keeps going when Deck quits".to_string(),
-            Some(crate::daemon::JobInfo { exit: Some(c), .. }) => format!("exited {c}"),
-            _ => "starting".to_string(),
+        let running = dj.as_ref().is_some_and(|j| j.running);
+        let (dot, state) = match dj.as_ref() {
+            Some(j) if j.running => (theme::palette().ansi[2], "running".to_string()),
+            Some(crate::daemon::JobInfo { exit: Some(0), .. }) => (theme::dim(), "finished".to_string()),
+            Some(crate::daemon::JobInfo { exit: Some(c), .. }) => (theme::DANGER, format!("exited {c}")),
+            _ => (theme::dim(), "starting".to_string()),
         };
-        let restart_name = dj.as_ref().map(|j| j.name.clone());
-        let button = |id: &'static str, glyph: Icon| icon_button(id, glyph).size(u(22.));
+        let job_name = dj.as_ref().map(|j| j.name.clone());
+        let (min, max) = (self.drawer_min, self.drawer_max);
+        // Each control says what it does on hover.
+        let button = |eid: &'static str, glyph: Icon, tip: &'static str| {
+            icon_button(eid, glyph).size(u(24.)).tooltip(move |_, cx| Tip::view(tip, cx))
+        };
+        let (n1, n2) = (job_name.clone(), job_name);
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(8.))
+            .h(u(32.))
+            .pl(u(12.))
+            .pr(u(4.))
+            .text_size(u(12.))
+            .when(!min, |d| d.border_b_1().border_color(rgba(theme::hairline())))
+            .child(div().flex_none().size(u(7.)).rounded_full().bg(rgb(dot)))
+            .child(div().flex_none().font_weight(FontWeight::MEDIUM).child(name.unwrap_or_else(|| format!("job {id}"))))
+            .child(div().flex_1().min_w_0().one_line().font_family(theme::mono()).text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(cmd))
+            .child(div().flex_none().text_size(u(11.)).text_color(rgb(theme::dim())).child(state))
+            // Run again or stop: the job and its output stay either way.
+            .when(running, |d| {
+                d.child(button("job-halt", Icon::Stop, "Stop").on_click(cx.listener(move |_, _, _, cx| {
+                    if let Some(n) = n1.clone() {
+                        cx.background_executor().spawn(async move { crate::daemon::halt(&n) }).detach();
+                    }
+                })))
+            })
+            .child(
+                button("job-restart", Icon::Refresh, if running { "Restart" } else { "Run again" }).on_click(cx.listener(
+                    move |_, _, _, cx| {
+                        if let Some(n) = n2.clone() {
+                            cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
+                        }
+                    },
+                )),
+            )
+            .child(div().flex_none().w(u(1.)).h(u(14.)).mx(u(2.)).bg(rgba(theme::hairline())))
+            .child(button("job-tab", Icon::PanelRight, "Open as a tab").on_click(cx.listener(move |ws, _, w, cx| ws.job_to_tab(id, w, cx))))
+            .child(
+                button("job-min", if min { Icon::ChevronUp } else { Icon::ChevronDown }, if min { "Restore" } else { "Minimize" })
+                    .on_click(cx.listener(|ws, _, _, cx| {
+                        ws.drawer_min = !ws.drawer_min;
+                        ws.drawer_max = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button("job-max", Icon::Maximize, if max { "Restore size" } else { "Maximize" }).on_click(cx.listener(|ws, _, _, cx| {
+                    ws.drawer_max = !ws.drawer_max;
+                    ws.drawer_min = false;
+                    cx.notify();
+                })),
+            )
+            .child(button("job-forget", Icon::Close, "Stop and remove").on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))));
+        // The top edge drags the drawer taller or shorter; a double click
+        // puts it back.
+        let grip = div()
+            .id("drawer-grip")
+            .absolute()
+            .top(u(-3.))
+            .left_0()
+            .right_0()
+            .h(u(6.))
+            .cursor_row_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, ev: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if ev.click_count == 2 {
+                        ws.drawer_h = DRAWER_H;
+                    } else {
+                        ws.drawer_drag = Some((f32::from(ev.position.y), ws.drawer_h));
+                    }
+                    ws.drawer_min = false;
+                    ws.drawer_max = false;
+                    cx.notify();
+                }),
+            );
+        let height = if max { DRAWER_MAX } else { self.drawer_h };
         Some(
             div()
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_none()
-                .h(u(300.))
+                .when(!min, |d| d.h(u(height)))
                 .mx(u(theme::GUTTER))
                 .mb(u(theme::GUTTER))
                 .rounded(u(theme::CARD_RADIUS))
                 .overflow_hidden()
+                .bg(rgb(theme::pane()))
                 .border_1()
                 .border_color(rgba(theme::hairline()))
-                .bg(rgb(theme::pane()))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(u(8.))
-                        .h(u(32.))
-                        .pl(u(12.))
-                        .pr(u(4.))
-                        .border_b_1()
-                        .border_color(rgba(theme::hairline()))
-                        .text_size(u(12.))
-                        .child(icon(Icon::Terminal, 13., theme::text_2()))
-                        .child(div().font_weight(FontWeight::MEDIUM).child(name.unwrap_or_else(|| format!("job {id}"))))
-                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::dim())).child(cmd))
-                        .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(status))
-                        .child(
-                            button("job-restart", Icon::Refresh)
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    if let Some(n) = restart_name.clone() {
-                                        cx.background_executor().spawn(async move { crate::daemon::restart(&n) }).detach();
-                                    }
-                                })),
-                        )
-                        .child(
-                            button("job-tab", Icon::Maximize)
-                                .on_click(cx.listener(move |ws, _, w, cx| ws.job_to_tab(id, w, cx))),
-                        )
-                        .child(
-                            button("job-stop", Icon::Stop)
-                                .on_click(cx.listener(move |ws, _, w, cx| ws.stop_job(id, w, cx))),
-                        )
-                        .child(button("job-hide", Icon::ChevronDown).on_click(cx.listener(|ws, _, _, cx| {
-                            ws.job_open = None;
-                            cx.notify();
-                        }))),
-                )
-                .child(div().flex_1().min_h_0().child(t.clone()))
+                .when(!min, |d| d.child(grip))
+                .child(header)
+                .when(!min, |d| d.child(div().flex_1().min_h_0().child(t.clone())))
                 .into_any_element(),
         )
     }
@@ -10793,6 +11459,72 @@ impl Workspace {
     }
 }
 
+/// A shell's program name from its path: `zsh` from `/bin/zsh`, `pwsh`
+/// from `C:\Program Files\PowerShell\7\pwsh.exe`.
+fn shell_name(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base).to_string()
+}
+
+/// How wide Windows' minimize, maximize and close buttons are together.
+const CAPTION_PX: f32 = 3. * 46.;
+
+/// Empty title strip that moves the window on Windows, where the system
+/// draws no title bar of its own above Deck's.
+fn drag_strip() -> impl IntoElement {
+    div()
+        .id("drag-strip")
+        .flex_1()
+        .h_full()
+        .window_control_area(WindowControlArea::Drag)
+}
+
+/// Minimize, maximize and close in the window's top right corner on
+/// Windows, at the system's sizes. The system handles their clicks (the
+/// areas answer its hit test), so snap layouts show over maximize.
+fn caption_buttons(window: &Window) -> Option<AnyElement> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let ink = rgb(theme::text_2());
+    let button = |id: &'static str, area: WindowControlArea, glyph: AnyElement, close: bool| {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(46.))
+            .h_full()
+            .window_control_area(area)
+            .hover(move |s| if close { s.bg(rgb(0xc42b1c)) } else { s.bg(rgb(theme::row_hover())) })
+            .child(glyph)
+    };
+    let minimize = div().w(px(10.)).h(px(1.)).bg(ink);
+    // Restore is two overlapping squares, the back one showing its top
+    // and right edges only.
+    let maximize = if window.is_maximized() {
+        div()
+            .relative()
+            .size(px(10.))
+            .child(div().absolute().top_0().left(px(2.)).size(px(8.)).border_t_1().border_r_1().border_color(ink))
+            .child(div().absolute().top(px(2.)).left_0().size(px(8.)).border_1().border_color(ink))
+    } else {
+        div().size(px(10.)).border_1().border_color(ink)
+    };
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .flex()
+            .h(px(theme::TITLEBAR_PX))
+            .child(button("caption-min", WindowControlArea::Min, minimize.into_any_element(), false))
+            .child(button("caption-max", WindowControlArea::Max, maximize.into_any_element(), false))
+            .child(button("caption-close", WindowControlArea::Close, icon(Icon::Close, 14., theme::text_2()).into_any_element(), true))
+            .into_any_element(),
+    )
+}
+
 pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -10811,6 +11543,18 @@ pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui
 /// The content area never gets narrower than this to make room for chrome:
 /// past it the inspector folds away (and comes back when there is room).
 const MIN_CONTENT_PX: f32 = 520.;
+/// A page's storage, as `deck browser storage` reports it: its origin,
+/// the cookies script can see (not HttpOnly ones), and local and session
+/// storage, long values clipped.
+const STORAGE_JS: &str = "(() => { const clip = v => (v || '').length > 2000 ? v.slice(0, 2000) + '…' : (v || ''); \
+const dump = s => { const o = {}; try { for (let i = 0; i < s.length; i++) { const k = s.key(i); o[k] = clip(s.getItem(k)); } } catch (e) { o.error = String(e); } return o; }; \
+const c = {}; document.cookie.split('; ').filter(Boolean).forEach(p => { const i = p.indexOf('='); c[i < 0 ? p : p.slice(0, i)] = i < 0 ? '' : clip(p.slice(i + 1)); }); \
+return { origin: location.origin, cookies: c, localStorage: dump(window.localStorage), sessionStorage: dump(window.sessionStorage) }; })()";
+
+/// The job drawer's height to start with, and how far it drags.
+const DRAWER_H: f32 = 300.;
+const DRAWER_MIN: f32 = 120.;
+const DRAWER_MAX: f32 = 720.;
 /// How far the side panels can be dragged.
 const SIDEBAR_MIN: f32 = 200.;
 const SIDEBAR_MAX: f32 = 440.;
@@ -10829,6 +11573,65 @@ enum Finish {
 /// A word for the shell, single-quoted.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// A pane picked up by its grip, as gpui carries it during the drag.
+struct DraggedPane(PaneId);
+
+/// Where a dragged pane would land if let go now.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PaneDrop {
+    /// Beside a pane of its split, on that side of it.
+    Beside(PaneId, Side),
+    /// Out into a tab of its own: the sidebar's empty part.
+    NewTab,
+    /// Into another tab, beside the pane in front there: its row.
+    IntoTab(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Where the places a pane can be dropped were drawn last frame, in
+/// window pixels.
+#[derive(Default)]
+struct DropMap {
+    leaves: HashMap<PaneId, gpui::Bounds<gpui::Pixels>>,
+    /// Sidebar rows, by tab index.
+    rows: HashMap<usize, gpui::Bounds<gpui::Pixels>>,
+    sidebar: Option<gpui::Bounds<gpui::Pixels>>,
+}
+
+/// Notes where the element it fills lands, through `put`.
+fn mark_bounds(put: impl Fn(gpui::Bounds<gpui::Pixels>) + 'static) -> impl IntoElement {
+    canvas(move |b, _, _| put(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+}
+
+/// The dragged pane under the pointer: its name on a small card.
+struct PaneGhost(SharedString);
+
+impl Render for PaneGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .font_family(theme::ui())
+            .max_w(u(220.))
+            .px(u(10.))
+            .py(u(5.))
+            .rounded(u(8.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
+            .shadow_md()
+            .text_size(u(theme::TEXT_UI))
+            .text_color(rgb(theme::text()))
+            .one_line()
+            .child(self.0.clone())
+    }
 }
 
 /// A divider held down: the two panes either side (by the pane each
@@ -10856,9 +11659,11 @@ const ROW_SLOT: f32 = 16.;
 /// The trailing column of every row (time, state, close), right-aligned.
 const TRAIL_W: f32 = 30.;
 /// Every list row: one line, this tall, titles this size.
-const ROW_H: f32 = 34.;
-const ROW_TEXT: f32 = 14.;
-const HEAD_TEXT: f32 = 12.5;
+const ROW_H: f32 = 32.;
+/// A split pane's grip: the strip at its top edge it is dragged by.
+const GRIP_H: f32 = 8.;
+const ROW_TEXT: f32 = theme::TEXT_UI;
+const HEAD_TEXT: f32 = theme::TEXT_SMALL;
 const ROW_GAP: f32 = 10.;
 const ROW_END: f32 = 4.;
 /// A project's rows sit one step in from its header: their icons on the
@@ -11051,6 +11856,32 @@ fn git_head(root: &std::path::Path) -> Option<String> {
 /// its own controls.
 /// A group's header: its name, a step down from the rows, in semibold,
 /// the same for days, projects and the view switch.
+/// The branch checked out at `root`, read from `.git/HEAD` (a worktree's
+/// `.git` file points at its own HEAD): no git process, kept a few seconds.
+fn head_branch(root: &std::path::Path) -> Option<String> {
+    type Cache = HashMap<PathBuf, (Instant, Option<String>)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some((at, b)) = cache.get(root) {
+        if at.elapsed() < Duration::from_secs(5) {
+            return b.clone();
+        }
+    }
+    let dot = root.join(".git");
+    let git_dir = if dot.is_file() {
+        let text = std::fs::read_to_string(&dot).unwrap_or_default();
+        text.trim().strip_prefix("gitdir:").map(|d| root.join(d.trim()))
+    } else {
+        Some(dot)
+    };
+    let branch = git_dir
+        .and_then(|d| std::fs::read_to_string(d.join("HEAD")).ok())
+        .and_then(|h| h.trim().strip_prefix("ref: refs/heads/").map(str::to_string));
+    cache.insert(root.to_path_buf(), (Instant::now(), branch.clone()));
+    branch
+}
+
 fn sidebar_header(label: &'static str) -> gpui::Div {
     div()
         .flex()
@@ -11139,10 +11970,11 @@ fn sidebar_row(
         .rounded(u(theme::ROW_RADIUS))
         .border_1()
         .cursor_pointer()
-        // The open row: a faint fill inside a hairline, flat (no shadow).
+        // The open row: a fill alone, flat (no shadow, no outline), so it
+        // never reads as a box stacked on its hovered neighbour.
         .when(active, |d| {
-            d.bg(rgba(theme::alpha(theme::text(), 0x0a)))
-                .border_color(rgba(theme::hairline()))
+            d.bg(rgba(theme::alpha(theme::text(), 0x10)))
+                .border_color(gpui::transparent_black())
         })
         .when(!active, |d| {
             d.border_color(gpui::transparent_black())
@@ -11172,6 +12004,34 @@ fn lead(mark: AnyElement) -> AnyElement {
         .w(u(ROW_SLOT))
         .child(mark)
         .into_any_element()
+}
+
+/// A small label shown on hover, for controls that are only an icon.
+pub(crate) struct Tip(SharedString);
+
+impl Tip {
+    pub(crate) fn view(text: &'static str, cx: &mut App) -> AnyView {
+        cx.new(|_| Tip(text.into())).into()
+    }
+
+    pub(crate) fn view_owned(text: String, cx: &mut App) -> AnyView {
+        cx.new(|_| Tip(text.into())).into()
+    }
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(u(8.))
+            .py(u(4.))
+            .rounded(u(6.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
+            .text_size(u(12.))
+            .text_color(rgb(theme::text()))
+            .child(self.0.clone())
+    }
 }
 
 /// A part of the window chrome drawn as its own cached view.
@@ -11308,7 +12168,7 @@ fn is_shell(name: &str) -> bool {
 }
 
 fn place_of(cwd: &std::path::Path) -> Place {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = agent_core::dirs::home_dir();
     if home.as_deref() == Some(cwd) {
         return Place {
             cwd: cwd.to_path_buf(),
@@ -11367,18 +12227,35 @@ impl Render for Workspace {
         let screen = self.locked || !crate::account::allowed();
         // Pages are native views drawn above everything gpui paints: while a
         // menu, the palette or a whole-window screen is up, they step aside.
-        let cover = screen || self.menu.is_some() || self.palette.is_some() || self.usage_open;
+        // A pane drag ended somewhere nothing took it (gpui dropped it).
+        if self.pane_drag.is_some() && !cx.has_active_drag() {
+            self.pane_drag = None;
+            self.pane_drop = None;
+        }
+        // Panes and the sidebar note where they land again this frame.
+        {
+            let mut map = self.drop_map.borrow_mut();
+            map.leaves.clear();
+            map.sidebar = None;
+        }
+        // While a pane is dragged, pages step aside too, so the drop
+        // highlight shows over them.
+        let cover = screen
+            || self.menu.is_some()
+            || self.palette.is_some()
+            || self.usage_open
+            || self.pane_drag.is_some();
         if cover != self.screen_cover {
             self.screen_cover = cover;
             self.cover_pages(cover, cx);
         }
         if self.locked {
             window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
-            return self.lock_screen(cx);
+            return self.lock_screen(window, cx);
         }
         if screen {
             window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
-            return self.sign_in_screen(cx);
+            return self.sign_in_screen(window, cx);
         }
         let (sidebar, inspector) = self.islands(cx);
         window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
@@ -11461,14 +12338,17 @@ impl Render for Workspace {
             // The title sits on the same edge as the text in the card below.
             .when(sidebar_shown, |d| d.pl(u(theme::PANE_PAD_X + 1.)))
             // Clear of the traffic lights, which do not zoom.
-            .when(!sidebar_shown, |d| d.pl(px(80.)))
+            .when(!sidebar_shown && cfg!(target_os = "macos"), |d| d.pl(px(80.)))
+            .when(!sidebar_shown && !cfg!(target_os = "macos"), |d| d.pl(u(theme::GUTTER)))
             .on_mouse_down(MouseButton::Left, |ev, window, _| {
                 if ev.click_count == 2 {
                     window.titlebar_double_click();
                 }
             })
             .when(!sidebar_shown, |d| {
-                d.child(self.new_chat_button("new-chat-bar", cx)).child(
+                d.child(self.new_chat_button("new-chat-bar", cx))
+                    .child(self.new_terminal_button("new-terminal-bar", cx))
+                    .child(
                     icon_button("show-sidebar", Icon::Sidebar)
                         .mr(u(6.))
                         .on_click(cx.listener(|ws, _, w, cx| {
@@ -11485,9 +12365,12 @@ impl Render for Workspace {
             .child(
                 // project / title: where you are, then what.
                 div()
+                    .id("title")
                     .flex()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
+                    .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag))
                     .items_center()
                     .gap(u(6.))
                     .text_size(u(13.))
@@ -11541,7 +12424,8 @@ impl Render for Workspace {
                     .on_click(cx.listener(|ws, _, w, cx| ws.toggle_inspector(w, cx))),
             )
             .children(self.update_pill(cx))
-            .child(self.avatar_button(cx));
+            .child(self.avatar_button(cx))
+            .when(cfg!(windows) && !inspector_shown, |d| d.child(div().flex_none().w(px(CAPTION_PX))));
 
         let main = div()
             .flex()
@@ -11576,16 +12460,29 @@ impl Render for Workspace {
             .when(sidebar_shown, |d| d.child(self.side_handle(true, cx)))
             .when(inspector_shown, |d| d.child(self.side_handle(false, cx)))
             .when(sidebar_shown, |d| {
+                let map = self.drop_map.clone();
                 d.child(
-                    AnyView::from(sidebar).cached(
-                        StyleRefinement::default()
-                            .flex_none()
-                            .w(u(self.sidebar_px))
-                            .h_full(),
-                    ),
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(u(self.sidebar_px))
+                        .h_full()
+                        .child(AnyView::from(sidebar).cached(StyleRefinement::default().size_full()))
+                        .child(mark_bounds(move |b| map.borrow_mut().sidebar = Some(b))),
                 )
             })
-            .child(main)
+            // The job drawer under the panes only: the sidebar and the
+            // inspector keep the window's full height beside it.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(main)
+                    .children(self.render_job_drawer(cx)),
+            )
             .when(inspector_shown, |d| {
                 d.child(
                     AnyView::from(inspector).cached(
@@ -11604,13 +12501,24 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(theme::ground())
-            .font_family(theme::UI)
+            .font_family(theme::ui())
             .on_mouse_move(cx.listener(Self::drag_divider))
             .on_mouse_move(cx.listener(Self::drag_side))
+            .on_mouse_move(cx.listener(Self::drag_drawer))
+            .on_drag_move::<DraggedPane>(cx.listener(|ws, ev: &gpui::DragMoveEvent<DraggedPane>, _, cx| {
+                let Some(src) = ws.pane_drag else { return };
+                let to = ws.pane_drop_at(src, ev.event.position);
+                if to != ws.pane_drop {
+                    ws.pane_drop = to;
+                    cx.notify();
+                }
+            }))
+            // Before gpui ends the drag on this release.
+            .capture_any_mouse_up(cx.listener(|ws, _: &gpui::MouseUpEvent, w, cx| ws.drop_pane(w, cx)))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|ws, _, _, cx| {
-                    if ws.resizing.take().is_some() | ws.side_drag.take().is_some() {
+                    if ws.resizing.take().is_some() | ws.side_drag.take().is_some() | ws.drawer_drag.take().is_some() {
                         cx.notify();
                     }
                 }),
@@ -11693,14 +12601,47 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|ws, _: &FilterSidebar, w, cx| ws.open_filter(w, cx)))
-            .on_key_down(cx.listener(|ws, ev: &gpui::KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" && !ws.picked.is_empty() {
-                    ws.picked.clear();
-                    cx.notify();
+            // A click on Deck's own chrome takes the keyboard back from a
+            // page, which on X11 keeps it otherwise (clicks on the page go
+            // to the page's own window and never reach this).
+            .when(cfg!(target_os = "linux"), |d| {
+                d.capture_any_mouse_down(|_, window, _| crate::browser::reclaim_keyboard(window))
+            })
+            // Select All while rows are picked picks every row: taken on the
+            // way down, before the focused field's own Select All.
+            .capture_action(cx.listener(|ws, _: &SelectAll, _, cx| {
+                if ws.picked.is_empty() {
+                    return;
                 }
+                let all: Vec<PaneId> = ws.tabs.iter().filter(|t| !t.pinned).map(|t| t.leaves()[0]).collect();
+                ws.picked.extend(all);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            // On the way down, before the focused composer or field: while
+            // rows are picked, Esc and ⌘A (Ctrl+A) are the sidebar's.
+            .capture_key_down(cx.listener(|ws, ev: &gpui::KeyDownEvent, _, cx| {
+                if ws.picked.is_empty() {
+                    return;
+                }
+                let m = ev.keystroke.modifiers;
+                let command = if cfg!(target_os = "macos") { m.platform } else { m.control };
+                match ev.keystroke.key.as_str() {
+                    "escape" => ws.picked.clear(),
+                    // While rows are picked, ⌘A (Ctrl+A) picks every one
+                    // that can be closed.
+                    "a" if command && !m.shift && !m.alt => {
+                        let all: Vec<PaneId> = ws.tabs.iter().filter(|t| !t.pinned).map(|t| t.leaves()[0]).collect();
+                        ws.picked.extend(all);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+                cx.notify();
             }))
             .on_action(cx.listener(|ws, _: &OpenPackages, w, cx| ws.open_page(PageKind::Packages, w, cx)))
             .on_action(cx.listener(|ws, _: &ImportBrowserData, w, cx| ws.open_settings_at(crate::settings_pane::Page::Browser, w, cx)))
+            .on_action(cx.listener(|ws, _: &ContinueClaudeSession, w, cx| ws.open_claude_sessions(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleAgents, w, cx| {
                 ws.sidebar = true;
                 let at = ws.agent_menu_at();
@@ -11805,8 +12746,9 @@ impl Render for Workspace {
             // The side panels' edges (in `body`): drag to size them,
             // double-click for the usual width.
             .child(body)
-            .children(self.render_job_drawer(cx))
             .children(bar)
+            .children(caption_buttons(window))
+            .children(self.render_drop_hint())
             .children(self.menu.as_ref().map(crate::menu::Open::render))
             // The palette floats over everything, a little above centre,
             // on a scrim that closes it when clicked.
@@ -11871,12 +12813,18 @@ impl Render for Workspace {
 /// (traffic lights, menus, scrollbars, web pages), so nothing is left in
 /// the other mode. System leaves the appearance to macOS.
 fn wear(theme: crate::theme::Theme, window: &Window) {
-    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     let system_dark = matches!(
         window.appearance(),
         gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
     );
     crate::theme::set(theme, system_dark);
+    #[cfg(target_os = "macos")]
+    appkit_appearance(theme);
+}
+
+#[cfg(target_os = "macos")]
+fn appkit_appearance(theme: crate::theme::Theme) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return;
     };
@@ -11891,7 +12839,19 @@ fn wear(theme: crate::theme::Theme, window: &Window) {
     app.setAppearance(appearance.as_deref());
 }
 
+/// The Dock icon's badge: how many panes want you, or none. Linux has no
+/// badge yet.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn set_badge(_n: usize) {}
+
+/// The taskbar button's overlay: how many panes want you, or none.
+#[cfg(windows)]
+fn set_badge(n: usize) {
+    crate::notify::badge(n);
+}
+
 /// The Dock icon's badge: how many panes want you, or none.
+#[cfg(target_os = "macos")]
 fn set_badge(n: usize) {
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return;
@@ -11950,26 +12910,26 @@ pub struct BranchPicker {
     at: gpui::Point<gpui::Pixels>,
 }
 
-/// A row picked with ⌘-click: the accent's tint and edge, full strength.
+/// A row picked with ⌘-click: the accent's tint, a fill alone like the
+/// open row (no outline), at full strength. Hover keeps the tint, so the
+/// row doesn't flicker to the plain hover fill under the pointer.
 fn picked_row(d: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
-    d.relative()
-        .bg(rgba(theme::alpha(theme::accent(), 0x1f)))
-        .border_color(rgba(theme::alpha(theme::accent(), 0x59)))
-        .opacity(1.)
-        // A check on the row's leading edge: picked, not just open.
-        .child(
-            div()
-                .absolute()
-                .left(u(-3.))
-                .top(u(-3.))
-                .size(u(14.))
-                .rounded_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgb(theme::accent()))
-                .child(icon(Icon::Check, 9., theme::pane())),
-        )
+    let fill = rgba(theme::alpha(theme::accent(), 0x1f));
+    d.bg(fill).opacity(1.).hover(move |s| s.bg(fill).opacity(1.))
+}
+
+/// What a picked row shows in its icon's place: a filled check, inside
+/// the row, on the icons' line.
+fn pick_check() -> AnyElement {
+    div()
+        .size(u(16.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(theme::accent()))
+        .child(icon(Icon::Check, 10., theme::on_accent()))
+        .into_any_element()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -12004,7 +12964,7 @@ fn row_trailer(id: ElementId, state: RowState, when: String) -> AnyElement {
         .flex()
         .items_center()
         .gap(u(8.))
-        .child(div().text_size(u(12.5)).text_color(rgb(theme::dim())).child(when))
+        .child(div().text_size(u(theme::TEXT_UI)).text_color(rgb(theme::dim())).child(when))
         .children(mark)
         .into_any_element()
 }
@@ -12029,18 +12989,17 @@ struct BgRow {
     open: bool,
 }
 
+/// A quiet mark: an accent dot and the word, no filled badge; the row's
+/// own highlight already says most of it.
 fn current_tag() -> gpui::Div {
     div()
         .flex_none()
-        .h(u(18.))
-        .px(u(6.))
         .flex()
         .items_center()
-        .rounded(u(4.))
-        .bg(rgba(theme::alpha(theme::accent(), 0x26)))
-        .text_size(u(10.5))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(theme::accent()))
+        .gap(u(5.))
+        .text_size(u(11.))
+        .text_color(rgb(theme::dim()))
+        .child(div().size(u(6.)).rounded_full().bg(rgb(theme::accent())))
         .child("Current")
 }
 
@@ -12174,14 +13133,27 @@ fn host(url: &str) -> String {
         .to_string()
 }
 
+/// The shell line a pane runs to show background job `name`; the pane ends
+/// with the attach.
+fn job_attach_cmd(exe: &std::path::Path, name: &str) -> String {
+    let exe = exe.to_string_lossy();
+    #[cfg(windows)]
+    {
+        // ponytail: PowerShell syntax, the default Windows shell; a DECK_SHELL
+        // of cmd.exe would need its own quoting.
+        let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        format!("& {} job attach {}; exit", q(&exe), q(name))
+    }
+    #[cfg(not(windows))]
+    {
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        format!("exec {} job attach {}", q(&exe), q(name))
+    }
+}
+
 fn new_token() -> String {
-    let mut bytes = [0u8; 16];
-    // /dev/urandom cannot run dry; failing to open it means a broken system,
-    // and an all-zero token would be guessable, so that is fatal.
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("read /dev/urandom");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    // 122 bits from the OS CSPRNG on every platform (Windows has no /dev/urandom).
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Your snippets and the project's as palette rows.
@@ -12435,7 +13407,7 @@ impl Workspace {
         .detach();
     }
 
-    fn sign_in_screen(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn sign_in_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let account = crate::account::current();
         let note = self.account_note.clone();
         let mut col = div()
@@ -12560,26 +13532,31 @@ impl Workspace {
                 .text_color(rgb(theme::DANGER))
                 .child(n)
         }));
-        self.screen(col)
+        self.screen(col, window)
     }
 
     /// A full window with `content` in the middle, under a strip that still
     /// moves the window.
-    fn screen(&self, content: gpui::Div) -> AnyElement {
+    fn screen(&self, content: gpui::Div, window: &Window) -> AnyElement {
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(theme::pane()))
-            .font_family(theme::UI)
-            .child(div().flex_none().h(px(theme::TITLEBAR_PX)).on_mouse_down(
-                MouseButton::Left,
-                |ev, window, _| {
-                    if ev.click_count == 2 {
-                        window.titlebar_double_click();
-                    }
-                },
-            ))
+            .font_family(theme::ui())
+            .child(
+                div()
+                    .id("screen-title")
+                    .flex_none()
+                    .h(px(theme::TITLEBAR_PX))
+                    .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag))
+                    .on_mouse_down(MouseButton::Left, |ev, window, _| {
+                        if ev.click_count == 2 {
+                            window.titlebar_double_click();
+                        }
+                    }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -12589,6 +13566,7 @@ impl Workspace {
                     .pb(u(60.))
                     .child(content),
             )
+            .children(caption_buttons(window))
             .into_any_element()
     }
 
@@ -12612,7 +13590,7 @@ impl Workspace {
         .detach();
     }
 
-    fn lock_screen(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn lock_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let col = div()
             .flex()
             .flex_col()
@@ -12653,7 +13631,7 @@ impl Workspace {
                     .text_color(rgb(theme::dim()))
                     .child("With Touch ID or your Mac's password"),
             );
-        self.screen(col)
+        self.screen(col, window)
     }
 
     // -- the avatar menu --------------------------------------------------------
@@ -13041,6 +14019,33 @@ mod tests {
         let mut v = Vec::new();
         n.leaves(&mut v);
         v
+    }
+
+    #[test]
+    fn a_dragged_pane_lands_on_the_side_it_was_dropped() {
+        // Three columns; take the last and drop it left of the first.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Axis::Row);
+        t.split(2, 3, Axis::Row);
+        t.remove(3);
+        assert!(t.place(1, 3, Axis::Row, true));
+        assert_eq!(leaves(&t), vec![3, 1, 2]);
+        // Below the middle one: that column splits, the others stay.
+        t.remove(3);
+        assert!(t.place(2, 3, Axis::Column, false));
+        assert_eq!(
+            t,
+            Node::Split(
+                Axis::Row,
+                vec![Node::Leaf(1), Node::Split(Axis::Column, vec![Node::Leaf(2), Node::Leaf(3)], vec![1., 1.])],
+                vec![0.5, 0.5],
+            )
+        );
+        // Above a lone pane.
+        let mut t = Node::Leaf(1);
+        assert!(t.place(1, 2, Axis::Column, true));
+        assert_eq!(leaves(&t), vec![2, 1]);
+        assert!(!t.place(9, 3, Axis::Row, false));
     }
 
     #[test]

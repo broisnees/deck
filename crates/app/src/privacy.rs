@@ -86,6 +86,7 @@ impl Permission {
     pub fn state(self) -> State {
         match self {
             Permission::FullDisk => full_disk(),
+            #[cfg(target_os = "macos")]
             Permission::Accessibility => {
                 if unsafe { AXIsProcessTrusted() } {
                     State::On
@@ -93,6 +94,7 @@ impl Permission {
                     State::Off
                 }
             }
+            #[cfg(target_os = "macos")]
             Permission::Screen => {
                 if unsafe { CGPreflightScreenCaptureAccess() } {
                     State::On
@@ -112,7 +114,9 @@ impl Permission {
 
     pub fn ask(self) {
         match self {
+            #[cfg(target_os = "macos")]
             Permission::Accessibility => ask_accessibility(),
+            #[cfg(target_os = "macos")]
             Permission::Screen => unsafe {
                 CGRequestScreenCaptureAccess();
             },
@@ -137,7 +141,7 @@ impl Permission {
     }
 
     pub fn open(self) {
-        let _ = std::process::Command::new("/usr/bin/open").arg(self.pane()).spawn();
+        crate::desktop::open(self.pane());
     }
 }
 
@@ -161,7 +165,7 @@ pub fn service_full_disk() -> State {
 pub fn grant_service() {
     Permission::FullDisk.open();
     let exe = crate::control::socket_dir().join("bin").join("deckd");
-    let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(exe).spawn();
+    let _ = crate::desktop::reveal(&exe);
 }
 
 /// Only an app with Full Disk Access can open the system's own privacy
@@ -177,8 +181,10 @@ pub fn full_disk() -> State {
     }
 }
 
+#[cfg(target_os = "macos")]
 type CFTypeRef = *const std::ffi::c_void;
 
+#[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
@@ -186,12 +192,14 @@ extern "C" {
     static kAXTrustedCheckOptionPrompt: CFTypeRef;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFBooleanTrue: CFTypeRef;
@@ -210,6 +218,7 @@ extern "C" {
 
 /// macOS's own "Deck would like to control this computer" prompt, which
 /// also lists Deck in the Accessibility pane.
+#[cfg(target_os = "macos")]
 fn ask_accessibility() {
     // SAFETY: CoreFoundation's documented constants and calls; the
     // dictionary is released after use.

@@ -28,7 +28,7 @@
 //! own theme instead of shipping a second one.
 
 mod tap;
-#[cfg(feature = "ghostty")]
+#[cfg(all(feature = "ghostty", unix))]
 mod ghostty;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
@@ -884,7 +884,7 @@ const STALE_ENV: &[&str] = &[
 /// `~/.hushlogin` exists. This is the same command with `-q` added, so the
 /// banner is gone without anyone having to create that file.
 #[cfg(target_os = "macos")]
-fn login_shell() -> Option<tty::Shell> {
+fn login_shell(_env: &HashMap<String, String>) -> Option<tty::Shell> {
     let user = std::env::var("USER").ok().filter(|u| !u.is_empty())?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let name = shell.rsplit('/').next().unwrap_or("zsh");
@@ -897,9 +897,64 @@ fn login_shell() -> Option<tty::Shell> {
     ))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn login_shell() -> Option<tty::Shell> {
+#[cfg(all(unix, not(target_os = "macos")))]
+fn login_shell(_env: &HashMap<String, String>) -> Option<tty::Shell> {
     None
+}
+
+/// Windows' shell: the one named by `DECK_SHELL` (in the spawn's
+/// environment or Deck's), else PowerShell 7, else Windows PowerShell,
+/// else `%COMSPEC%`. Deck's integration loads into either PowerShell when
+/// `DECK_PWSH_INTEGRATION` names its script.
+#[cfg(windows)]
+fn login_shell(env: &HashMap<String, String>) -> Option<tty::Shell> {
+    let get = |k: &str| env.get(k).cloned().filter(|v| !v.is_empty()).or_else(|| std::env::var(k).ok().filter(|v| !v.is_empty()));
+    let (program, args) = windows_shell(
+        get("DECK_SHELL").as_deref(),
+        get("DECK_PWSH_INTEGRATION").as_deref(),
+        |bin| which(bin).is_some(),
+        get("COMSPEC"),
+    );
+    Some(tty::Shell::new(program, args))
+}
+
+/// Which Windows shell to run and how. `choice` is a program (a name or a
+/// path; `wsl` for the default WSL distribution); `script` is Deck's
+/// PowerShell integration.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_shell(
+    choice: Option<&str>,
+    script: Option<&str>,
+    on_path: impl Fn(&str) -> bool,
+    comspec: Option<String>,
+) -> (String, Vec<String>) {
+    let program = match choice.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => c.to_string(),
+        None => ["pwsh.exe", "powershell.exe"]
+            .into_iter()
+            .find(|b| on_path(b))
+            .map(str::to_string)
+            .unwrap_or_else(|| comspec.unwrap_or_else(|| "cmd.exe".into())),
+    };
+    let stem = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(&program)
+        .to_ascii_lowercase();
+    let stem = stem.strip_suffix(".exe").unwrap_or(&stem);
+    let mut args = Vec::new();
+    match stem {
+        "pwsh" | "powershell" => {
+            args.push("-NoLogo".into());
+            if let Some(script) = script {
+                // Your profile loads first, then the integration wraps the
+                // prompt it set.
+                args.extend(["-NoExit".into(), "-Command".into(), format!(". '{}'", script.replace('\'', "''"))]);
+            }
+        }
+        _ => {}
+    }
+    (program, args)
 }
 
 fn base_env() -> HashMap<String, String> {
@@ -933,11 +988,39 @@ impl Spawn {
     /// Not `exit`-ing afterwards is deliberate: a pane that dies the moment the
     /// command finishes takes its output with it, exactly when you want to read
     /// it.
+    #[cfg(not(windows))]
     pub fn command(cmd: &str, cwd: &Path) -> Spawn {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         Spawn {
             program: Some(shell.clone()),
             args: vec!["-c".into(), format!("{cmd}; exec {shell}")],
+            cwd: Some(cwd.to_path_buf()),
+            env: base_env(),
+            engine: Engine::default(),
+        }
+    }
+
+    /// Run one command, then leave the user at a live prompt: through
+    /// PowerShell with `-NoExit` (cmd's `/K` without one).
+    #[cfg(windows)]
+    pub fn command(cmd: &str, cwd: &Path) -> Spawn {
+        let (program, mut args) = windows_shell(
+            std::env::var("DECK_SHELL").ok().as_deref(),
+            None,
+            |bin| which(bin).is_some(),
+            std::env::var("COMSPEC").ok(),
+        );
+        let stem = program.to_ascii_lowercase();
+        if stem.contains("pwsh") || stem.contains("powershell") {
+            args.extend(["-NoExit".into(), "-Command".into(), cmd.into()]);
+        } else if stem.ends_with("cmd.exe") || stem.ends_with("cmd") {
+            args.extend(["/K".into(), cmd.into()]);
+        } else {
+            args.extend(["-e".into(), "sh".into(), "-c".into(), format!("{cmd}; exec \"${{SHELL:-sh}}\"")]);
+        }
+        Spawn {
+            program: Some(program),
+            args,
             cwd: Some(cwd.to_path_buf()),
             env: base_env(),
             engine: Engine::default(),
@@ -1135,18 +1218,23 @@ impl AlacTerminal {
         let options = tty::Options {
             shell: match spawn.program {
                 Some(program) => Some(tty::Shell::new(program, spawn.args)),
-                None => login_shell(),
+                None => login_shell(&env),
             },
             working_directory: spawn.cwd,
             drain_on_exit: true,
             env,
+            #[cfg(windows)]
+            escape_args: true,
         };
 
         let shared = Arc::new(Shared::new(window));
         let proxy = Proxy(shared.clone());
 
         let pty = tty::new(&options, window, 0)?;
+        #[cfg(not(windows))]
         let pid = pty.child().id();
+        #[cfg(windows)]
+        let pid = pty.child_watcher().pid().map_or(0, |p| p.get());
         let pty = tap::Tapped::new(pty, shared.clone())?;
         let config = Config {
             scrolling_history: SCROLLBACK,
@@ -1867,7 +1955,7 @@ impl Engine {
     pub fn available(self) -> bool {
         match self {
             Engine::Alacritty => true,
-            Engine::Ghostty => cfg!(feature = "ghostty"),
+            Engine::Ghostty => cfg!(all(feature = "ghostty", unix)),
         }
     }
 }
@@ -1920,7 +2008,7 @@ impl Terminal {
     /// Start `spawn` on its engine. One not in this build falls back to
     /// Alacritty rather than failing: the pane still opens.
     pub fn spawn(spawn: Spawn, columns: u16, rows: u16) -> anyhow::Result<Terminal> {
-        #[cfg(feature = "ghostty")]
+        #[cfg(all(feature = "ghostty", unix))]
         if spawn.engine == Engine::Ghostty {
             return Ok(Terminal {
                 backend: Box::new(ghostty::GhosttyTerminal::spawn(spawn, columns, rows)?),
@@ -2232,10 +2320,24 @@ pub fn available_externals() -> Vec<&'static str> {
         .collect()
 }
 
+/// `bin` on `PATH`. On Windows a bare name also matches it plus one of
+/// `PATHEXT`'s extensions, so `claude` finds npm's `claude.cmd`.
 pub fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) && Path::new(bin).extension().is_none() {
+        std::env::var("PATHEXT")
+            .ok()
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| e.starts_with('.'))
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
     std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
+        .flat_map(|dir| exts.iter().map(move |e| dir.join(format!("{bin}{e}"))))
         .find(|p| p.is_file())
 }
 
@@ -2285,6 +2387,25 @@ mod tests {
                 0x555555, 0xff5555, 0x55ff55, 0xffff55, 0x5555ff, 0xff55ff, 0x55ffff, 0xffffff,
             ],
         }
+    }
+
+    #[test]
+    fn windows_shell_prefers_pwsh_and_loads_the_integration() {
+        let has = |names: &'static [&'static str]| move |b: &str| names.contains(&b);
+        let script = Some(r"C:\Users\o'neil\deck.ps1");
+        let (p, a) = windows_shell(None, script, has(&["pwsh.exe", "powershell.exe"]), None);
+        assert_eq!(p, "pwsh.exe");
+        assert_eq!(a, ["-NoLogo", "-NoExit", "-Command", r". 'C:\Users\o''neil\deck.ps1'"]);
+        let (p, a) = windows_shell(None, None, has(&["powershell.exe"]), None);
+        assert_eq!((p.as_str(), a.as_slice()), ("powershell.exe", ["-NoLogo".to_string()].as_slice()));
+        let (p, a) = windows_shell(None, script, has(&[]), Some(r"C:\Windows\system32\cmd.exe".into()));
+        assert_eq!(p, r"C:\Windows\system32\cmd.exe");
+        assert!(a.is_empty());
+        let (p, a) = windows_shell(Some("wsl.exe"), script, has(&["pwsh.exe"]), None);
+        assert_eq!(p, "wsl.exe");
+        assert!(a.is_empty());
+        let (p, _) = windows_shell(Some(r"C:\Program Files\PowerShell\7\PWSH.EXE"), script, has(&[]), None);
+        assert!(p.ends_with("PWSH.EXE"));
     }
 
     #[test]
@@ -2355,6 +2476,7 @@ mod tests {
         assert_eq!(palette().resolve(AnsiColor::Spec(rgb)), 0x123456);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_shell_command_leaves_you_at_a_live_prompt() {
         let s = Spawn::command("cargo build", Path::new("/tmp"));

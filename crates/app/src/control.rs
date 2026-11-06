@@ -10,8 +10,7 @@ use futures::channel::{mpsc, oneshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use crate::os::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -69,13 +68,7 @@ fn newest_socket() -> Option<PathBuf> {
 /// Where deck keeps its socket, settings and threads. `DECK_DATA_DIR` moves
 /// it, so a test instance never touches the user's own.
 pub fn socket_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("DECK_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Library/Application Support/deck")
+    agent_core::dirs::data_dir()
 }
 
 pub fn stable_socket() -> PathBuf {
@@ -85,7 +78,7 @@ pub fn stable_socket() -> PathBuf {
 pub fn listen() -> std::io::Result<(Server, mpsc::UnboundedReceiver<Incoming>)> {
     let dir = socket_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    crate::os::private(&dir)?;
 
     // A crashed instance leaves its socket behind; nothing answers on it.
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -101,12 +94,12 @@ pub fn listen() -> std::io::Result<(Server, mpsc::UnboundedReceiver<Incoming>)> 
     let path = dir.join(format!("deck-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    crate::os::private(&path)?;
     // A name that outlives this process: shells kept by the background
     // service across relaunches find the Deck of the moment through it.
     let stable = stable_socket();
     let _ = std::fs::remove_file(&stable);
-    let _ = std::os::unix::fs::symlink(&path, &stable);
+    let _ = crate::os::symlink(&path, &stable);
 
     let (tx, rx) = mpsc::unbounded();
     std::thread::Builder::new()
@@ -155,7 +148,7 @@ fn serve(stream: UnixStream, tx: mpsc::UnboundedSender<Incoming>) {
 ///
 /// Inside a deck pane the socket and token come from the environment. From
 /// anywhere else we find the newest running window and call without a token,
-/// which that window only accepts for `browser.open`.
+/// which that window only accepts for `browser.open` and `app.open_url`.
 pub fn call(method: &str, params: Value) -> Result<Value, String> {
     let (socket, token) = match std::env::var("DECK_SOCKET") {
         Ok(s) => (s, std::env::var("DECK_TOKEN").unwrap_or_default()),

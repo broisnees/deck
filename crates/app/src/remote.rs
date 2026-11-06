@@ -44,7 +44,7 @@ fn own_file() -> PathBuf {
 }
 
 fn ssh_config() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".ssh").join("config"))
+    agent_core::dirs::home_dir().map(|h| h.join(".ssh").join("config"))
 }
 
 /// Every host: SSH's aliases first (in the order the file lists them), then
@@ -89,8 +89,7 @@ fn write_config(all: &[Host]) -> std::io::Result<()> {
         "# Written by Deck from remote-hosts.json; edits here are replaced.\nInclude ~/.ssh/config\nInclude /etc/ssh/ssh_config\n\n{}",
         blocks.join("\n")
     );
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    let mut f = crate::os::create_private(&path)?;
     std::io::Write::write_all(&mut f, text.as_bytes())
 }
 
@@ -122,6 +121,9 @@ fn config_block(h: &Host) -> Option<String> {
         }
     }
     if let Some(k) = &h.key {
+        // Windows' OpenSSH reads `/` in a path, and a `\` could be taken
+        // for an escape.
+        let k = if cfg!(windows) { k.replace('\\', "/") } else { k.clone() };
         b += &format!("  IdentityFile \"{k}\"\n  IdentitiesOnly yes\n");
     }
     b += "  StrictHostKeyChecking accept-new\n";
@@ -136,7 +138,7 @@ pub fn add(spec: &str, name: Option<&str>, key: Option<&str>, dir: Option<String
     let key = match key {
         Some(k) => {
             let p = match k.strip_prefix("~/") {
-                Some(rest) => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|| k.into()),
+                Some(rest) => agent_core::dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| k.into()),
                 None => std::path::absolute(k)?,
             };
             if !p.is_file() {
@@ -160,14 +162,13 @@ pub fn add(spec: &str, name: Option<&str>, key: Option<&str>, dir: Option<String
     // is one: `ssh` there failed with "Load key: Operation not permitted".
     let key = match key {
         Some(src) => {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let dir = crate::control::socket_dir().join("keys");
             std::fs::create_dir_all(&dir)?;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            crate::os::private(&dir)?;
             let dest = dir.join(format!("{name}.pem"));
             let bytes = std::fs::read(&src).map_err(|e| bad(format!("could not read {}: {e}", src.display())))?;
             let tmp = dir.join(format!(".{name}.pem.new"));
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            let mut f = crate::os::create_private(&tmp)?;
             std::io::Write::write_all(&mut f, &bytes)?;
             std::fs::rename(&tmp, &dest)?;
             Some(dest.to_string_lossy().into_owned())
@@ -255,7 +256,7 @@ fn parse_config(path: &Path, depth: u8) -> Vec<Host> {
                 let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
                 for pat in value.split_whitespace() {
                     let p = if let Some(rest) = pat.strip_prefix("~/") {
-                        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest)).unwrap_or_default()
+                        agent_core::dirs::home_dir().map(|h| h.join(rest)).unwrap_or_default()
                     } else if Path::new(pat).is_absolute() {
                         PathBuf::from(pat)
                     } else {
@@ -389,11 +390,15 @@ pub fn run_on(host: &str, line: &str, input: Option<&[u8]>, timeout: u64) -> Res
 
 /// Where the shared connections' sockets live: short (a socket path has
 /// ~104 bytes), private, and cleared on restart.
+#[cfg_attr(windows, allow(dead_code))]
 fn control_dir() -> PathBuf {
+    #[cfg(unix)]
+    // SAFETY: getuid reads this process's user id.
     let dir = PathBuf::from(format!("/tmp/deck-{}", unsafe { libc::getuid() }));
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir().join("deck-ssh");
     if std::fs::create_dir_all(&dir).is_ok() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = crate::os::private(&dir);
     }
     dir
 }
@@ -405,10 +410,18 @@ fn ssh(host: &str, line: &str, input: Option<&[u8]>, timeout: u64) -> Result<(Op
     // call: an agent's tool call then costs a round trip, not a handshake
     // (about 90 ms against 900 to an EC2 box). %C is ssh's hash of the
     // destination, so the path stays short.
-    let control = format!("ControlPath={}/%C", control_dir().display());
-    let mut child = Command::new("ssh")
+    // Windows' OpenSSH cannot share connections (no ControlMaster), so
+    // there each call makes its own.
+    let shared: Vec<String> = if cfg!(windows) {
+        Vec::new()
+    } else {
+        let control = format!("ControlPath={}/%C", control_dir().display());
+        ["-o", "ControlMaster=auto", "-o", &control, "-o", "ControlPersist=10m"].map(String::from).to_vec()
+    };
+    let mut child = crate::os::no_window(&mut Command::new("ssh"))
         .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=20"])
-        .args(["-o", "ControlMaster=auto", "-o", &control, "-o", "ControlPersist=10m", "-o", "LogLevel=ERROR"])
+        .args(shared)
+        .args(["-o", "LogLevel=ERROR"])
         .args(ssh_flags())
         .args([host, "--"])
         .arg(format!("exec \"$SHELL\" -lc {}", q(line)))

@@ -116,6 +116,21 @@ Deck works with whichever agent CLIs you already have on your `PATH`: `claude`, 
 
 > For notifications from Claude Code running in a terminal, set `"preferredNotifChannel": "iterm2"` in `~/.claude/settings.json`. Deck understands that notification style.
 
+### Windows
+
+Needs 64-bit Windows 10 1809 or later (ConPTY and AF_UNIX sockets) and the Microsoft Edge WebView2 Runtime for pages. Windows 11 and current Windows 10 already have it; the installer offers the download when it's missing.
+
+Run `Deck-<version>-setup.exe`. It installs for the current user only, no admin: `deck.exe` into `%LOCALAPPDATA%\Programs\Deck`, a Start menu entry, that folder on the user `PATH` (so `deck` works in new terminals), and `deck://` links. Uninstall from Settings › Apps. The portable zip is the same `deck.exe` without any of that.
+
+Cross-build both from Linux:
+
+```sh
+cargo install cargo-xwin   # plus llvm (llvm-rc, lld), NSIS 3 (makensis) and zip
+scripts/build-windows.sh   # dist/Deck-<version>-setup.exe and dist/Deck-<version>-windows-x64.zip
+```
+
+On Windows `deck.exe` runs the Alacritty engine; Ghostty's backend drives a Unix PTY, so it stays on macOS and Linux. To build natively, install Visual Studio Build Tools (MSVC and the Windows SDK) and Rust 1.96.1, then `cargo build --release`; no Zig needed. CI does exactly that and builds the installer (`.github/workflows/ci.yml`).
+
 ## Keyboard shortcuts
 
 | Shortcut | Does |

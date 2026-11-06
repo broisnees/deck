@@ -222,7 +222,7 @@ pub fn body(p: &Preview) -> AnyElement {
             numbers, text, cut, ..
         } => {
             let mono = |d: gpui::Div| {
-                d.font_family(theme::MONO)
+                d.font_family(theme::mono())
                     .text_size(u(12.))
                     .line_height(u(18.))
                     .whitespace_nowrap()

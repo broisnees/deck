@@ -8,15 +8,20 @@ license.workspace = true
 name = "deck"
 path = "src/main.rs"
 
+# deck.exe's icon, version block and (cross builds) manifest; see build.rs.
+[build-dependencies]
+embed-resource = "3"
+
 [features]
 default = ["ghostty"]
 # The Ghostty terminal engine (Settings → Terminal → Engine). Building it
 # needs Zig 0.17 on PATH; without it, `--no-default-features` builds
-# Alacritty only.
+# Alacritty only. Unix only: on Windows the feature is a no-op.
 ghostty = ["term/ghostty"]
 
 [dependencies]
 smol_str.workspace = true
+uuid.workspace = true
 term.workspace = true
 agent-core.workspace = true
 agent-claude.workspace = true
@@ -34,15 +39,78 @@ gpui.workspace = true
 image = "0.25"
 wry.workspace = true
 raw-window-handle.workspace = true
+libc = "0.2"
+# Code colouring in chats: bat's grammars, on a pure-Rust regex engine.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+
+# WebKitGTK's event loop, run inside gpui's (see gtk_loop.rs). The version
+# wry builds against.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+# XSetInputFocus, to take the keyboard back from a page (the version wry
+# already builds).
+x11-dl = "2.21"
+gdkx11 = "0.18"
+
+# The control socket: AF_UNIX on Windows 10 and later.
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1"
+# Win32 and WinRT, the version wry and webview2-com build: ConPTY for the
+# background service, toasts, tray, hot keys, Credential Manager, DPAPI,
+# the process inspector, window pictures.
+webview2-com = "0.39"
+windows-core = "0.62"
+windows-future = "0.3"
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "Security_Credentials_UI",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# HTTP for the browser chrome and accounts; macOS uses NSURLSession.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ureq = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit.workspace = true
 objc2-quartz-core = "0.3"
 objc2-foundation = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 block2 = "0.6"
-libc = "0.2"
 objc2 = "0.6"
 objc2-user-notifications = "0.3"
-# Code colouring in chats: bat's grammars, on a pure-Rust regex engine.
-syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
-two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }

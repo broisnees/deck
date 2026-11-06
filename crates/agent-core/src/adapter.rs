@@ -131,19 +131,11 @@ pub struct SessionCtx {
 
 /// Deck's own SSH config: the hosts added in Deck (each with its user, key
 /// and port), then the user's `~/.ssh/config` and the system's, included.
-/// Kept beside Deck's other data (`DECK_DATA_DIR`, else Application
-/// Support) and written by the app; here so every `ssh` Deck starts, an
-/// agent's included, reads the same hosts.
+/// Kept beside Deck's other data (`crate::dirs::data_dir`) and written by
+/// the app; here so every `ssh` Deck starts, an agent's included, reads the
+/// same hosts.
 pub fn ssh_config() -> std::path::PathBuf {
-    std::env::var_os("DECK_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("Library/Application Support/deck")
-        })
-        .join("ssh_config")
+    crate::dirs::data_dir().join("ssh_config")
 }
 
 /// `-F` and Deck's SSH config, once there is one; nothing before any host
@@ -164,7 +156,9 @@ pub fn ssh_config_flags() -> Vec<String> {
 /// arguments and the local folder to start it in.
 pub fn launch(ctx: &SessionCtx, bin: &str, args: &[String]) -> (String, Vec<String>, std::path::PathBuf) {
     let Some(host) = ctx.remote.as_deref() else {
-        return (bin.to_string(), args.to_vec(), ctx.cwd.clone());
+        let (program, mut first) = crate::exec::launcher(bin);
+        first.extend(args.iter().cloned());
+        return (program.to_string_lossy().into_owned(), first, ctx.cwd.clone());
     };
     fn q(s: &str) -> String {
         if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c)) {
@@ -221,7 +215,7 @@ pub fn launch(ctx: &SessionCtx, bin: &str, args: &[String]) -> (String, Vec<Stri
     ];
     ssh_args.extend(ssh_config_flags());
     ssh_args.extend([host.to_string(), "--".into(), line]);
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/".into());
+    let home = crate::dirs::home_dir().unwrap_or_else(|| "/".into());
     ("ssh".into(), ssh_args, home)
 }
 

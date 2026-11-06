@@ -11,8 +11,11 @@ use gpui::prelude::*;
 use gpui::{div, rgb, rgba, Div, SharedString};
 use std::ops::Range;
 
-/// One keycap: `⌘K`, `⏎`, `esc`.
+/// One keycap: `⌘K`, `⏎`, `esc`. Off macOS the glyphs read as the keys'
+/// names (`Ctrl+K`, `Enter`, `Esc`).
 pub fn key(keys: impl Into<SharedString>) -> Div {
+    let keys: SharedString = keys.into();
+    let keys: SharedString = if cfg!(target_os = "macos") { keys } else { spoken(&keys).into() };
     div()
         .flex()
         .flex_none()
@@ -25,7 +28,44 @@ pub fn key(keys: impl Into<SharedString>) -> Div {
         .bg(rgba(theme::tint()))
         .text_size(u(11.))
         .text_color(rgb(theme::text_2()))
-        .child(keys.into())
+        .child(keys)
+}
+
+/// `⇧⌘N` as `Shift+Ctrl+N`, `⏎` as `Enter`: a hint's glyphs by name. These
+/// keys are a text field's, where ⌘ is plain Ctrl off macOS.
+fn spoken(keys: &str) -> String {
+    if keys == "esc" {
+        return "Esc".into();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut key = String::new();
+    for c in keys.chars() {
+        let name = match c {
+            '⌘' | '⌃' => Some("Ctrl"),
+            '⌥' => Some("Alt"),
+            '⇧' => Some("Shift"),
+            _ => None,
+        };
+        match name {
+            Some(n) if key.is_empty() => {
+                if !parts.iter().any(|p| p == n) {
+                    parts.push(n.into());
+                }
+            }
+            _ => match c {
+                '⏎' | '↵' | '↩' => key.push_str("Enter"),
+                '⇥' => key.push_str("Tab"),
+                '⌫' => key.push_str("Backspace"),
+                '⌦' => key.push_str("Delete"),
+                '⎋' => key.push_str("Esc"),
+                _ => key.push(c),
+            },
+        }
+    }
+    if !key.is_empty() {
+        parts.push(key);
+    }
+    parts.join("+")
 }
 
 /// A hint line, `⏎ send · ⇧⏎ new line · esc close`: each key a keycap, the

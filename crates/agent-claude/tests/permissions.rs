@@ -1,5 +1,7 @@
 //! The permission round trip against a stand-in `claude`: it asks to run a
 //! command over stdout, and records what deck answers on stdin.
+//! The stand-in is a shell script, so Unix only.
+#![cfg(unix)]
 
 use agent_claude::ClaudeAdapter;
 use agent_core::{AgentAdapter, AgentEvent, Decision, PermissionMode, SessionCtx, UserTurn};

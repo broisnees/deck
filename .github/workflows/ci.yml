@@ -1,0 +1,129 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    # A version tag (v0.2.0) also publishes the Windows installer and zip
+    # as a GitHub Release, which the in-app updater reads.
+    tags: ["v*"]
+  pull_request:
+  # A manual run can build one platform: gh workflow run ci.yml -f only=windows
+  workflow_dispatch:
+    inputs:
+      only:
+        type: choice
+        options: [all, linux, macos, windows]
+        default: all
+
+# A newer push to the same branch or PR cancels the run still going.
+# Version tags always finish, since they publish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.96.1"
+  ZIG_VERSION: "0.17.1"
+
+jobs:
+  linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # gpui on X11 (xcb, xkbcommon, fontconfig, Vulkan loader), pages on
+      # WebKitGTK 4.1, GTK 3 for its event loop, OpenSSL for ureq's deps.
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxi-dev libxrandr-dev libxcursor-dev \
+            libfontconfig-dev libfreetype-dev libvulkan-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libxdo-dev libssl-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  macos:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'macos'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # No Zig: the Ghostty engine is Unix only, Windows runs Alacritty.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      # Every failing test binary, not just the first.
+      - run: cargo test --release --workspace --no-fail-fast
+      # deck.exe with arguments is the CLI; `--help` needs no window, no
+      # running Deck and no network.
+      - name: Smoke test
+        run: |
+          out="$(target/release/deck.exe --help)"
+          echo "$out" | head -5
+          echo "$out" | grep -q "deck pane"
+      - name: NSIS
+        run: |
+          choco install nsis -y --no-progress
+          echo "C:/Program Files (x86)/NSIS" >> "$GITHUB_PATH"
+      - name: Installer and zip
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "app"))')"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          mkdir -p dist/windows/Deck
+          cp target/release/deck.exe dist/windows/Deck/
+          makensis -V2 -DVERSION="$version" -DSRC="$(pwd -W)/dist/windows/Deck" \
+            -DOUTFILE="$(pwd -W)/dist/Deck-$version-setup.exe" packaging/windows/deck.nsi
+          pwsh -NoProfile -Command "Compress-Archive -Path dist/windows/Deck -DestinationPath dist/Deck-$version-windows-x64.zip"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deck-windows-${{ env.VERSION }}
+          path: |
+            dist/Deck-*-setup.exe
+            dist/Deck-*-windows-x64.zip
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          [ "$tag" = "v$VERSION" ] || { echo "tag $tag does not match version $VERSION"; exit 1; }
+          files=(dist/Deck-*-setup.exe dist/Deck-*-windows-x64.zip)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --title "Deck $VERSION" --generate-notes
+          fi

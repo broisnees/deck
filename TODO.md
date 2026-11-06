@@ -301,16 +301,75 @@ In rough order of value.
 
 Today Deck builds only on macOS: 18 files in `crates/app` call macOS APIs (objc2, WebKit, Carbon, Keychain, LaunchAgent) and one place has a `cfg(target_os)` fallback. gpui has Linux and Windows backends and `alacritty_terminal` runs on both, so the core ports; the macOS-only parts go behind a platform layer. Every step below ends in a build that runs.
 
-- [ ] Platform layer: a `platform` module in `crates/app` with one interface per macOS service (web view, notifications, menu bar icon, global shortcuts, background service, keychain, pasteboard, screenshots, window blur, `deck://` handler). macOS keeps today's code; other targets start as stubs that say "not on this platform"
-- [ ] macOS-only dependencies (objc2*, block2, objc2-user-notifications) under `[target.'cfg(target_os = "macos")'.dependencies]`; `cargo check` for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` passes
-- [ ] Linux, first runnable build: window, sidebar, terminals (Alacritty engine), chats and agents, settings. Pages, notifications and the background service stubbed; Ghostty engine only when Zig is installed
-- [ ] Linux, full: pages through WebKitGTK, notifications through D-Bus with Approve / Deny / Reply actions, tray through StatusNotifierItem, `deckd` as a systemd user unit in place of the LaunchAgent, secrets through the Secret Service, global shortcuts through X11 grabs or the GlobalShortcuts portal on Wayland, cookie import from Chromium's Linux store
+- [~] Platform layer (2026-11-05: `other/*.rs` stand-ins, `desktop.rs`, `inspect/procfs.rs`, `x11.rs`, cfg gates; not one `platform` module yet): a `platform` module in `crates/app` with one interface per macOS service (web view, notifications, menu bar icon, global shortcuts, background service, keychain, pasteboard, screenshots, window blur, `deck://` handler). macOS keeps today's code; other targets start as stubs that say "not on this platform"
+- [x] macOS-only dependencies (Linux and Windows `cargo check` pass, 2026-11-05) (objc2*, block2, objc2-user-notifications) under `[target.'cfg(target_os = "macos")'.dependencies]`; `cargo check` for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` passes
+- [x] Linux, first runnable build (2026-11-05, Hyprland: window, sidebar, terminals, chats and agents, settings, `deckd` jobs, all tests pass): window, sidebar, terminals (Alacritty engine), chats and agents, settings. Pages, notifications and the background service stubbed; Ghostty engine only when Zig is installed
+- [~] Linux, full (pages through WebKitGTK as X11 children with gpui on XWayland, notifications through `notify-send` with Approve/Always/Deny, XDG folders; tray, systemd unit, Secret Service, global shortcuts and cookie import still to do): pages through WebKitGTK, notifications through D-Bus with Approve / Deny / Reply actions, tray through StatusNotifierItem, `deckd` as a systemd user unit in place of the LaunchAgent, secrets through the Secret Service, global shortcuts through X11 grabs or the GlobalShortcuts portal on Wayland, cookie import from Chromium's Linux store
 - [ ] Linux packaging: AppImage and .deb, `deck` CLI on PATH, desktop file and `deck://` handler, `scripts/install.sh` for Linux
-- [ ] Windows, first runnable build: terminals over ConPTY (PowerShell, cmd, WSL), the control socket as a named pipe in place of the Unix socket, Windows paths, the `deck` CLI. Pages and the background service stubbed
-- [ ] Windows, full: pages through WebView2, toast notifications with buttons, tray icon, `deckd` as a per-user background task, Credential Manager for secrets, RegisterHotKey for global shortcuts, DPAPI for Chromium cookie import
-- [ ] Windows packaging: an installer (MSIX or similar), code signing, `deck://` registration
-- [ ] Agents off macOS: each adapter's config and transcript paths (`%APPDATA%`, XDG dirs) for usage; the OpenCode lifeline and `kill_tree` are `sh` and process groups, so Windows needs job objects
-- [ ] CI on ubuntu-latest and windows-latest: build, tests, and a smoke test that opens a window, starts a shell and runs a command
+- [~] Windows, first runnable build (2026-11-06: `scripts/build-windows.sh` cross-builds a release `deck.exe`; gpui compiles its HLSL at launch when built off Windows, since fxc.exe only runs there; Ghostty is Unix only (its backend drives a Unix PTY), so Windows runs Alacritty; not run on Windows yet, no machine or Wine here): terminals over ConPTY (pwsh, then Windows PowerShell, then cmd; `"shell"` in settings.json picks `wsl`, `cmd` or a path) with PowerShell prompt marks and OSC 7, the control socket over AF_UNIX (`uds_windows`), Windows paths through `USERPROFILE`, the `deck` CLI on PATH in panes, its own minimize, maximize and close with drag areas on the title strips, a terminal button beside new chat
+- [~] Windows, full (2026-11-06, built, not run): pages through WebView2 (progress, stop, page dialogs answered in a bar or by agents, CapturePreview cover, dark mode, rounded corners, profile under the data folder, a clear error without the runtime, the editor at `http://deckcode.localhost/`), toasts with Approve / Always / Deny and a reply box (AppUserModelID `Deck.Deck`; buttons only while Deck runs, no COM activator), a tray icon with jobs, Restart, Stop and Quit, `deckd` jobs under ConPTY in Job Objects with autostart through the Run key and `deck job attach` in the console, Credential Manager for the account token (`secret.rs`, with Secret Service on Linux), RegisterHotKey on its own thread, Chromium cookie import from Chrome, Edge, Brave, Vivaldi and Chromium (DPAPI key, AES-GCM through BCrypt; v20 app-bound cookies skipped and counted), Windows Hello for the lock, PrintWindow pictures, a count on the taskbar button, clipboard files and images, a process inspector (ToolHelp, PEB, owner-pid TCP tables), `deck://` links handed to a running Deck
+- [~] Windows packaging (2026-11-06: `packaging/windows/deck.nsi`, per-user install to `%LOCALAPPDATA%\Programs\Deck`, Start menu shortcut with the AppUserModelID, user PATH, `deck://`, uninstaller; icon and VERSIONINFO from `crates/app/build.rs`; portable zip; the updater runs the setup silently; no code signing yet): an installer (MSIX or similar), code signing, `deck://` registration
+- [x] Agents off macOS (2026-11-06): `agent_core::exec` finds npm `.cmd` shims through PATHEXT and runs their script directly, `taskkill /T` then `/F` for trees, a PowerShell lifeline for `opencode serve`, `~/.claude` credentials read from `.credentials.json` off macOS, OpenCode under `%APPDATA%` too, `C--Users-me` project folders decoded
+- [~] CI on ubuntu-latest, macos-latest and windows-latest (`.github/workflows/ci.yml`: build and tests on each; Windows also `deck.exe --help` as a smoke test, the installer and zip as artifacts). No test yet that opens a window, starts a shell and runs a command
+
+### Linux polish and chat redesign (asked 2026-11-05)
+
+- [~] Model picker (titled panels, shadow, aligned notes, check on the current agent): agents and their models in one cleaner menu (rows, sizes, the model list beside the agent)
+- [~] Activity log (verbs in one quiet column, `cd <chat folder> &&` left off commands): "Working for 7s · Ran 4 commands" and its command rows in a calmer, scannable look
+- [~] Permission card (Yes / Always allow / No as one row of buttons, typing a reply offered beside them): "Claude wants to run a command" with the command, Yes / Always / No, in a tighter design
+- [~] Bottom panel in a chat (the Console: terminal button in the composer toolbar, every command with its output, live and following): the commands the agent runs and their live output, opened from the activity log or a status chip
+- [~] Chat outline (toolbar button opens it on the right; the open chat's row in the sidebar lists your messages; a click jumps): every message you sent as a table of contents, to jump to it, in the sidebar under the chat and on the right
+- [~] Prompt rewrite knows the thread (a brief of every message and the start of each answer goes with it; the shell-command prompt says Linux and GNU off macOS): the rewriter gets a short overview of the conversation so far
+- [~] First answer faster (measured: Claude Code takes ~1.9s to first output here, then hooks and 7 MCP servers, two of which always fail to connect; Deck already starts the agent when you click into a chat): measure an agent chat's time to first token on Linux and cut what Deck adds before the agent starts
+- [~] Pages step aside for the address bar's suggestions on Linux (the code parks them; check on screen)
+- [x] Agents and pages: `deck browser tabs` and `deck browser storage` (cookies, localStorage, sessionStorage) beside console, network and errors; Settings › Browser › Let agents read pages switches all page reading off
+- [x] Job drawer under the panes only, resizable by its top edge, fold and maximize, Stop keeps the job, Run starts it again
+- [x] Browser toolbar as one floating capsule
+- [~] Sidebar redesign (rows: 4px apart, 32px tall, fill-only active row, no repeated labels, last command on idle shells; project headers show their git branch; footer icons have labels on hover; still to do: the bottom strip itself, one type scale with chat and pages)
+- [x] Windows: `cargo check` passes for the whole workspace (control socket over `uds_windows`, `os.rs` for permissions, exec and detach, `deckd`'s server Unix-only with Windows stand-ins)
+- [x] One type scale (11 meta, 12 small, 13 UI, 14 reading; `theme::TEXT_*`) across sidebar, chat, pages and settings
+- [x] Smooth wheel scrolling: a wheel's notches glide in over a few frames in the chat's list and every scrolling panel (vendored gpui); trackpads unchanged
+- [x] Sidebar footer counts as one family, and Select All (Ctrl+A) while rows are picked picks every row even with a text field focused
+- [x] Done today: Ctrl+Shift shortcut scheme, Ctrl+Backspace by word, zoom keys, keyboard back from pages, rounded and inset pages, exit bar for finished jobs, sidebar selection (Ctrl-click, Ctrl+A), no repeated row labels, last command on idle shells, command suggestions with intent and typos, job viewers not kept as sessions, X11 window class, release build
+
+### Memory for agents (asked 2026-11-05)
+
+- [x] Kinds (preference, gotcha, decision, fact), twins confirmed instead of added, `deck memory edit`
+- [x] The session brief ranks (this project first, how to work first, newest first), keeps to ~3,500 characters and says how many more there are
+- [x] Recent work: the last five Deck chats in the project, from the newest thread files only
+- [x] MCP tools: `deck_memory`, `deck_memory_add`, `deck_memory_edit`, `deck_memory_forget`
+- [ ] Memory page of its own: search, edit in place, move between a project and everywhere (today: Settings › Agents › Deck memory lists and forgets)
+- [ ] Notes from a finished chat: offer the decisions and gotchas it found as memories, one click to keep
+
+### Agents: default, limits, failed commands (asked 2026-11-05)
+
+- [x] Default agent from the chat's agent menu: "default" beside it, "Make … the default" on the one under the pointer (Settings › Agents › Default agent too)
+- [x] A failed command in a terminal raises an overlay: what failed, "Run clear" when it was likely meant (`cls`, `gti`), Fix with agent, dismiss; gone with the next command
+- [x] Command box (⌘J): Ctrl+Enter writes the command and runs it; keys shown as keycaps
+- [x] Routing when a limit is reached: Settings › Agents › When an agent reaches its limit takes agents in order (numbered as picked); the thread moves to the first ready one with the whole conversation, on down the chain if that one is out too, and back to its own agent with the first message after the reset
+- [x] Before the limit: a chat on an agent at 90% or more of a plan limit says so under its composer, with the reset time
+
+- [x] Model picker as one panel: agents as rows, an agent's models open inline under it, "default" on the default one
+- [x] Agents: Gemini out of the picker; GitHub Copilot as a chat agent (plain text, flags from its `--help`); Freebuff and Qwen Code as terminal agents (Freebuff has no headless mode; Qwen lists no approval flag)
+- [ ] OmniRoute as a model route (it is a router with fallbacks, not a coding agent): agents' requests through it
+- [ ] Kimi CLI and Kiro: add once installed, from their own `--help`
+- [ ] Copilot's JSON lines (`--output-format json`): read tool calls and the session id once its schema is observed
+
+### One setup for every agent (asked 2026-11-05)
+
+- [ ] See each agent's MCP servers, skills, slash commands, hooks and plugins side by side (Claude Code, Codex, Gemini CLI, OpenCode, Grok, Crush, Vibe), read from their own config files
+- [ ] Sync: add an MCP server or skill once and have Deck write it into every agent that supports it, in each one's own format; show what each agent can't take
+- [ ] Health: which MCP servers fail to connect (stroke and ewiz-share do today) and slow every session start, with the error and a fix or a switch to turn it off
+- [ ] Compare agents: models, context size, tools, approval modes, MCP and skill support, cost and plan limits, in one table, plus the same prompt run in two agents side by side
+- [ ] Keep it in step: Deck notices when an agent's config changes outside Deck and offers to sync it to the rest
+
+### Integrations (asked 2026-11-05)
+
+- [ ] Integrations page in Settings: switch each one on, sign in (OAuth or a token kept in the keychain / Secret Service), see what it can reach
+- [ ] GitHub: my repositories, pull requests (review state, checks, diff), issues and Actions runs in a Deck page; open a repo or PR in a terminal, worktree or chat; fetch and pull from there
+- [ ] Linear: my issues and cycles by team and status, an issue's detail and comments, change status or assignee; start a chat or worktree from an issue
+- [ ] Agents use them too: `deck github …` and `deck linear …` commands (and MCP tools) once an integration is on, the same way they use `deck browser`
+- [ ] One look for both: lists, detail panes and status chips that match the sidebar and chat
 
 ### Chat scrolling and experience
 - [~] Auto-follow: the thread follows new output while you are at the bottom; scrolling up pauses it; sending or jumping resumes it (built; the state machine is not unit-tested yet)

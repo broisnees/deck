@@ -54,12 +54,20 @@ pub enum TerminalEvent {
     /// ⌃R at the shell's prompt: search the commands run before.
     History,
     /// "# …" at the prompt: write a command for this, in this folder.
-    Ask { request: String, cwd: Option<PathBuf> },
+    /// Write a command for `request`; `run` presses Enter once it is in.
+    Ask { request: String, cwd: Option<PathBuf>, run: bool },
     /// "Fix with agent" on a block: a message for a chat in this folder.
     AskAgent { prompt: String, cwd: Option<PathBuf> },
 }
 
 pub struct TerminalPane {
+    /// The command box was sent with Ctrl+Enter: the command runs once in.
+    ask_runs: bool,
+    /// The failed command whose overlay was closed, by block number.
+    fail_dismissed: Option<u64>,
+    /// The job this pane shows has exited: its output stays, with no cursor
+    /// left blinking in it.
+    pub ended: bool,
     /// The AI command box (⌘J): what you asked for, and whether the
     /// command is being written.
     ask: Option<(Entity<crate::field::Field>, Subscription)>,
@@ -262,7 +270,7 @@ impl TerminalPane {
                             }
                             term::TermEvent::Ask(request) => {
                                 let cwd = p.term.shell_cwd().map(PathBuf::from);
-                                cx.emit(TerminalEvent::Ask { request, cwd });
+                                cx.emit(TerminalEvent::Ask { request, cwd, run: false });
                             }
                             term::TermEvent::Line(line) => {
                                 if line.is_none() {
@@ -288,6 +296,9 @@ impl TerminalPane {
 
         term.set_cursor_default(look.cursor, look.blink);
         Self {
+            ask_runs: false,
+            fail_dismissed: None,
+            ended: false,
             ask: None,
             asking: false,
             reported: None,
@@ -638,7 +649,7 @@ impl TerminalPane {
             .term
             .shell_cwd()
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| agent_core::dirs::home_dir())
             .unwrap_or_default();
         self._complete = Some(cx.spawn(async move |this, cx| {
             let (line, at) = (text.clone(), cursor);
@@ -1310,8 +1321,12 @@ impl TerminalPane {
         let sub = cx.subscribe_in(&field, window, |p, _, ev: &crate::field::FieldEvent, window, cx| match ev {
             crate::field::FieldEvent::Submit(text) if !text.trim().is_empty() && !p.asking => {
                 p.asking = true;
+                // Ctrl+Enter (⌘↩ on macOS) runs it as soon as it is written.
+                let m = window.modifiers();
+                let run = m.control || m.platform;
+                p.ask_runs = run;
                 let cwd = p.term.shell_cwd().map(PathBuf::from);
-                cx.emit(TerminalEvent::Ask { request: text.trim().to_string(), cwd });
+                cx.emit(TerminalEvent::Ask { request: text.trim().to_string(), cwd, run });
                 cx.notify();
             }
             crate::field::FieldEvent::Cancel => {
@@ -1327,14 +1342,21 @@ impl TerminalPane {
     fn close_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ask = None;
         self.asking = false;
+        self.ask_runs = false;
         window.focus(&self.focus);
         cx.notify();
+    }
+
+    /// Press Enter at the prompt: run what is typed there.
+    pub fn press_enter(&mut self) {
+        self.term.write(b"\r".to_vec());
     }
 
     /// The command came back (or failed): the box goes, the prompt has it.
     pub fn ask_done(&mut self, cx: &mut Context<Self>) {
         if self.ask.take().is_some() {
             self.asking = false;
+            self.ask_runs = false;
             cx.notify();
         }
     }
@@ -1384,9 +1406,13 @@ impl TerminalPane {
                                 .px(theme::u(6.))
                                 .text_size(theme::u(11.))
                                 .text_color(rgb(theme::dim()))
-                                .child(if self.asking { "Writing the command…" } else { "⏎ write it into the prompt" })
-                                .child("esc close")
-                                .child("nothing runs until you press ⏎ in the shell"),
+                                .child(if self.asking {
+                                    div()
+                                        .child(if self.ask_runs { "Writing the command, then running it…" } else { "Writing the command…" })
+                                        .into_any_element()
+                                } else {
+                                    crate::kbd::hints("⏎ write it into the prompt · ⌘⏎ write and run it · esc close").into_any_element()
+                                }),
                         )
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
                 )
@@ -1818,6 +1844,105 @@ impl TerminalPane {
 }
 
 impl TerminalPane {
+    /// The last command failed and nothing has run since: what failed, the
+    /// command it was likely meant to be when Deck can tell (`cls` for
+    /// `clear`), and the agent to find out why. Gone with the next command.
+    fn render_failed(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (n, block) = self.term.last_block()?;
+        let code = block.exit.filter(|c| *c != 0)?;
+        // Ctrl+C and the like end a command on purpose.
+        if block.running() || self.fail_dismissed == Some(n) || matches!(code, 130 | 143) || self.ended {
+            return None;
+        }
+        let command = block.command.clone()?;
+        let first = command.split_whitespace().next().unwrap_or("").to_string();
+        // A program that isn't there: offer the one it was likely meant to be.
+        let fix = (code == 127)
+            .then(|| crate::complete::meant(&first))
+            .flatten()
+            .map(|to| format!("{to}{}", &command[first.len()..]));
+        let what = match code {
+            127 => format!("{first}: command not found"),
+            126 => format!("{first}: can't be run"),
+            c => format!("failed with exit code {c}"),
+        };
+        let button = |id: &'static str, label: String, strong: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .h(px(24.))
+                .px(px(10.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .when(strong, |d| d.bg(rgb(theme::text())).text_color(rgb(theme::pane())).hover(|s| s.opacity(0.9)))
+                .when(!strong, |d| {
+                    d.bg(rgb(theme::surface()))
+                        .text_color(rgb(theme::text_2()))
+                        .hover(|s| s.bg(rgb(theme::surface_hover())).text_color(rgb(theme::text())))
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+        };
+        let has_fix = fix.is_some();
+        let card = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .max_w(px(560.))
+            .pl(px(12.))
+            .pr(px(6.))
+            .py(px(6.))
+            .rounded(px(10.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::DANGER, 0x55)))
+            .shadow_lg()
+            .font_family(theme::ui())
+            .text_size(px(theme::TEXT_UI))
+            .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(theme::DANGER)))
+            .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text())).child(what))
+            .children(fix.map(|fix| {
+                let label = format!("Run {}", fix.chars().take(32).collect::<String>());
+                button("fail-fix", label, true).on_click(cx.listener(move |p, _, _, cx| {
+                    p.term.write(format!("{fix}\r").into_bytes());
+                    cx.notify();
+                }))
+            }))
+            .child(button("fail-agent", "Fix with agent".into(), !has_fix).on_click(cx.listener(move |p, _, _, cx| {
+                p.fail_dismissed = Some(n);
+                p.ask_agent(n, cx);
+            })))
+            .child(
+                div()
+                    .id("fail-close")
+                    .flex_none()
+                    .p(px(4.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(crate::icon::icon(crate::icon::Icon::Close, 11., theme::dim()))
+                    .on_click(cx.listener(move |p, _, _, cx| {
+                        p.fail_dismissed = Some(n);
+                        cx.notify();
+                    })),
+            );
+        Some(
+            div()
+                .absolute()
+                .bottom(px(12.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .px(px(16.))
+                .child(card)
+                .into_any_element(),
+        )
+    }
+
     /// OSC 9;4 as a slim bar along the top: filled to the percentage, a
     /// sliding band when the program can't say how far, red for an error,
     /// amber when paused.
@@ -1935,6 +2060,7 @@ impl Render for TerminalPane {
             })
             .children(self.render_progress())
             .children(self.render_blocks(pad, cx))
+            .children(self.render_failed(cx))
             .children(self.render_suggest(focused, cx))
             .children(self.render_ask(cx))
             .children(find)
@@ -2257,10 +2383,10 @@ impl Element for Grid {
             }
         }
         let cursor = cursor_at
-            .filter(|_| pane.blink_on)
+            .filter(|_| pane.blink_on && !pane.ended)
             .map(|b| (b, snap.cursor_shape));
         let under_cursor = match (snap.cursor, snap.cursor_shape, self.focused) {
-            (Some((y, x)), term::CursorShape::Block, true) if pane.blink_on => snap
+            (Some((y, x)), term::CursorShape::Block, true) if pane.blink_on && !pane.ended => snap
                 .rows
                 .get(y)
                 .and_then(|r| row_cols(r).chars().nth(x))
@@ -2420,6 +2546,20 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
             "delete" => Some(vec![0x0b]),
             _ => None,
         };
+    }
+    // Off macOS, Ctrl+⌫ deletes the word before the cursor and Ctrl+Alt+⌫
+    // the line before it, and Ctrl+← / Ctrl+→ move by word, as GTK and Qt
+    // terminals do; the bytes are the ones ⌥ and ⌘ send on macOS.
+    let linux = !cfg!(target_os = "macos");
+    if linux && m.control && !m.shift {
+        match ks.key.as_str() {
+            "backspace" if m.alt => return Some(vec![0x15]),
+            "backspace" => return Some(vec![0x17]),
+            "left" if !m.alt => return Some(b"\x1bb".to_vec()),
+            "right" if !m.alt => return Some(b"\x1bf".to_vec()),
+            "delete" if !m.alt => return Some(b"\x1bd".to_vec()),
+            _ => {}
+        }
     }
     let arrow = |c: u8| -> Vec<u8> {
         match (m.alt, c) {
@@ -2723,6 +2863,26 @@ fn mouse_log(what: &str, bytes: &[u8]) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn mouse_held() -> bool {
     objc2_app_kit::NSEvent::pressedMouseButtons() != 0
+}
+
+/// The primary button, wherever the pointer is.
+#[cfg(windows)]
+fn mouse_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    // SAFETY: plain queries. GetAsyncKeyState reads physical buttons, so a
+    // swapped mouse's primary is VK_RBUTTON.
+    unsafe {
+        let vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { VK_RBUTTON } else { VK_LBUTTON };
+        GetAsyncKeyState(vk.0 as i32) < 0
+    }
+}
+
+/// gpui has no global button state on Linux; drags end on mouse up.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn mouse_held() -> bool {
+    false
 }

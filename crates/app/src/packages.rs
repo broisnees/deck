@@ -644,7 +644,7 @@ impl Render for PackagesPage {
                 .h(u(24.))
                 .px(u(10.))
                 .rounded(u(6.))
-                .text_size(u(12.5))
+                .text_size(u(theme::TEXT_UI))
                 .cursor_pointer()
                 .when(on, |d| {
                     d.bg(rgb(theme::row_active())).border_1().border_color(rgba(theme::hairline())).text_color(rgb(theme::text()))
@@ -782,7 +782,7 @@ impl Render for PackagesPage {
                                         .items_baseline()
                                         .gap(u(8.))
                                         .child(div().font_weight(FontWeight::MEDIUM).line_height(u(18.)).child(f.name.clone()))
-                                        .child(div().text_size(u(11.5)).text_color(rgb(theme::dim())).child(f.version.clone())),
+                                        .child(div().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::dim())).child(f.version.clone())),
                                 )
                                 .when(!f.about.is_empty(), |x| {
                                     x.child(
@@ -849,7 +849,7 @@ impl Render for PackagesPage {
                         .px(u(8.))
                         .rounded(u(8.))
                         .cursor_pointer()
-                        .text_size(u(12.5))
+                        .text_size(u(theme::TEXT_UI))
                         .text_color(rgb(theme::text_2()))
                         .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                         .child(icon(Icon::Search, 12., theme::dim()))
@@ -918,7 +918,7 @@ impl Render for PackagesPage {
                     .flex()
                     .items_center()
                     .h(u(30.))
-                    .text_size(u(11.5))
+                    .text_size(u(theme::TEXT_SMALL))
                     .text_color(rgb(theme::dim()))
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
@@ -968,12 +968,12 @@ impl Render for PackagesPage {
                                 .items_center()
                                 .gap(u(6.))
                                 .child(div().font_weight(FontWeight::MEDIUM).one_line().child(d.name.clone()))
-                                .when(d.dev, |x| x.child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child("dev")))
-                                .child(div().text_size(u(10.5)).text_color(rgb(theme::dim())).child(d.eco.label()))
+                                .when(d.dev, |x| x.child(div().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child("dev")))
+                                .child(div().text_size(u(theme::TEXT_META)).text_color(rgb(theme::dim())).child(d.eco.label()))
                                 .children(worst.map(sev_badge)),
                         )
                         .children(latest.about.clone().map(|a| {
-                            div().w_full().one_line().text_size(u(11.5)).text_color(rgb(theme::text_2())).child(a)
+                            div().w_full().one_line().text_size(u(theme::TEXT_SMALL)).text_color(rgb(theme::text_2())).child(a)
                         })),
                 )
                 .child(div().w(u(110.)).text_color(rgb(theme::text_2())).one_line().child(d.wanted.clone()))
@@ -1100,7 +1100,7 @@ fn sev_badge(sev: Sev) -> gpui::Div {
         .px(u(5.))
         .rounded(u(4.))
         .bg(rgba((c << 8) | 0x24))
-        .text_size(u(10.5))
+        .text_size(u(theme::TEXT_META))
         .text_color(rgb(c))
         .child(sev.label())
 }
@@ -1512,14 +1512,13 @@ fn used_by(graph: &Graph, roots: &[&str], target: &str) -> Vec<String> {
 /// A tool on the PATH, or where the usual installers put one; the app may
 /// have started with a short PATH.
 fn find_tool(name: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .chain([format!("{home}/.cargo/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()].map(PathBuf::from))
-        .map(|d| d.join(name))
+    if let Some(p) = agent_core::exec::which(name) {
+        return Some(p);
+    }
+    let home = agent_core::dirs::home_dir().unwrap_or_default();
+    [home.join(".cargo").join("bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()]
+        .into_iter()
+        .map(|d| d.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
         .find(|p| p.is_file())
 }
 
@@ -1527,11 +1526,15 @@ fn find_tool(name: &str) -> Option<PathBuf> {
 /// folder goes first on PATH, so `npm` finds the `node` beside it.
 fn json_of(bin: &Path, args: &[&str], root: &Path) -> Option<Value> {
     use std::process::{Command, Stdio};
-    let mut path = bin.parent().map(|p| p.display().to_string()).unwrap_or_default();
-    if let Ok(p) = std::env::var("PATH") {
-        path = format!("{path}:{p}");
+    let mut dirs: Vec<PathBuf> = bin.parent().map(Path::to_path_buf).into_iter().collect();
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
     }
-    let out = Command::new(bin)
+    let path = std::env::join_paths(dirs).unwrap_or_default();
+    // `npm` is `npm.cmd` on Windows: through what it runs, as for agents.
+    let (program, first) = agent_core::exec::launcher(&bin.to_string_lossy());
+    let out = crate::os::no_window(&mut Command::new(program))
+        .args(first)
         .args(args)
         .current_dir(root)
         .env("PATH", path)

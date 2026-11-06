@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const GITHUB: &str = "https://api.github.com/repos/broisnischal/deck/releases/latest";
+const GITHUB: &str = "https://api.github.com/repos/panelab/deck/releases/latest";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
@@ -112,10 +112,15 @@ fn parse_github(body: &[u8]) -> Option<Release> {
     Some(Release {
         version: l.tag_name.trim_start_matches('v').to_string(),
         notes_url: l.html_url,
+        // The zip holds Deck.app, which macOS swaps in place; Windows runs
+        // the installer. Elsewhere the release page is offered instead.
         download: l
             .assets
             .into_iter()
-            .find(|a| a.name.ends_with(".zip"))
+            .find(|a| {
+                (cfg!(target_os = "macos") && a.name.ends_with(".zip"))
+                    || (cfg!(windows) && a.name.ends_with("-setup.exe"))
+            })
             .map(|a| a.browser_download_url),
     })
 }
@@ -153,6 +158,14 @@ pub async fn download(r: &Release) -> Result<PathBuf, String> {
     let dir = crate::control::socket_dir().join("update");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if cfg!(windows) {
+        if !bytes.starts_with(b"MZ") {
+            return Err("the download is not an installer".into());
+        }
+        let setup = dir.join("Deck-setup.exe");
+        std::fs::write(&setup, bytes).map_err(|e| e.to_string())?;
+        return Ok(setup);
+    }
     let zip = dir.join("Deck.zip");
     std::fs::write(&zip, bytes).map_err(|e| e.to_string())?;
     let ok = std::process::Command::new("/usr/bin/ditto")
@@ -182,16 +195,43 @@ fn bundle_id(app: &Path) -> Option<String> {
 }
 
 /// The app bundle this deck runs from.
+#[cfg(not(windows))]
 pub fn running_app() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let app = exe.parent()?.parent()?.parent()?.to_path_buf();
     app.extension().is_some_and(|e| e == "app").then_some(app)
 }
 
+/// Windows: once deck has quit, run the downloaded installer silently over
+/// this install (it stops the background service too), then reopen.
+#[cfg(windows)]
+pub fn install_on_quit(setup: &Path, reopen: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+    let script = format!(
+        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; \
+         Start-Process -Wait -FilePath {setup} -ArgumentList '/S'{open}",
+        pid = std::process::id(),
+        setup = q(setup),
+        open = if reopen { format!("; Start-Process -FilePath {}", q(&exe)) } else { String::new() },
+    );
+    // No console window, and a process group of its own so it outlives deck.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Hand the swap to a script that waits for deck to quit, moves the new app
 /// into place and (when `reopen`) opens it. The caller quits right after.
+#[cfg(not(windows))]
 pub fn install_on_quit(new_app: &Path, reopen: bool) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let app = running_app().ok_or("deck is not running from an app bundle")?;
     let pid = std::process::id();
     let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
@@ -209,24 +249,8 @@ pub fn install_on_quit(new_app: &Path, reopen: bool) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // Its own session, so it outlives deck.
-    // SAFETY: setsid is async-signal-safe and touches nothing else.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc_setsid();
-            Ok(())
-        });
-    }
+    crate::os::detach(&mut cmd);
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
-}
-
-fn libc_setsid() {
-    extern "C" {
-        fn setsid() -> i32;
-    }
-    // SAFETY: no arguments, no memory.
-    unsafe {
-        setsid();
-    }
 }
 
 #[cfg(test)]
@@ -247,7 +271,13 @@ mod tests {
         let gh = br#"{"tag_name":"v0.2.0","html_url":"https://x/r","assets":[{"name":"Deck.dmg","browser_download_url":"d"},{"name":"Deck-0.2.0.zip","browser_download_url":"z"}]}"#;
         let r = parse_github(gh).unwrap();
         assert_eq!(r.version, "0.2.0");
-        assert_eq!(r.download.as_deref(), Some("z"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(r.download.as_deref(), Some("z"));
+        } else if cfg!(windows) {
+            assert_eq!(r.download, None);
+        } else {
+            assert_eq!(r.download, None);
+        }
         let b = br#"{"version":"0.3.1","notes_url":"n"}"#;
         assert_eq!(parse_backend(b).unwrap().download, None);
     }

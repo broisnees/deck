@@ -19,6 +19,52 @@ type Tool = (
 
 const TOOLS: &[Tool] = &[
     (
+        "deck_memory",
+        "memory.list",
+        "Deck memory: notes every coding agent shares across sessions, for this project and everywhere (preferences, gotchas, decisions, facts). Read it before starting work. With query, only notes containing every word.",
+        || json!({ "query": {"type": "string"}, "all": {"type": "boolean", "description": "every project's, not just this one's"} }),
+        &[],
+    ),
+    (
+        "deck_memory_add",
+        "memory.add",
+        "Keep a note a later session should know and can't read from the code: how I like things done, what bites, why something is as it is. Saying the same thing again confirms the note instead of adding a twin.",
+        || json!({
+            "text": {"type": "string"},
+            "kind": {"type": "string", "enum": ["preference", "gotcha", "decision", "fact"]},
+            "global": {"type": "boolean", "description": "for every project, not just this one"}
+        }),
+        &["text"],
+    ),
+    (
+        "deck_memory_edit",
+        "memory.edit",
+        "Rewrite a Deck memory that has gone stale or wrong (id from deck_memory; a prefix works).",
+        || json!({ "id": {"type": "string"}, "text": {"type": "string"} }),
+        &["id", "text"],
+    ),
+    (
+        "deck_memory_forget",
+        "memory.forget",
+        "Remove a Deck memory that no longer holds.",
+        || json!({ "id": {"type": "string"} }),
+        &["id"],
+    ),
+    (
+        "deck_browser_tabs",
+        "browser.tabs",
+        "Every page open in this Deck window: pane, name, URL, title, whether it is loading, in the background or focused.",
+        || json!({}),
+        &[],
+    ),
+    (
+        "deck_browser_storage",
+        "browser.storage",
+        "A page's application storage: its origin, the cookies script can see (not HttpOnly), localStorage and sessionStorage, long values clipped.",
+        || json!({ "pane": {"type": "integer"}, "name": {"type": "string"} }),
+        &[],
+    ),
+    (
         "deck_remote_hosts",
         "remote.hosts",
         "List the machines reachable over SSH (aliases from the user's SSH config and hosts added in Deck), with user@hostname.",
@@ -439,6 +485,12 @@ fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
 /// Run one tool through the control socket; a failure is the tool's
 /// answer (`isError`), not a protocol error, so the agent can read it.
 fn call(rpc: &str, args: Value) -> Value {
+    if rpc.starts_with("memory.") {
+        return match crate::memory::tool(rpc, &args) {
+            Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),
+            Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+        };
+    }
     if rpc.starts_with("remote.") {
         return match crate::remote::tool(rpc, &args) {
             Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),

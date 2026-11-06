@@ -52,6 +52,7 @@ const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
 /// It also exits when the server does, so a dead server is noticed. TERM is
 /// followed by KILL: servers that came up with TERM ignored were found
 /// running days after their deck had gone.
+#[cfg(unix)]
 const LIFELINE: &str = r#"exec 3<&0
 "$@" </dev/null 3<&- &
 pid=$!
@@ -59,6 +60,28 @@ pid=$!
 exec 3<&-
 wait "$pid"
 kill -TERM 0"#;
+
+/// Deck's half of [`LIFELINE`] on Windows: a hidden PowerShell that waits
+/// for deck or the server to exit, and if deck went first, stops the
+/// server's tree.
+#[cfg(windows)]
+fn windows_lifeline(server: u32) {
+    use std::os::windows::process::CommandExt;
+    let script = format!(
+        "$d=Get-Process -Id {deck} -EA 0; $s=Get-Process -Id {server} -EA 0; \
+         if(-not $d -or -not $s){{exit}}; \
+         while(-not $d.HasExited -and -not $s.HasExited){{Start-Sleep 2}}; \
+         if(-not $s.HasExited){{taskkill /T /F /PID {server} | Out-Null}}",
+        deck = std::process::id(),
+    );
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(agent_core::exec::CREATION_FLAGS)
+        .spawn();
+}
 
 /// OpenCode's permission keys for its tools that read, change or run
 /// anything on this machine (`edit` covers write and apply_patch).
@@ -111,9 +134,22 @@ impl Server {
         // The server runs tools; nothing else on this machine should be able
         // to drive it.
         let password = token();
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", LIFELINE, "opencode-serve", bin])
-            .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", LIFELINE, "opencode-serve", bin]);
+            cmd
+        };
+        // No `sh` to hold a lifeline: the server runs as is, and a watcher
+        // (`windows_lifeline`) stops it if deck goes away without doing so.
+        #[cfg(windows)]
+        let mut cmd = {
+            let (program, first) = agent_core::exec::launcher(bin);
+            let mut cmd = Command::new(program);
+            cmd.args(first).creation_flags(agent_core::exec::CREATION_FLAGS);
+            cmd
+        };
+        cmd.args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
             .current_dir(&ctx.cwd)
             .envs(ctx.env.iter().map(|(k, v)| (k, v)))
             .env("OPENCODE_SERVER_PASSWORD", &password)
@@ -129,6 +165,10 @@ impl Server {
             .spawn()
             .map_err(|e| format!("could not start `{bin} serve`: {e}"))?;
         let lifeline = child.stdin.take();
+        #[cfg(windows)]
+        if let Some(pid) = child.id() {
+            windows_lifeline(pid);
+        }
 
         let stderr = child.stderr.take().expect("piped");
         let tail: Arc<Mutex<Vec<String>>> = Arc::default();

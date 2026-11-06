@@ -13,9 +13,12 @@ alacritty_terminal = "0.26"
 polling = "3"
 memchr = "2"
 libc = "0.2"
-# The Ghostty engine (`Engine::Ghostty`): libghostty-vt, built from Ghostty's
-# source with Zig 0.17 on the first build.
-ghostty-vt = { version = "=0.8.0", optional = true, default-features = false }
 anyhow.workspace = true
 futures.workspace = true
 tracing.workspace = true
+
+# The Ghostty engine (`Engine::Ghostty`): libghostty-vt, built from Ghostty's
+# source with Zig 0.17 on the first build. Unix only: its backend drives a
+# Unix PTY, so Windows runs the Alacritty engine.
+[target.'cfg(unix)'.dependencies]
+ghostty-vt = { version = "=0.8.0", optional = true, default-features = false }

@@ -9,6 +9,14 @@ use std::env;
 fn main() {
     let target = env::var("CARGO_CFG_TARGET_OS");
     println!("cargo::rustc-check-cfg=cfg(gles)");
+    // Deck patch: fxc.exe only runs on Windows, so a build for Windows made
+    // elsewhere (cargo xwin) compiles its HLSL when it starts instead.
+    println!("cargo::rustc-check-cfg=cfg(gpui_hlsl_at_launch)");
+    if target.as_deref() == Ok("windows")
+        && (cfg!(not(target_os = "windows")) || env::var("PROFILE").as_deref() == Ok("debug"))
+    {
+        println!("cargo::rustc-cfg=gpui_hlsl_at_launch");
+    }
 
     #[cfg(any(
         not(any(target_os = "macos", target_os = "windows")),

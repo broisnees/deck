@@ -147,8 +147,8 @@ fn monospace_families(installed: &[String], current: &str) -> Vec<SharedString> 
     nerd.dedup();
     out.extend(nerd.into_iter().map(|n| SharedString::from(n.clone())));
     // Menlo ships with every Mac and is the default; never leave it out.
-    if !out.iter().any(|f| f.as_ref() == theme::MONO) {
-        out.insert(0, theme::MONO.into());
+    if !out.iter().any(|f| f.as_ref() == theme::mono()) {
+        out.insert(0, theme::mono().into());
     }
     if !out.iter().any(|f| f.as_ref() == current) {
         out.push(SharedString::from(current.to_string()));
@@ -194,7 +194,7 @@ impl SettingsPane {
         });
         let _memory = cx.subscribe(&memory_field, |_: &mut Self, f, ev: &FieldEvent, cx| {
             if let FieldEvent::Submit(text) = ev {
-                if !text.trim().is_empty() && crate::memory::add(text, None).is_ok() {
+                if !text.trim().is_empty() && crate::memory::add(text, None, None).is_ok() {
                     f.update(cx, |f, cx| f.set_text("", cx));
                     cx.notify();
                 }
@@ -376,6 +376,9 @@ impl SettingsPane {
     fn outline(&self, window: &Window, cx: &mut Context<Self>) -> Vec<(Page, Vec<Section>)> {
         Page::ALL
             .iter()
+            // Permissions are macOS's privacy panes; Linux and Windows
+            // have nothing like them to grant.
+            .filter(|p| cfg!(target_os = "macos") || **p != Page::Permissions)
             .map(|p| (*p, self.sections(*p, window, cx)))
             .collect()
     }
@@ -1077,7 +1080,7 @@ impl SettingsPane {
                 .child(
                     div()
                         .mr(u(4.))
-                        .font_family(theme::MONO)
+                        .font_family(theme::mono())
                         .text_size(u(12.))
                         .text_color(rgb(p.fg))
                         .child("~ $"),
@@ -1300,7 +1303,7 @@ fn render_row(r: Row) -> Div {
             })
             .children(r.about.map(|a| {
                 div()
-                    .text_size(u(12.5))
+                    .text_size(u(theme::TEXT_UI))
                     .line_height(u(18.))
                     .text_color(rgb(theme::dim()))
                     .child(a)
@@ -1551,7 +1554,9 @@ impl SettingsPane {
         for (pi, (page, sections)) in titles.iter().enumerate() {
             let page = *page;
             let on = page == self.page && !searching;
-            let open = !self.collapsed.contains(&page);
+            // Only the page you are on shows its sections (all of them while
+            // searching); the others open when chosen.
+            let open = searching || (page == self.page && !self.collapsed.contains(&page));
             let foldable = sections.len() > 1;
             col = col.child(
                 div()
@@ -1559,10 +1564,11 @@ impl SettingsPane {
                     .flex()
                     .items_center()
                     .gap(u(8.))
-                    .h(u(32.))
+                    .h(u(30.))
                     .px(u(8.))
                     .rounded(u(8.))
-                    .text_size(u(13.))
+                    .text_size(u(theme::TEXT_UI))
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .cursor_pointer()
                     .when(on, |d| {
                         d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
@@ -1611,9 +1617,11 @@ impl SettingsPane {
                 let mut kids = div()
                     .flex()
                     .flex_col()
-                    .gap(u(2.))
-                    .ml(u(15.))
-                    .pl(u(10.))
+                    .gap(u(1.))
+                    .mt(u(2.))
+                    .mb(u(6.))
+                    .ml(u(17.))
+                    .pl(u(6.))
                     .border_l_1()
                     .border_color(rgba(theme::hairline()));
                 for (si, title) in sections.iter().enumerate() {
@@ -1625,11 +1633,11 @@ impl SettingsPane {
                             ))
                             .flex()
                             .items_center()
-                            .h(u(32.))
+                            .h(u(26.))
                             .px(u(10.))
-                            .rounded(u(8.))
-                            .text_size(u(13.5))
-                            .text_color(rgb(theme::text_2()))
+                            .rounded(u(6.))
+                            .text_size(u(theme::TEXT_SMALL))
+                            .text_color(rgb(theme::dim()))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                             .child(*title)
@@ -1735,11 +1743,9 @@ impl SettingsPane {
     fn page_general(&self, cx: &mut Context<Self>) -> Vec<Section> {
         let path = settings::path();
         let shown = tilde(&path.display().to_string());
-        let reveal = button("reveal", "Show in Finder").on_click(move |_, _, _| {
-            let _ = std::process::Command::new("/usr/bin/open")
-                .arg("-R")
-                .arg(&path)
-                .spawn();
+        let reveal_label = if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Files" };
+        let reveal = button("reveal", reveal_label).on_click(move |_, _, _| {
+            let _ = crate::desktop::reveal(&path);
         });
         let reset = button("defaults", "Restore Defaults").on_click(self.on(
             |s| {
@@ -1760,7 +1766,7 @@ impl SettingsPane {
             },
         )
         .on_click(cx.listener(move |_, _, _, cx| cx.emit(SettingsEvent::DefaultTerminal(!on))));
-        vec![
+        let mut sections = vec![
             self.account_section(cx),
             self.updates_section(cx),
             group(
@@ -1787,7 +1793,13 @@ impl SettingsPane {
                 ],
                 None,
             ),
-        ]
+        ];
+        // Being the default terminal is Launch Services' on macOS; on Linux
+        // the desktop file the package installs claims it.
+        if !cfg!(target_os = "macos") {
+            sections.remove(2);
+        }
+        sections
     }
 
     fn page_appearance(&self, window: &Window, cx: &mut Context<Self>) -> Vec<Section> {
@@ -1971,12 +1983,16 @@ impl SettingsPane {
                 None,
             ),
             group(
-                "Option key",
+                if cfg!(target_os = "macos") { "Option key" } else { "Alt key" },
                 vec![row(
-                    "Use ⌥ as Meta",
+                    if cfg!(target_os = "macos") { "Use ⌥ as Meta" } else { "Use Alt as Meta" },
                     self.toggle("meta", s.option_as_meta, |s, on| s.option_as_meta = on, cx),
                 )
-                .about("⌥B and ⌥F jump by word in the shell, instead of typing ∫ and ƒ.")],
+                .about(if cfg!(target_os = "macos") {
+                    "⌥B and ⌥F jump by word in the shell, instead of typing ∫ and ƒ."
+                } else {
+                    "Alt+B and Alt+F jump by word in the shell, as most Linux terminals do."
+                })],
                 None,
             ),
             group(
@@ -2076,7 +2092,12 @@ impl SettingsPane {
                         crate::adblock::set_enabled(on);
                     }, cx),
                 )
-                .about("Third-party loads from the ad and tracking networks behind most of them are dropped, so pages are lighter and quieter. A site's own content and its sign-in are never touched. Applies to pages opened after the change.")],
+                .about("Third-party loads from the ad and tracking networks behind most of them are dropped, so pages are lighter and quieter. A site's own content and its sign-in are never touched. Applies to pages opened after the change."),
+                row(
+                    "Let agents read pages",
+                    self.toggle("agents-read-pages", self.settings.agents_read_pages, |s, on| s.agents_read_pages = on, cx),
+                )
+                .about("Agents can see a page's console, network requests, cookies and storage, and run scripts in it, to test and debug what they build. Off, they can still open pages for you to look at, but read nothing from them.")],
                 None,
             ),
             group(
@@ -2155,11 +2176,55 @@ impl SettingsPane {
                 .on_click(self.on(move |s| s.access = a, cx))
             })
             .collect();
+        // Where a thread goes when its agent hits the plan's usage limit:
+        // agents in the order picked, numbered; none waits for the reset.
+        let chain = self.settings.limit_chain.clone();
+        let mut on_limit = vec![choice(
+            "limit-wait".into(),
+            Some(Icon::Clock),
+            "Wait for the reset".into(),
+            Some("The thread picks up by itself when the limit resets".into()),
+            chain.is_empty(),
+        )
+        .on_click(self.on(|s| s.limit_chain.clear(), cx))];
+        for (ix, (id, name)) in self.agents.iter().enumerate() {
+            let pick = id.to_string();
+            let at = chain.iter().position(|a| a == id.as_ref());
+            on_limit.push(
+                choice(
+                    ElementId::NamedInteger("limit-agent".into(), ix as u64),
+                    Some(Icon::agent(id)),
+                    match at {
+                        Some(n) => format!("{}. Continue with {name}", n + 1).into(),
+                        None => format!("Continue with {name}").into(),
+                    },
+                    None,
+                    at.is_some(),
+                )
+                .on_click(self.on(
+                    move |s| {
+                        // A click adds it to the end of the chain, or takes
+                        // it out.
+                        if let Some(i) = s.limit_chain.iter().position(|a| *a == pick) {
+                            s.limit_chain.remove(i);
+                        } else {
+                            s.limit_chain.push(pick.clone());
+                        }
+                    },
+                    cx,
+                )),
+            );
+        }
         vec![
             choices(
                 "New chats",
                 start,
                 (self.agents.is_empty()).then(|| "Detecting agents…".into()),
+            ),
+            choices(
+                "When an agent reaches its limit",
+                on_limit,
+                Some("Claude's 5-hour and weekly limits, Codex's monthly one. Pick agents in the order to try them: the thread moves to the first ready one with the whole conversation, and comes back to its own agent with the first message after the reset.".into()),
             ),
             choices(
                 "Access",
@@ -2337,8 +2402,9 @@ impl SettingsPane {
                 .into_any_element(),
         )];
         let mut all = crate::memory::load();
-        all.sort_by_key(|m| std::cmp::Reverse(m.created));
-        for (i, m) in all.into_iter().take(40).enumerate() {
+        // Last written or confirmed first.
+        all.sort_by_key(|m| std::cmp::Reverse(m.updated.unwrap_or(m.created)));
+        for (i, m) in all.into_iter().take(60).enumerate() {
             let scope = match &m.project {
                 Some(p) => p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
                 None => "every project".to_string(),
@@ -2354,7 +2420,10 @@ impl SettingsPane {
                         }))
                         .into_any_element(),
                 )
-                .about(format!("{scope} · {}", m.id)),
+                .about(match &m.kind {
+                    Some(k) => format!("{k} · {scope} · {}", m.id),
+                    None => format!("{scope} · {}", m.id),
+                }),
             );
         }
         rows
@@ -2532,8 +2601,8 @@ const FIXED_KEYS: &[(&str, &str)] = &[
 
 /// `/Users/me/x` → `~/x`.
 fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+    match agent_core::dirs::home_dir().map(|h| h.to_string_lossy().into_owned()) {
+        Some(home) if !home.is_empty() && path.starts_with(&home) => {
             format!("~{}", &path[home.len()..])
         }
         _ => path.to_string(),
@@ -2545,6 +2614,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn fonts_offered_are_installed_ones_plus_menlo_and_the_current() {
         let installed: Vec<String> = [
             "Monaco",

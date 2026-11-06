@@ -251,7 +251,7 @@ impl Render for ContextMenu {
             .bg(rgb(theme::menu()))
             .border_1()
             .border_color(rgba(theme::alpha(theme::text(), 0x14)))
-            .font_family(theme::UI)
+            .font_family(theme::ui())
             .text_size(u(13.))
             .line_height(u(18.))
             .on_key_down(cx.listener(Self::on_key))

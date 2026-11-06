@@ -9,8 +9,14 @@
 //! for Deck; its cookies are sealed in Safari's container and are not read.
 //! Saved passwords are not imported.
 //!
+//! On Windows the key is in the profile's `Local State`, sealed with DPAPI
+//! for the account; Chrome 127 and later seals new cookies to Chrome itself
+//! (app-bound), and those are skipped.
+//!
 //! Databases are copied before reading, so a running browser is never
-//! disturbed, and read with the system's `sqlite3`.
+//! disturbed, and read with the system's `sqlite3` (on Windows, the
+//! `winsqlite3.dll` it ships). Windows keeps a running browser's files
+//! locked, so there it has to be closed first.
 
 use crate::history::Visit;
 use std::path::{Path, PathBuf};
@@ -32,8 +38,29 @@ impl Source {
 }
 
 /// The browsers installed with a profile to read, most common first.
+/// Their cookie key sits in `Local State` beside the profile, sealed with
+/// DPAPI for this Windows account.
+#[cfg(windows)]
 pub fn sources() -> Vec<Source> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else { return Vec::new() };
+    let chromium: [(&str, &str); 5] = [
+        ("Chrome", r"Google\Chrome\User Data"),
+        ("Edge", r"Microsoft\Edge\User Data"),
+        ("Brave", r"BraveSoftware\Brave-Browser\User Data"),
+        ("Vivaldi", r"Vivaldi\User Data"),
+        ("Chromium", r"Chromium\User Data"),
+    ];
+    chromium
+        .iter()
+        .map(|(name, dir)| Source { name, dir: local.join(dir).join("Default"), keychain: Some("Local State") })
+        .filter(|s| s.dir.join("History").exists())
+        .collect()
+}
+
+/// The browsers installed with a profile to read, most common first.
+#[cfg(not(windows))]
+pub fn sources() -> Vec<Source> {
+    let Some(home) = agent_core::dirs::home_dir() else { return Vec::new() };
     let support = home.join("Library/Application Support");
     let chromium: [(&str, &str, &str); 6] = [
         ("Chrome", "Google/Chrome", "Chrome Safe Storage"),
@@ -126,9 +153,10 @@ pub fn import(src: &Source, cookies: bool) -> (Report, Vec<Cookie>) {
     let mut jar = Vec::new();
     if cookies && !src.safari() {
         match read_cookies(src) {
-            Ok(c) => {
+            Ok((c, note)) => {
                 report.cookies = c.len();
                 jar = c;
+                report.notes.extend(note);
             }
             Err(e) => report.notes.push(e),
         }
@@ -141,14 +169,30 @@ pub fn import(src: &Source, cookies: bool) -> (Report, Vec<Cookie>) {
             Err(e) => report.notes.push(e),
         }
     }
+    // Windows keeps a running browser's databases locked.
+    let mut locked = false;
+    report.notes.retain(|n| {
+        let hit = n == LOCKED;
+        locked |= hit;
+        !hit
+    });
+    if locked {
+        report.notes.push(format!("{0} keeps its files locked while it runs: close {0} first", src.name));
+    }
     (report, jar)
 }
+
+/// `query`'s error for a database another process holds open.
+const LOCKED: &str = "locked";
 
 /// The rows of `sql` against a copy of `db`, fields split on 0x1f.
 fn query(db: &Path, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let tmp = std::env::temp_dir().join(format!("deck-import-{}-{}", std::process::id(), db.file_name().and_then(|n| n.to_str()).unwrap_or("db")));
     std::fs::copy(db, &tmp).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        if cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)) {
+            LOCKED.to_string()
+        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
             "Deck needs Full Disk Access to read this (System Settings › Privacy & Security)".to_string()
         } else {
             format!("could not read {}: {e}", db.display())
@@ -159,15 +203,28 @@ fn query(db: &Path, sql: &str) -> Result<Vec<Vec<String>>, String> {
     if wal.exists() {
         let _ = std::fs::copy(&wal, format!("{}-wal", tmp.display()));
     }
+    let rows = run_sql(&tmp, sql);
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    rows
+}
+
+#[cfg(windows)]
+fn run_sql(tmp: &Path, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    win::rows(tmp, sql)
+}
+
+/// `sql` against `tmp` with the system's `sqlite3`.
+#[cfg(not(windows))]
+fn run_sql(tmp: &Path, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let out = Command::new("/usr/bin/sqlite3")
         .args(["-readonly", "-separator", "\u{1f}", "-newline", "\u{1e}"])
         .arg(&tmp)
         .arg(sql)
         .output()
-        .map_err(|e| format!("sqlite3: {e}"));
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
-    let out = out?;
+        .map_err(|e| format!("sqlite3: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -266,21 +323,14 @@ fn read_bookmarks(src: &Source) -> Result<Vec<Visit>, String> {
     Ok(out)
 }
 
-fn read_cookies(src: &Source) -> Result<Vec<Cookie>, String> {
-    let service = src.keychain.ok_or("no keychain item")?;
-    let db = [src.dir.join("Cookies"), src.dir.join("Network/Cookies")]
+/// The cookies a Chromium profile holds, and a note on any it could not
+/// open.
+fn read_cookies(src: &Source) -> Result<(Vec<Cookie>, Option<String>), String> {
+    let db = [src.dir.join("Cookies"), src.dir.join("Network").join("Cookies")]
         .into_iter()
         .find(|p| p.exists())
         .ok_or("no cookie database")?;
-    let out = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-w", "-s", service])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("sign-ins skipped: the keychain did not give out \"{service}\""));
-    }
-    let password = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let key = derive_key(password.as_bytes()).ok_or("could not derive the cookie key")?;
+    let key = cookie_key(src)?;
     // Since Chrome 130 (meta version 24) each value starts with a 32-byte
     // hash of its domain.
     let version: u32 = query(&db, "SELECT value FROM meta WHERE key = 'version'")?
@@ -296,6 +346,7 @@ fn read_cookies(src: &Source) -> Result<Vec<Cookie>, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0., |d| d.as_secs_f64());
     let mut jar = Vec::new();
+    let mut sealed = 0;
     for r in rows {
         let Ok([domain, name, path, expires, secure, http_only, enc, plain]) = <[String; 8]>::try_from(r) else {
             continue;
@@ -309,8 +360,14 @@ fn read_cookies(src: &Source) -> Result<Vec<Cookie>, String> {
             plain
         } else {
             let Some(bytes) = unhex(&enc) else { continue };
-            let Some(body) = bytes.strip_prefix(b"v10") else { continue };
-            let Some(mut clear) = decrypt(&key, body) else { continue };
+            let mut clear = match open_value(&key, &bytes) {
+                Opened::Clear(c) => c,
+                Opened::Sealed => {
+                    sealed += 1;
+                    continue;
+                }
+                Opened::Unreadable => continue,
+            };
             if version >= 24 && clear.len() >= 32 {
                 clear.drain(..32);
             }
@@ -329,13 +386,280 @@ fn read_cookies(src: &Source) -> Result<Vec<Cookie>, String> {
             http_only: http_only == "1",
         });
     }
-    Ok(jar)
+    let note = (sealed > 0).then(|| {
+        format!(
+            "{sealed} of {}'s sign-ins are sealed to {0} itself (app-bound encryption, Chrome 127 and later) and were skipped: sign in to those sites again here",
+            src.name
+        )
+    });
+    Ok((jar, note))
+}
+
+enum Opened {
+    Clear(Vec<u8>),
+    /// Readable only by the browser that wrote it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Sealed,
+    Unreadable,
+}
+
+/// Chromium's cookie key on macOS: from the keychain item `src` names.
+#[cfg(not(windows))]
+type Key = [u8; 16];
+
+#[cfg(not(windows))]
+fn cookie_key(src: &Source) -> Result<Key, String> {
+    let service = src.keychain.ok_or("no keychain item")?;
+    let out = Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-w", "-s", service])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("sign-ins skipped: the keychain did not give out \"{service}\""));
+    }
+    let password = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    derive_key(password.as_bytes()).ok_or_else(|| "could not derive the cookie key".into())
+}
+
+#[cfg(not(windows))]
+fn open_value(key: &Key, bytes: &[u8]) -> Opened {
+    match bytes.strip_prefix(b"v10").and_then(|body| decrypt(key, body)) {
+        Some(clear) => Opened::Clear(clear),
+        None => Opened::Unreadable,
+    }
+}
+
+/// Chromium's cookie key on Windows: `os_crypt.encrypted_key` in the
+/// profile's `Local State`, base64 of "DPAPI" and a DPAPI blob for this
+/// account, 32 bytes for AES-256-GCM.
+#[cfg(windows)]
+type Key = Vec<u8>;
+
+#[cfg(windows)]
+fn cookie_key(src: &Source) -> Result<Key, String> {
+    let state = src.dir.parent().ok_or("no profile folder")?.join("Local State");
+    let json: serde_json::Value = std::fs::read(&state)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| format!("sign-ins skipped: could not read {}'s Local State", src.name))?;
+    let sealed = json["os_crypt"]["encrypted_key"]
+        .as_str()
+        .and_then(unbase64)
+        .ok_or("sign-ins skipped: no cookie key in Local State")?;
+    let blob = sealed.strip_prefix(b"DPAPI").ok_or("sign-ins skipped: the cookie key is not DPAPI-sealed")?;
+    let key = win::unprotect(blob).ok_or("sign-ins skipped: Windows did not unseal the cookie key")?;
+    if key.len() != 32 {
+        return Err("sign-ins skipped: the cookie key is not 32 bytes".into());
+    }
+    Ok(key)
+}
+
+/// `v10`/`v11`: AES-256-GCM, a 12-byte nonce, the text, a 16-byte tag.
+/// `v20` is app-bound: only the browser's own elevated service opens it.
+#[cfg(windows)]
+fn open_value(key: &Key, bytes: &[u8]) -> Opened {
+    if bytes.starts_with(b"v20") {
+        return Opened::Sealed;
+    }
+    let Some(body) = bytes.strip_prefix(b"v10").or_else(|| bytes.strip_prefix(b"v11")) else {
+        // Before Chrome 80: the value is a DPAPI blob of its own.
+        return win::unprotect(bytes).map_or(Opened::Unreadable, Opened::Clear);
+    };
+    if body.len() < 12 + 16 {
+        return Opened::Unreadable;
+    }
+    let (nonce, rest) = body.split_at(12);
+    let (text, tag) = rest.split_at(rest.len() - 16);
+    win::aes_gcm_open(key, nonce, text, tag).map_or(Opened::Unreadable, Opened::Clear)
+}
+
+/// Standard base64, padding optional; `None` on anything else.
+#[cfg(windows)]
+fn unbase64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(windows)]
+mod win {
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use windows::core::{s, w, PCWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        BCryptCloseAlgorithmProvider, BCryptDecrypt, BCryptDestroyKey, BCryptGenerateSymmetricKey,
+        BCryptOpenAlgorithmProvider, BCryptSetProperty, CryptUnprotectData, BCRYPT_AES_ALGORITHM,
+        BCRYPT_ALG_HANDLE, BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO,
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION, BCRYPT_CHAINING_MODE, BCRYPT_FLAGS,
+        BCRYPT_KEY_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, CRYPT_INTEGER_BLOB,
+    };
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+    /// DPAPI's CryptUnprotectData, for the signed-in account.
+    pub fn unprotect(blob: &[u8]) -> Option<Vec<u8>> {
+        let input = CRYPT_INTEGER_BLOB { cbData: blob.len() as u32, pbData: blob.as_ptr() as *mut u8 };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: `input` points at `blob` for the call; `out` is DPAPI's
+        // LocalAlloc'd buffer, copied and then freed.
+        unsafe {
+            CryptUnprotectData(&input, None, None, None, None, 0, &mut out).ok()?;
+            let clear = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+            LocalFree(Some(HLOCAL(out.pbData as *mut c_void)));
+            Some(clear)
+        }
+    }
+
+    /// AES-GCM through CNG: `text` decrypted when `tag` checks out.
+    pub fn aes_gcm_open(key: &[u8], nonce: &[u8], text: &[u8], tag: &[u8]) -> Option<Vec<u8>> {
+        let mut alg = BCRYPT_ALG_HANDLE::default();
+        // SAFETY: CNG handles opened and closed here; every buffer outlives
+        // the call that reads or writes it.
+        unsafe {
+            if BCryptOpenAlgorithmProvider(&mut alg, BCRYPT_AES_ALGORITHM, PCWSTR::null(), BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0)).is_err() {
+                return None;
+            }
+            let gcm: Vec<u8> = "ChainingModeGCM\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let mut out = None;
+            if BCryptSetProperty(alg.into(), BCRYPT_CHAINING_MODE, &gcm, 0).is_ok() {
+                let mut hkey = BCRYPT_KEY_HANDLE::default();
+                if BCryptGenerateSymmetricKey(alg, &mut hkey, None, key, 0).is_ok() {
+                    let mut nonce = nonce.to_vec();
+                    let mut tag = tag.to_vec();
+                    let info = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO {
+                        cbSize: std::mem::size_of::<BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO>() as u32,
+                        dwInfoVersion: BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION,
+                        pbNonce: nonce.as_mut_ptr(),
+                        cbNonce: nonce.len() as u32,
+                        pbTag: tag.as_mut_ptr(),
+                        cbTag: tag.len() as u32,
+                        ..Default::default()
+                    };
+                    let mut clear = vec![0u8; text.len()];
+                    let mut n = 0u32;
+                    let st = BCryptDecrypt(
+                        hkey,
+                        Some(text),
+                        Some(&info as *const _ as *const c_void),
+                        None,
+                        Some(&mut clear),
+                        &mut n,
+                        BCRYPT_FLAGS(0),
+                    );
+                    if st.is_ok() {
+                        clear.truncate(n as usize);
+                        out = Some(clear);
+                    }
+                    let _ = BCryptDestroyKey(hkey);
+                }
+            }
+            let _ = BCryptCloseAlgorithmProvider(alg, 0);
+            out
+        }
+    }
+
+    type Open = unsafe extern "system" fn(*const c_char, *mut *mut c_void, c_int, *const c_char) -> c_int;
+    type Prepare = unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut *mut c_void, *mut *const c_char) -> c_int;
+    type Step = unsafe extern "system" fn(*mut c_void) -> c_int;
+    type Count = unsafe extern "system" fn(*mut c_void) -> c_int;
+    type Text = unsafe extern "system" fn(*mut c_void, c_int) -> *const u8;
+    type Bytes = unsafe extern "system" fn(*mut c_void, c_int) -> c_int;
+    type Finalize = unsafe extern "system" fn(*mut c_void) -> c_int;
+    type Close = unsafe extern "system" fn(*mut c_void) -> c_int;
+    type ErrMsg = unsafe extern "system" fn(*mut c_void) -> *const c_char;
+
+    /// The rows of `sql` against `db`, through `winsqlite3.dll`, the SQLite
+    /// every Windows 10 and later ships, loaded when first needed.
+    pub fn rows(db: &std::path::Path, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        const OK: c_int = 0;
+        const ROW: c_int = 100;
+        const DONE: c_int = 101;
+        // SQLITE_OPEN_READWRITE: it is our own copy, and WAL wants to write
+        // its index beside it.
+        const OPEN_READWRITE: c_int = 0x2;
+        let path = CString::new(db.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+        let sql = CString::new(sql).map_err(|e| e.to_string())?;
+        // SAFETY: the functions are SQLite's C API with the signatures
+        // above; the connection and statement live only inside this block.
+        unsafe {
+            let lib = LoadLibraryW(w!("winsqlite3.dll")).map_err(|e| format!("winsqlite3: {e}"))?;
+            macro_rules! f {
+                ($name:literal, $ty:ty) => {
+                    std::mem::transmute::<_, $ty>(GetProcAddress(lib, s!($name)).ok_or(concat!("winsqlite3 has no ", $name))?)
+                };
+            }
+            let open = f!("sqlite3_open_v2", Open);
+            let prepare = f!("sqlite3_prepare_v2", Prepare);
+            let step = f!("sqlite3_step", Step);
+            let count = f!("sqlite3_column_count", Count);
+            let text = f!("sqlite3_column_text", Text);
+            let bytes = f!("sqlite3_column_bytes", Bytes);
+            let finalize = f!("sqlite3_finalize", Finalize);
+            let close = f!("sqlite3_close", Close);
+            let errmsg = f!("sqlite3_errmsg", ErrMsg);
+            let err = |conn: *mut c_void| {
+                let m = errmsg(conn);
+                if m.is_null() { "sqlite error".to_string() } else { CStr::from_ptr(m).to_string_lossy().into_owned() }
+            };
+            let mut conn = std::ptr::null_mut();
+            if open(path.as_ptr(), &mut conn, OPEN_READWRITE, std::ptr::null()) != OK {
+                let e = err(conn);
+                close(conn);
+                return Err(e);
+            }
+            let mut stmt = std::ptr::null_mut();
+            if prepare(conn, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut()) != OK {
+                let e = err(conn);
+                close(conn);
+                return Err(e);
+            }
+            let cols = count(stmt);
+            let mut out = Vec::new();
+            let result = loop {
+                match step(stmt) {
+                    ROW => out.push(
+                        (0..cols)
+                            .map(|i| {
+                                let p = text(stmt, i);
+                                let n = bytes(stmt, i).max(0) as usize;
+                                if p.is_null() {
+                                    String::new()
+                                } else {
+                                    String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).into_owned()
+                                }
+                            })
+                            .collect(),
+                    ),
+                    DONE => break Ok(out),
+                    _ => break Err(err(conn)),
+                }
+            };
+            finalize(stmt);
+            close(conn);
+            result
+        }
+    }
 }
 
 /// Safari's cookies, from its `Cookies.binarycookies` (inside Safari's
 /// container: needs Full Disk Access for Deck).
 fn read_safari_cookies() -> Result<Vec<Cookie>, String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("no home folder")?;
+    let home = agent_core::dirs::home_dir().ok_or("no home folder")?;
     let paths = [
         home.join("Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"),
         home.join("Library/Cookies/Cookies.binarycookies"),
@@ -420,6 +744,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "System", kind = "dylib")]
 extern "C" {
     fn CCKeyDerivationPBKDF(
@@ -451,6 +776,7 @@ extern "C" {
 
 /// Chromium's cookie key on macOS: PBKDF2-SHA1 of the keychain password,
 /// salt "saltysalt", 1003 rounds, 16 bytes.
+#[cfg(target_os = "macos")]
 fn derive_key(password: &[u8]) -> Option<[u8; 16]> {
     let mut key = [0u8; 16];
     let salt = b"saltysalt";
@@ -461,7 +787,19 @@ fn derive_key(password: &[u8]) -> Option<[u8; 16]> {
     (rc == 0).then_some(key)
 }
 
+/// Chromium's Linux store is not read yet.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn derive_key(_password: &[u8]) -> Option<[u8; 16]> {
+    None
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn decrypt(_key: &[u8; 16], _data: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
 /// AES-128-CBC with an IV of sixteen spaces and PKCS#7 padding.
+#[cfg(target_os = "macos")]
 fn decrypt(key: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     let iv = [b' '; 16];
     let mut out = vec![0u8; data.len() + 16];
@@ -477,7 +815,59 @@ fn decrypt(key: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Hand the cookies to WebKit's default store, the one Deck's pages use.
-/// Main thread only.
+/// Main thread only. On Linux there is no store of ours to fill yet.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn install_cookies(_jar: &[Cookie]) {}
+
+#[cfg(windows)]
+thread_local! {
+    /// Cookies imported before any page was open, for the first one.
+    static WAITING: std::cell::RefCell<Vec<Cookie>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Into WebView2's profile, which every page shares (one data folder):
+/// through any open page's cookie manager, or the next page made.
+#[cfg(windows)]
+pub fn install_cookies(jar: &[Cookie]) {
+    WAITING.with(|w| w.borrow_mut().extend_from_slice(jar));
+    if let Some(page) = crate::browser::any_page() {
+        install_waiting(&page);
+    }
+}
+
+/// The cookies imported while no page was open, into `page`'s profile.
+#[cfg(windows)]
+pub fn install_waiting(page: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_2;
+    use windows::core::{Interface, HSTRING};
+    let jar = WAITING.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    if jar.is_empty() {
+        return;
+    }
+    // SAFETY: WebView2 calls on the main thread, where the page lives.
+    unsafe {
+        let Ok(manager) = page.cast::<ICoreWebView2_2>().and_then(|p| p.CookieManager()) else {
+            return;
+        };
+        for c in &jar {
+            let made = manager.CreateCookie(
+                &HSTRING::from(c.name.as_str()),
+                &HSTRING::from(c.value.as_str()),
+                &HSTRING::from(c.domain.as_str()),
+                &HSTRING::from(c.path.as_str()),
+            );
+            let Ok(cookie) = made else { continue };
+            if let Some(at) = c.expires {
+                let _ = cookie.SetExpires(at);
+            }
+            let _ = cookie.SetIsSecure(c.secure);
+            let _ = cookie.SetIsHttpOnly(c.http_only);
+            let _ = manager.AddOrUpdateCookie(&cookie);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn install_cookies(jar: &[Cookie]) {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -554,6 +944,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn chromium_cookies_decrypt() {
         // Encrypt with the same scheme, then read it back.
         let key = derive_key(b"peanuts").unwrap();

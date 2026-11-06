@@ -162,9 +162,13 @@ impl SettingsPane {
                 .background_executor()
                 .spawn(async { local::survey() })
                 .await;
+            // Settings is one long view of every page: draw it again only
+            // when something changed, not on every poll.
             let drawn = this.update(cx, |p, cx| {
-                p.models.survey = Some(survey);
-                cx.notify();
+                if p.models.survey.as_ref() != Some(&survey) {
+                    p.models.survey = Some(survey);
+                    cx.notify();
+                }
             });
             if drawn.is_err() {
                 return;
@@ -529,7 +533,12 @@ impl SettingsPane {
         match self.models.busy.get(&m.name) {
             Some(doing) => control = control.child(quiet(*doing)),
             None => {
-                if m.chats() {
+                // An Ollama cloud model ("…:cloud", "…-cloud") runs on Ollama's
+                // servers: there is nothing to load into memory here.
+                let cloud = m.name.ends_with(":cloud") || m.name.ends_with("-cloud");
+                if cloud {
+                    control = control.child(quiet("runs in the cloud"));
+                } else if m.chats() {
                     let (label, act) = if loaded.is_some() {
                         ("Unload", Act::Unload)
                     } else {
@@ -745,7 +754,7 @@ fn badge(text: String) -> AnyElement {
         .px(u(8.))
         .rounded(u(6.))
         .bg(rgb(theme::surface()))
-        .text_size(u(11.5))
+        .text_size(u(theme::TEXT_SMALL))
         .text_color(rgb(theme::text_2()))
         .child(div().size(u(6.)).rounded_full().bg(rgb(green())))
         .child(text)

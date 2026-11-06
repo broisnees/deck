@@ -6,8 +6,10 @@
 //! crate, never on a specific backend.
 
 pub mod adapter;
+pub mod dirs;
 pub mod error;
 pub mod event;
+pub mod exec;
 pub mod ids;
 pub mod transcript;
 

@@ -112,9 +112,7 @@ impl Kind {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    agent_core::dirs::home_dir().unwrap_or_default()
 }
 
 /// `bin` on PATH or where Homebrew, pip and LM Studio put theirs (an app
@@ -124,11 +122,17 @@ fn find_binary(bin: &str) -> Option<PathBuf> {
         return Some(p);
     }
     let home = home();
+    // Windows: Ollama's and LM Studio's installers put theirs under
+    // %LOCALAPPDATA%\Programs.
+    let programs = std::env::var_os("LOCALAPPDATA")
+        .filter(|_| cfg!(windows))
+        .map(|d| PathBuf::from(d).join("Programs"));
     ["/opt/homebrew/bin", "/usr/local/bin"]
         .into_iter()
         .map(PathBuf::from)
         .chain([".local/bin", ".lmstudio/bin", ".cache/lm-studio/bin"].map(|d| home.join(d)))
-        .map(|d| d.join(bin))
+        .chain(programs.into_iter().flat_map(|p| [p.join("Ollama"), p.join("LM Studio")]))
+        .map(|d| d.join(format!("{bin}{}", std::env::consts::EXE_SUFFIX)))
         .find(|p| p.is_file())
 }
 
@@ -224,7 +228,6 @@ fn probe_8080() -> (Option<Option<String>>, bool) {
 /// itself updated), else `ollama serve` in its own process group, so it
 /// outlives Deck. Waits until it answers.
 pub fn start(kind: Kind) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     if kind != Kind::Ollama {
         return Err(format!("Deck can't start {} yet", kind.name()));
@@ -233,13 +236,14 @@ pub fn start(kind: Kind) -> Result<(), String> {
         Some(app) => Command::new("/usr/bin/open").arg("-a").arg(app).spawn(),
         None => {
             let bin = find_binary(kind.binary()).ok_or("Ollama isn't installed")?;
-            Command::new(bin)
-                .arg("serve")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
+            crate::os::detach(
+                Command::new(bin)
+                    .arg("serve")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .spawn()
         }
     };
     spawned.map_err(|e| format!("couldn't start Ollama: {e}"))?;

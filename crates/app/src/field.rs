@@ -405,6 +405,11 @@ impl Field {
             Move::Collapse
         };
         let vertical = matches!(ks.key.as_str(), "up" | "down");
+        // Off macOS, Ctrl does what ⌥ does there (by word) and Ctrl+Alt
+        // what ⌘ does (to the line's start or end), as in GTK and Qt.
+        let linux = !cfg!(target_os = "macos");
+        let by_line = m.platform || (linux && m.control && m.alt);
+        let by_word = !by_line && (m.alt || (linux && m.control));
         match ks.key.as_str() {
             "enter" if self.multiline && (self.editor || m.shift || m.alt) => {
                 self.edit(Run::Other, cx, |b| b.insert("\n"))
@@ -414,16 +419,16 @@ impl Field {
             }
             "enter" => cx.emit(FieldEvent::Submit(self.buf.text().to_string())),
             "escape" => cx.emit(FieldEvent::Cancel),
-            "backspace" if m.platform => self.edit(Run::Other, cx, |b| b.delete_to_line_start()),
-            "backspace" if m.alt => self.edit(Run::Other, cx, |b| b.delete_word_left()),
+            "backspace" if by_line => self.edit(Run::Other, cx, |b| b.delete_to_line_start()),
+            "backspace" if by_word => self.edit(Run::Other, cx, |b| b.delete_word_left()),
             "backspace" => self.edit(Run::Delete, cx, |b| b.backspace()),
-            "delete" if m.alt => self.edit(Run::Other, cx, |b| b.delete_word_right()),
+            "delete" if by_word => self.edit(Run::Other, cx, |b| b.delete_word_right()),
             "delete" => self.edit(Run::Delete, cx, |b| b.delete_forward()),
-            "left" if m.platform => self.buf.move_line_start(mv),
-            "left" if m.alt => self.buf.move_word_left(mv),
+            "left" if by_line => self.buf.move_line_start(mv),
+            "left" if by_word => self.buf.move_word_left(mv),
             "left" => self.buf.move_left(mv),
-            "right" if m.platform => self.buf.move_line_end(mv),
-            "right" if m.alt => self.buf.move_word_right(mv),
+            "right" if by_line => self.buf.move_line_end(mv),
+            "right" if by_word => self.buf.move_word_right(mv),
             "right" => self.buf.move_right(mv),
             "up" if m.platform => self.buf.move_doc_start(mv),
             "down" if m.platform => self.buf.move_doc_end(mv),

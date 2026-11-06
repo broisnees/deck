@@ -381,11 +381,47 @@ pub const CODEX: CliSpec = CliSpec {
     }),
 };
 
-pub const ALL: &[&CliSpec] = &[&OPENCODE, &VIBE, &GROK, &CRUSH, &GEMINI, &CODEX];
+/// GitHub Copilot CLI, one turn at a time over its plain text: its JSON
+/// lines' schema has not been observed yet. Flags from `copilot --help`,
+/// 1.0.105: `-s` prints only the answer, `-C` sets the folder.
+pub const COPILOT: CliSpec = CliSpec {
+    id: "copilot",
+    display_name: "Copilot",
+    bin: "copilot",
+    wire: Wire::PlainText,
+    base_args: &["-s"],
+    cwd_flag: Some("-C"),
+    model_flag: Some("--model"),
+    resume: Resume::Latest("--continue"),
+    yolo_args: &["--allow-all-tools"],
+    prompt_flag: Some("--prompt"),
+    login: Some("copilot login"),
+    caps: PLAIN_CAPS,
+    models: &[],
+    list_models: None,
+    env: &[],
+    setup: Some(agent_core::Setup {
+        verb: "Install",
+        command: "npm install -g @github/copilot",
+        source: "GitHub's Copilot CLI docs",
+    }),
+};
+
+/// The CLIs Deck offers for chats. Gemini CLI is left out of the picker
+/// (`GEMINI` stays, for threads saved with it).
+pub const ALL: &[&CliSpec] = &[&OPENCODE, &CODEX, &COPILOT, &GROK, &CRUSH, &VIBE];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_runs_one_quiet_turn_in_the_folder() {
+        let a = COPILOT.args("fix it", "/r", Some("gpt-5"), None, PermissionMode::Edit);
+        assert_eq!(a, ["-s", "-C", "/r", "--model", "gpt-5", "--allow-all-tools", "--prompt=fix it"]);
+        let a = COPILOT.args("go on", "/r", None, Some("x"), PermissionMode::Ask);
+        assert_eq!(a, ["-s", "-C", "/r", "--continue", "--prompt=go on"]);
+    }
 
     #[test]
     fn opencode_argv_matches_the_verified_cli_surface() {

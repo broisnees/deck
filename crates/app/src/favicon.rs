@@ -7,7 +7,9 @@
 //! sites that are not open.
 
 use gpui::{Image, ImageFormat};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSData, NSDictionary};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -87,6 +89,11 @@ fn decode(bytes: &[u8]) -> Option<(Vec<u8>, ImageFormat, &'static str)> {
     if head.contains("<svg") || head.starts_with("<?xml") {
         return Some((bytes.to_vec(), ImageFormat::Svg, "svg"));
     }
+    raster(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn raster(bytes: &[u8]) -> Option<(Vec<u8>, ImageFormat, &'static str)> {
     let reps = NSBitmapImageRep::imageRepsWithData(&NSData::with_bytes(bytes));
     // The sharpest size up to 256 px; past that only cost.
     let best = reps
@@ -104,4 +111,15 @@ fn decode(bytes: &[u8]) -> Option<(Vec<u8>, ImageFormat, &'static str)> {
         best.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
     }?;
     Some((png.to_vec(), ImageFormat::Png, "png"))
+}
+
+/// The image crate reads PNG, ICO, JPEG, GIF and WebP; an ICO comes out
+/// as its largest picture.
+#[cfg(not(target_os = "macos"))]
+fn raster(bytes: &[u8]) -> Option<(Vec<u8>, ImageFormat, &'static str)> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let image = if image.width() > 256 { image.thumbnail(256, 256) } else { image };
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some((png.into_inner(), ImageFormat::Png, "png"))
 }

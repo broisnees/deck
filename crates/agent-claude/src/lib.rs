@@ -194,7 +194,12 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     async fn probe(&self) -> Result<Availability, AgentError> {
-        let out = Command::new(&self.bin).arg("--version").output().await;
+        let (program, first) = agent_core::exec::launcher(&self.bin.to_string_lossy());
+        let mut probe = Command::new(program);
+        probe.args(first).arg("--version");
+        #[cfg(windows)]
+        probe.creation_flags(agent_core::exec::NO_WINDOW);
+        let out = probe.output().await;
         match out {
             Ok(o) if o.status.success() => Ok(Availability::Ready {
                 version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
@@ -215,16 +220,17 @@ impl AgentAdapter for ClaudeAdapter {
         let args = self.args(&ctx, mcp_config.as_ref());
         let (program, args, dir) = agent_core::adapter::launch(&ctx, &self.bin.to_string_lossy(), &args);
 
-        let mut child = Command::new(&program)
-            .args(&args)
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
             .envs(ctx.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(AgentError::Spawn)?;
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(agent_core::exec::CREATION_FLAGS);
+        let mut child = cmd.spawn().map_err(AgentError::Spawn)?;
 
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");

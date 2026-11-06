@@ -179,7 +179,7 @@ impl ReviewPane {
                     .flex_1()
                     .min_w_0()
                     .one_line()
-                    .font_family(theme::MONO)
+                    .font_family(theme::mono())
                     .text_size(u(12.))
                     .text_color(rgb(theme::text()))
                     .child(f.path.clone()),
@@ -188,7 +188,7 @@ impl ReviewPane {
                 div()
                     .flex()
                     .gap(u(6.))
-                    .font_family(theme::MONO)
+                    .font_family(theme::mono())
                     .text_size(u(11.))
                     .when(f.added > 0, |d| {
                         d.child(div().text_color(rgb(green)).child(format!("+{}", f.added)))
@@ -207,7 +207,7 @@ impl ReviewPane {
             .flex()
             .flex_col()
             .py(u(4.))
-            .font_family(theme::MONO)
+            .font_family(theme::mono())
             .text_size(u(12.))
             .line_height(u(18.));
         if open {

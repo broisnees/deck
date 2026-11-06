@@ -4,6 +4,7 @@
 //! `deck pane list` (and friends), run from a terminal inside it, drives it.
 
 mod account;
+#[cfg_attr(not(target_os = "macos"), path = "other/adblock.rs")]
 mod adblock;
 mod browse;
 mod browser;
@@ -15,11 +16,16 @@ mod code;
 mod complete;
 mod control;
 mod daemon;
+#[cfg_attr(not(target_os = "macos"), path = "other/daemon_menu.rs")]
 mod daemon_menu;
+mod desktop;
 mod favicon;
 mod field;
 mod fuzzy;
+#[cfg_attr(not(target_os = "macos"), path = "other/global.rs")]
 mod global;
+#[cfg(target_os = "linux")]
+mod gtk_loop;
 mod handler;
 mod history;
 mod icon;
@@ -29,6 +35,7 @@ mod kbd;
 mod keys;
 mod launcher;
 mod local;
+#[cfg_attr(not(target_os = "macos"), path = "other/lock.rs")]
 mod lock;
 mod markdown;
 mod memory;
@@ -36,7 +43,9 @@ mod host_mcp;
 mod mcp;
 mod menu;
 mod net;
+#[cfg_attr(not(target_os = "macos"), path = "other/notify.rs")]
 mod notify;
+mod os;
 mod palette;
 mod pasteboard;
 mod privacy;
@@ -45,11 +54,13 @@ mod refine;
 mod remote;
 mod retry;
 mod review;
+mod secret;
 mod select;
 mod session;
 mod settings;
 mod settings_pane;
 mod shell;
+#[cfg_attr(not(target_os = "macos"), path = "other/shot.rs")]
 mod shot;
 mod snippets;
 mod syntax;
@@ -64,6 +75,10 @@ mod usage;
 mod usage_page;
 mod packages;
 mod workspace;
+#[cfg(windows)]
+mod win_console;
+#[cfg(target_os = "linux")]
+mod x11;
 
 use gpui::prelude::*;
 use gpui::{
@@ -95,6 +110,12 @@ fn log_panics() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A `deck://` link Windows opened Deck with goes to the window.
+    #[cfg(windows)]
+    let args = handler::take_launch_url(args);
+    // No console window for the app started from the Start menu (see win_console.rs).
+    #[cfg(windows)]
+    win_console::detach_if_own_console(&args);
     // Started from inside an agent's session (a relaunch an agent ran, a
     // `deck daemon` it kicked off), Deck would pass that session's markers
     // to every terminal and job it starts. It drops them first. (Not for a
@@ -122,7 +143,7 @@ fn main() {
     let cwd = std::env::current_dir()
         .ok()
         .filter(|d| d.as_os_str() != "/")
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| agent_core::dirs::home_dir())
         .unwrap_or_else(|| PathBuf::from("/"));
 
     let app = Application::new().with_assets(icon::Assets);
@@ -133,6 +154,8 @@ fn main() {
     // every shell and agent still where it was.
     app.on_reopen(|cx| cx.activate(true));
     app.run(move |cx: &mut App| {
+        #[cfg(target_os = "linux")]
+        gtk_loop::start(cx);
         theme::add_fonts(cx);
         let skill = settings::load().agent_skill;
         std::thread::spawn(move || {
@@ -172,14 +195,23 @@ fn main() {
                 // Scripted checks open a window that does not take the
                 // keyboard from whatever the user is typing in.
                 focus: !background,
+                // Wayland's app id and X11's class: what the compositor's
+                // window rules and the desktop file match on.
+                app_id: Some("deck".into()),
                 ..Default::default()
             },
             |window, cx| {
                 // Closing the window hides deck rather than quitting it, so
                 // agents at work and running commands carry on; ⌘Q quits.
+                // gpui can't hide an app off macOS, so there the window
+                // closes; terminals and jobs live on in the service.
                 window.on_window_should_close(cx, |_, cx| {
-                    cx.hide();
-                    false
+                    if cfg!(target_os = "macos") {
+                        cx.hide();
+                        false
+                    } else {
+                        true
+                    }
                 });
                 cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx))
             },
@@ -237,12 +269,17 @@ pub(crate) fn adopt_shell_path() {
 
 /// `PATH` with each folder once, first place kept. Without it every deck
 /// started from a deck terminal added its own folder again.
+/// What separates the folders in `PATH`: `;` on Windows, where `:` is
+/// part of a drive letter.
+pub const PATH_SEP: &str = if cfg!(windows) { ";" } else { ":" };
+
 pub fn tidy_path(path: &str) -> String {
     let mut seen = std::collections::HashSet::new();
-    path.split(':')
-        .filter(|p| !p.is_empty() && seen.insert(*p))
+    path.split(PATH_SEP)
+        // Windows matches folders without regard to case.
+        .filter(|p| !p.is_empty() && seen.insert(if cfg!(windows) { p.to_lowercase() } else { p.to_string() }))
         .collect::<Vec<_>>()
-        .join(":")
+        .join(PATH_SEP)
 }
 
 /// The `PATH` line from the shell's output, skipping whatever its startup
@@ -255,11 +292,12 @@ fn shell_path(out: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_path, tidy_path};
+    use super::{shell_path, tidy_path, PATH_SEP};
 
     #[test]
     fn path_keeps_each_folder_once() {
-        assert_eq!(tidy_path("/a:/b:/a::/c:/b"), "/a:/b:/c");
+        let path = |dirs: &[&str]| dirs.join(PATH_SEP);
+        assert_eq!(tidy_path(&path(&["/a", "/b", "/a", "", "/c", "/b"])), path(&["/a", "/b", "/c"]));
     }
 
     #[test]
