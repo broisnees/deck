@@ -3,6 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
+    # A version tag (v0.2.0) also publishes the Windows installer and zip
+    # as a GitHub Release, which the in-app updater reads.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -54,6 +57,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     defaults:
       run:
         shell: bash
@@ -67,6 +72,21 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - uses: Swatinem/rust-cache@v2
+      # ghostty-vt-sys downloads its pinned source through native-tls, and
+      # Windows' TLS stack rejects that server's chain. curl fetches the same
+      # tarball, checked against the crate's own GHOSTTY.lock.
+      - name: Ghostty source
+        run: |
+          cargo fetch
+          lock="$(ls "$HOME"/.cargo/registry/src/*/ghostty-vt-sys-*/GHOSTTY.lock | head -1)"
+          val() { sed -n "s/^$1 = //p" "$lock"; }
+          # Unix-style, so tar doesn't take `D:` for a remote host.
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          curl -fsSL -o "$tmp/ghostty.tar.gz" "$(val url)"
+          echo "$(val sha256)  $tmp/ghostty.tar.gz" > "$tmp/ghostty.sha256"
+          sha256sum -c "$tmp/ghostty.sha256"
+          tar xzf "$tmp/ghostty.tar.gz" -C "$tmp"
+          echo "GHOSTTY_SOURCE_DIR=$(cygpath -w "$tmp/$(val root)")" >> "$GITHUB_ENV"
       - run: cargo build --release --workspace
       - run: cargo test --release --workspace
       # deck.exe with arguments is the CLI; `--help` needs no window, no
@@ -96,3 +116,16 @@ jobs:
           path: |
             dist/Deck-*-setup.exe
             dist/Deck-*-windows-x64.zip
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          [ "$tag" = "v$VERSION" ] || { echo "tag $tag does not match version $VERSION"; exit 1; }
+          files=(dist/Deck-*-setup.exe dist/Deck-*-windows-x64.zip)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --title "Deck $VERSION" --generate-notes
+          fi
