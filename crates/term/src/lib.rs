@@ -2476,6 +2476,7 @@ mod tests {
         assert_eq!(palette().resolve(AnsiColor::Spec(rgb)), 0x123456);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_shell_command_leaves_you_at_a_live_prompt() {
         let s = Spawn::command("cargo build", Path::new("/tmp"));

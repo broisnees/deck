@@ -161,6 +161,7 @@ mod tests {
             &["init", "-q"][..],
             &["config", "user.email", "t@t"],
             &["config", "user.name", "t"],
+            &["config", "core.autocrlf", "false"],
         ] {
             git(&d, args, &[]).unwrap();
         }

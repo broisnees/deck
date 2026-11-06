@@ -292,11 +292,12 @@ fn shell_path(out: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_path, tidy_path};
+    use super::{shell_path, tidy_path, PATH_SEP};
 
     #[test]
     fn path_keeps_each_folder_once() {
-        assert_eq!(tidy_path("/a:/b:/a::/c:/b"), "/a:/b:/c");
+        let path = |dirs: &[&str]| dirs.join(PATH_SEP);
+        assert_eq!(tidy_path(&path(&["/a", "/b", "/a", "", "/c", "/b"])), path(&["/a", "/b", "/c"]));
     }
 
     #[test]

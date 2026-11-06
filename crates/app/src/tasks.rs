@@ -514,6 +514,7 @@ mod tests {
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "t@t"]);
         run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "first"]);

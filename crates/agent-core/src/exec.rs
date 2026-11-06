@@ -199,7 +199,7 @@ mod tests {
         let exe = "@ECHO off\r\nGOTO start\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.exe\"   %*\r\n";
         assert_eq!(parse_cmd_shim(exe), Some(Shim::Exe(r"node_modules\@openai\codex\bin\codex.exe".into())));
         assert_eq!(parse_cmd_shim("@echo off\r\nmytool.exe %*\r\n"), None);
-        assert_eq!(launcher("sh"), (PathBuf::from("sh"), Vec::<String>::new()));
+        assert_eq!(launcher("deck-no-such-tool"), (PathBuf::from("deck-no-such-tool"), Vec::<String>::new()));
     }
 
     #[test]
