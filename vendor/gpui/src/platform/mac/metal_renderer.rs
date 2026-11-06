@@ -100,6 +100,9 @@ pub(crate) struct MetalRenderer {
     device: metal::Device,
     layer: metal::MetalLayer,
     presents_with_transaction: bool,
+    /// The layer presents with transactions for one frame of native view
+    /// changes (`sync_next_present`); turned back off on the next.
+    synced_once: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
@@ -258,6 +261,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            synced_once: false,
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -291,6 +295,7 @@ impl MetalRenderer {
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
+        self.synced_once = false;
         self.layer
             .set_presents_with_transaction(presents_with_transaction);
     }
@@ -351,6 +356,12 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        let sync = crate::take_sync_present();
+        if !self.presents_with_transaction && sync != self.synced_once {
+            self.synced_once = sync;
+            self.layer.set_presents_with_transaction(sync);
+        }
+        let with_transaction = self.presents_with_transaction || sync;
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -385,7 +396,7 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
-                    if self.presents_with_transaction {
+                    if with_transaction {
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
                         drawable.present();

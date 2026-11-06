@@ -1936,6 +1936,8 @@ impl BrowserPane {
             && !self.covered;
         if show != self.shown {
             self.shown = show;
+            // On screen with the frame being drawn, not a refresh apart.
+            gpui::sync_next_present();
             // The host, so a docked inspector hides with its page.
             match &self.host {
                 Some(h) => h.set_hidden(!show),
@@ -2084,6 +2086,8 @@ impl BrowserPane {
             return;
         }
         self.bounds = Some(bounds);
+        // Moved in step with the pixels around it (a resize, a divider).
+        gpui::sync_next_present();
         match &self.host {
             Some(h) => h.place(bounds),
             None if !cfg!(target_os = "macos") => self.place_native(),

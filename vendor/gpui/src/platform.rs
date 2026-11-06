@@ -1860,3 +1860,21 @@ impl From<String> for ClipboardString {
         }
     }
 }
+
+/// Set while a frame is built when native views laid over the window (a
+/// web view) were shown, hidden or moved in it. The renderer then presents
+/// that frame inside the Core Animation transaction that carries those
+/// changes, so both reach the screen on the same refresh; otherwise the
+/// view changes a frame before or after the pixels around it (a flash on
+/// tab switches, a page lagging a resize). macOS only; a no-op elsewhere.
+static SYNC_NEXT_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Present the frame being built in step with native view changes.
+pub fn sync_next_present() {
+    SYNC_NEXT_PRESENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[allow(dead_code)]
+pub(crate) fn take_sync_present() -> bool {
+    SYNC_NEXT_PRESENT.swap(false, std::sync::atomic::Ordering::Relaxed)
+}

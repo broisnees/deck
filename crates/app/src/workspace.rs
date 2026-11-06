@@ -2388,9 +2388,15 @@ impl Workspace {
                 t.update(cx, |t, cx| t.seen(cx));
             }
             Some(PaneKind::Browser(b)) => {
-                b.update(cx, |b, _| b.set_visible(true));
                 window.blur();
-                b.read(cx).focus_native();
+                // Shown with the frame that draws its tab, not now: a page
+                // shown from a click lands a refresh before the toolbar
+                // and the rest of the tab, a flash over the old tab.
+                let b = b.clone();
+                window.on_next_frame(move |_, cx| {
+                    b.update(cx, |b, _| b.set_visible(true));
+                    b.read(cx).focus_native();
+                });
             }
             Some(PaneKind::Chat(c)) => {
                 window.focus(&c.read(cx).composer.read(cx).focus);
