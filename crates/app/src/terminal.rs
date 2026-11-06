@@ -649,7 +649,7 @@ impl TerminalPane {
             .term
             .shell_cwd()
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| agent_core::dirs::home_dir())
             .unwrap_or_default();
         self._complete = Some(cx.spawn(async move |this, cx| {
             let (line, at) = (text.clone(), cursor);
@@ -2868,8 +2868,21 @@ fn mouse_held() -> bool {
     objc2_app_kit::NSEvent::pressedMouseButtons() != 0
 }
 
-/// gpui has no global button state off macOS; drags end on mouse up.
-#[cfg(not(target_os = "macos"))]
+/// The primary button, wherever the pointer is.
+#[cfg(windows)]
+fn mouse_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    // SAFETY: plain queries. GetAsyncKeyState reads physical buttons, so a
+    // swapped mouse's primary is VK_RBUTTON.
+    unsafe {
+        let vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { VK_RBUTTON } else { VK_LBUTTON };
+        GetAsyncKeyState(vk.0 as i32) < 0
+    }
+}
+
+/// gpui has no global button state on Linux; drags end on mouse up.
+#[cfg(not(any(target_os = "macos", windows)))]
 fn mouse_held() -> bool {
     false
 }

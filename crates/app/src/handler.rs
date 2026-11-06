@@ -2,7 +2,8 @@
 //! `.sh`, `.tool`) and `ssh:`, `telnet:` and `x-man-page:` links, each in a
 //! new terminal tab. macOS asks Launch Services which app handles them;
 //! Settings and the first launch offer to make it deck, and to hand them
-//! back to Terminal.
+//! back to Terminal. On Windows the link Deck owns is `deck://`, which it
+//! registers for the account (see `set_default`).
 
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFRetained, CFString};
@@ -15,11 +16,13 @@ pub const BUNDLE_ID: &str = "com.broisnischal.deck";
 pub const TERMINAL_APP: &str = "com.apple.Terminal";
 
 /// The file types a terminal opens, by uniform type identifier.
+#[cfg_attr(windows, allow(dead_code))]
 const TYPES: [&str; 3] = [
     "com.apple.terminal.shell-script",
     "public.shell-script",
     "public.unix-executable",
 ];
+#[cfg_attr(windows, allow(dead_code))]
 const SCHEMES: [&str; 3] = ["ssh", "telnet", "x-man-page"];
 
 /// Every role (viewer, editor, shell).
@@ -78,17 +81,122 @@ pub fn set_default(bundle_id: &str) -> usize {
     failed
 }
 
-/// Off macOS, being the default terminal belongs to the desktop file
+/// On Linux, being the default terminal belongs to the desktop file
 /// (`deck.desktop` with `x-scheme-handler/ssh` and friends), which the
 /// Linux packages install; there is nothing to switch here yet.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn is_default() -> bool {
     false
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn set_default(_bundle_id: &str) -> usize {
     TYPES.len() + SCHEMES.len()
+}
+
+/// Where Windows looks up who opens `deck://` for this account.
+#[cfg(windows)]
+const DECK_KEY: &str = r"Software\Classes\deck";
+
+/// The command Windows runs for a `deck://` link: this executable with the
+/// link as its one argument.
+#[cfg(windows)]
+fn open_command() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(format!("\"{}\" \"%1\"", exe.display()))
+}
+
+/// Whether `deck://` links open in this copy of Deck.
+#[cfg(windows)]
+pub fn is_default() -> bool {
+    let (Some(want), Some(have)) = (open_command(), reg::read(&format!(r"{DECK_KEY}\shell\open\command"))) else {
+        return false;
+    };
+    have.eq_ignore_ascii_case(&want)
+}
+
+/// Register this executable for `deck://` (sign-in callbacks, job links)
+/// under the account's classes, or, handed to anything else, take that
+/// registration back if it is this copy's. Returns how many writes failed.
+#[cfg(windows)]
+pub fn set_default(bundle_id: &str) -> usize {
+    let Some(command) = open_command() else { return 1 };
+    if bundle_id != BUNDLE_ID {
+        return usize::from(is_default() && !reg::delete(DECK_KEY));
+    }
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    [
+        (DECK_KEY.to_string(), "", "URL:Deck"),
+        (DECK_KEY.to_string(), "URL Protocol", ""),
+        (format!(r"{DECK_KEY}\DefaultIcon"), "", format!("\"{exe}\",0").as_str()),
+        (format!(r"{DECK_KEY}\shell\open\command"), "", command.as_str()),
+    ]
+    .iter()
+    .filter(|(key, name, value)| !reg::write(key, name, value))
+    .count()
+}
+
+/// String values under HKEY_CURRENT_USER.
+#[cfg(windows)]
+mod reg {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, REG_OPTION_NON_VOLATILE, REG_SZ, KEY_WRITE, RRF_RT_REG_SZ,
+    };
+
+    /// The default value of `key`.
+    pub fn read(key: &str) -> Option<String> {
+        let key = HSTRING::from(key);
+        let mut buf = [0u16; 1024];
+        let mut len = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: `buf` holds `len` bytes; the value comes back NUL-terminated.
+        let rc = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, &key, PCWSTR::null(), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr().cast()), Some(&mut len))
+        };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let n = (len as usize / 2).min(buf.len());
+        let s = String::from_utf16_lossy(&buf[..n]);
+        Some(s.trim_end_matches('\0').to_string())
+    }
+
+    /// Set `name` (empty: the default value) of `key` to `value`, making
+    /// the key as needed.
+    pub fn write(key: &str, name: &str, value: &str) -> bool {
+        let mut hkey = HKEY::default();
+        let data: Vec<u8> = value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        // SAFETY: a key opened and closed here; `data` outlives the call.
+        unsafe {
+            let made = RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                &HSTRING::from(key),
+                None,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                None,
+                &mut hkey,
+                None,
+            );
+            if made != ERROR_SUCCESS {
+                return false;
+            }
+            let name = HSTRING::from(name);
+            let name = if name.is_empty() { PCWSTR::null() } else { PCWSTR(name.as_ptr()) };
+            let ok = RegSetValueExW(hkey, name, None, REG_SZ, Some(&data)) == ERROR_SUCCESS;
+            let _ = RegCloseKey(hkey);
+            ok
+        }
+    }
+
+    /// Remove `key` and all below it.
+    pub fn delete(key: &str) -> bool {
+        // SAFETY: a plain registry call.
+        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(key)) == ERROR_SUCCESS }
+    }
 }
 
 // -- opened files and links ---------------------------------------------------------
@@ -104,6 +212,25 @@ static OPENED: LazyLock<Queue> = LazyLock::new(|| {
     let (tx, rx) = futures::channel::mpsc::unbounded();
     (tx, Mutex::new(Some(rx)))
 });
+
+/// A `deck://` link Windows launched Deck with (see `set_default`): it
+/// goes to a Deck window already open, else to the queue the window reads,
+/// as macOS hands one over, and the app starts as if run plainly. Anything else stays for the command line.
+#[cfg(windows)]
+pub fn take_launch_url(args: Vec<String>) -> Vec<String> {
+    match args.as_slice() {
+        [url] if url.starts_with("deck://") => {
+            // Deck is already open: the link goes to its window, and this
+            // copy ends.
+            if crate::control::call("app.open_url", serde_json::json!({ "url": url })).is_ok() {
+                std::process::exit(0);
+            }
+            opened(args);
+            Vec::new()
+        }
+        _ => args,
+    }
+}
 
 /// AppKit's `application:openURLs:`.
 pub fn opened(urls: Vec<String>) {

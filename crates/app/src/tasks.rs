@@ -84,6 +84,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 fn git_env(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String, String> {
     let mut cmd = Command::new("git");
+    crate::os::no_window(&mut cmd);
     cmd.arg("-C").arg(dir).args(args);
     // Polling never takes the index lock from under a commit you are making.
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
@@ -245,7 +246,7 @@ pub fn diff(task: &Task) -> Result<String, String> {
 /// Commit whatever the agent left uncommitted, so the branch holds it all.
 fn commit_all(task: &Task) -> Result<(), String> {
     git(&task.worktree, &["add", "-A"])?;
-    let staged = Command::new("git")
+    let staged = crate::os::no_window(&mut Command::new("git"))
         .arg("-C")
         .arg(&task.worktree)
         .args(["diff", "--cached", "--quiet"])
@@ -271,7 +272,7 @@ pub fn merge(task: &Task) -> Result<(), String> {
         ));
     }
     git(&task.repo, &["merge", "--squash", &task.branch])?;
-    let staged = Command::new("git")
+    let staged = crate::os::no_window(&mut Command::new("git"))
         .arg("-C")
         .arg(&task.repo)
         .args(["diff", "--cached", "--quiet"])
@@ -304,7 +305,7 @@ fn remove(task: &Task) -> Result<(), String> {
 pub fn open_pr(task: &Task) -> Result<String, String> {
     commit_all(task)?;
     git(&task.worktree, &["push", "-u", "origin", &task.branch])?;
-    let out = Command::new("gh")
+    let out = crate::os::no_window(&mut Command::new("gh"))
         .current_dir(&task.worktree)
         .args([
             "pr",

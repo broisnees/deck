@@ -1,11 +1,12 @@
 // Transport to Deck. Every op is a POST of JSON to /api/<op> on the page's own
-// origin; a non-2xx reply carries {"error": "..."}. Outside of deckcode:// the
-// in-memory mock answers instead.
+// origin; a non-2xx reply carries {"error": "..."}. Outside of deckcode:// (on
+// Windows WebView2 serves it as http://deckcode.localhost/) the in-memory mock
+// answers instead.
 
 import { createMock } from "./mock.js";
 
 export const params = new URLSearchParams(location.search);
-export const isMock = location.protocol !== "deckcode:";
+export const isMock = location.protocol !== "deckcode:" && location.hostname !== "deckcode.localhost";
 const mock = isMock ? createMock(params) : null;
 
 export class ApiError extends Error {}

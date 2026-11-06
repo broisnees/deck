@@ -35,6 +35,14 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 
 #[cfg_attr(not(target_os = "macos"), path = "other/popup.rs")]
 mod popup;
+#[cfg(windows)]
+mod win;
+
+/// Any open page on Windows, whose profile every page shares.
+#[cfg(windows)]
+pub fn any_page() -> Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2> {
+    win::any_page()
+}
 
 pub enum BrowserEvent {
     /// The page has the keyboard now.
@@ -76,6 +84,9 @@ pub enum Msg {
     /// The recorder's `{deck: "log", entries}`: console lines, errors and
     /// requests, each a flat object.
     Log(Vec<Value>),
+    /// The page is waiting on an `alert`, `confirm` or `prompt`.
+    #[cfg(windows)]
+    Dialog,
 }
 
 /// Safari's own, so sites serve their current code instead of the fallback
@@ -973,8 +984,21 @@ pub struct BrowserPane {
     _icon: Option<Task<()>>,
     _remote: Option<Task<()>>,
     _download: Option<Task<()>>,
+    /// The page's `alert`, `confirm` or `prompt`, shown above it while it
+    /// waits (WebView2 would draw its own, out of an agent's reach).
+    #[cfg(windows)]
+    dialog: Option<PageDialog>,
     _events: Task<()>,
     _subs: [Subscription; 2],
+}
+
+/// A page's dialog in the bar above it, with a prompt's field.
+#[cfg(windows)]
+struct PageDialog {
+    kind: &'static str,
+    text: String,
+    field: Option<Entity<Field>>,
+    _sub: Option<Subscription>,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserPane {}
@@ -996,8 +1020,12 @@ impl BrowserPane {
             normalize_url(url)
         };
         let is_editor = editor.is_some();
+        #[cfg(windows)]
+        win::check_runtime()?;
         let code: crate::code::Shared = std::sync::Arc::new(std::sync::Mutex::new(editor));
         let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();
+        #[cfg(windows)]
+        let tx_dialog = tx.clone();
         let (tx_title, tx_load, tx_ipc, tx_new, tx_dl, tx_done, tx_nav) = (
             tx.clone(),
             tx.clone(),
@@ -1008,14 +1036,21 @@ impl BrowserPane {
             tx,
         );
 
-        let mut builder = wry::WebViewBuilder::new()
-            .with_url(&url)
+        // WebView2 keeps its profile beside the executable unless told.
+        #[cfg(windows)]
+        let mut context = wry::WebContext::new(Some(win::data_dir()));
+        #[cfg(windows)]
+        let builder = wry::WebViewBuilder::new_with_web_context(&mut context);
+        #[cfg(not(windows))]
+        let builder = wry::WebViewBuilder::new();
+        let mut builder = builder
+            .with_url(engine_uri(&url))
             .with_bounds(rect(Bounds::default()))
-            // Hidden until it has painted, on macOS. A WebKitGTK page made
-            // hidden stays a 1x1 window after it is shown (wry's own note),
-            // so on Linux it starts shown, at no size until it is laid out.
-            .with_visible(!cfg!(target_os = "macos"))
-            .with_user_agent(USER_AGENT)
+            // Hidden until it has painted, on macOS and Windows. A
+            // WebKitGTK page made hidden stays a 1x1 window after it is
+            // shown (wry's own note), so on Linux it starts shown, at no
+            // size until it is laid out.
+            .with_visible(cfg!(target_os = "linux"))
             // Right-click › Inspect Element, and Safari's Develop menu.
             .with_devtools(true)
             .with_back_forward_navigation_gestures(true)
@@ -1025,6 +1060,10 @@ impl BrowserPane {
             .with_permission_handler(|_| wry::PermissionResponse::Default)
             .with_initialization_script(PAGE_SCRIPT)
             .with_initialization_script(&key_script());
+        // Safari's name suits WebKit; WebView2 is Chromium and keeps Edge's.
+        if !cfg!(windows) {
+            builder = builder.with_user_agent(USER_AGENT);
+        }
         // The editor is Deck's own page; agents read the pages they test.
         if !is_editor {
             builder = builder.with_initialization_script(RECORDER_SCRIPT);
@@ -1037,6 +1076,7 @@ impl BrowserPane {
             // The editor stays the editor: a link it shows opens in a tab of
             // its own. No other page may load the editor's scheme.
             .with_navigation_handler(move |to| {
+                let to = editor_uri(to);
                 let to_editor = crate::code::is_editor_url(&to);
                 if is_editor && !to_editor && !to.starts_with("about:") {
                     let _ = tx_nav.unbounded_send(Msg::NewWindow(to));
@@ -1069,6 +1109,15 @@ impl BrowserPane {
         add_page_dialogs(&webview);
         #[cfg(target_os = "linux")]
         crate::gtk_loop::PAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(windows)]
+        {
+            use wry::WebViewExtWindows;
+            win::attach(&webview, !is_blank(&url), move || {
+                let _ = tx_dialog.unbounded_send(Msg::Dialog);
+            })?;
+            win::set_dark(&webview, theme::is_dark());
+            crate::browser_import::install_waiting(&webview.webview());
+        }
         #[cfg(target_os = "macos")]
         {
             use wry::WebViewExtMacOS;
@@ -1137,7 +1186,7 @@ impl BrowserPane {
             tab_visible: true,
             revealed: false,
             // As made (see `build`): `sync_visibility` hides it from here.
-            shown: !cfg!(target_os = "macos"),
+            shown: cfg!(target_os = "linux"),
             covered: false,
             cover_shot: None,
             favicon: None,
@@ -1159,6 +1208,8 @@ impl BrowserPane {
             _icon: None,
             _remote: None,
             _download: None,
+            #[cfg(windows)]
+            dialog: None,
             _events: events,
             _subs: [typing, blur],
         };
@@ -1217,6 +1268,9 @@ impl BrowserPane {
 
     /// Hand the editor the current theme and font after a change.
     pub fn editor_restyle(&self) {
+        // On Windows every page wears the theme's scheme (macOS: the app's).
+        #[cfg(windows)]
+        win::set_dark(&self.webview, theme::is_dark());
         if !self.is_editor() {
             return;
         }
@@ -1267,19 +1321,139 @@ impl BrowserPane {
         out
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn webview_ptr(&self) -> usize {
         std::ptr::from_ref(&self.webview) as usize
     }
 
-    /// Off macOS the engine draws a page's dialogs itself, where an agent
+    #[cfg(windows)]
+    fn webview_ptr(&self) -> usize {
+        win::key(&self.webview)
+    }
+
+    /// The dialog this page waits on: its kind and text.
+    #[cfg(windows)]
+    pub fn pending_dialog(&self) -> Option<(&'static str, String)> {
+        win::pending(self.webview_ptr()).map(|(kind, text, _)| (kind, text))
+    }
+
+    /// Answer the page's dialog for an agent: OK or Cancel, with a
+    /// prompt's text first in `values`.
+    #[cfg(windows)]
+    pub fn answer_dialog(&self, accept: bool, values: &[String]) -> Result<Value, String> {
+        let (kind, text) = win::answer(self.webview_ptr(), accept, values.first().map(String::as_str))
+            .ok_or("no dialog is open on this page")?;
+        // The bar goes with the next render (see `on_msg`).
+        let ok = accept || kind == "alert";
+        Ok(serde_json::json!({ "dialog": kind, "text": text, "answer": if ok { "ok" } else { "cancel" } }))
+    }
+
+    /// Show the page's waiting dialog in the bar, or take the bar down once
+    /// it has been answered.
+    #[cfg(windows)]
+    fn sync_dialog(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let pending = win::pending(self.webview_ptr());
+        let same = match (&pending, &self.dialog) {
+            (Some((kind, text, _)), Some(d)) => *kind == d.kind && *text == d.text,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.dialog = pending.map(|(kind, text, default)| {
+            let (field, sub) = if kind == "prompt" {
+                let field = cx.new(|cx| {
+                    let mut f = Field::new("", cx);
+                    f.set_text(&default, cx);
+                    f
+                });
+                let sub = cx.subscribe(&field, |p, _, ev: &FieldEvent, cx| match ev {
+                    FieldEvent::Submit(_) => p.answer_bar(true, cx),
+                    FieldEvent::Cancel => p.answer_bar(false, cx),
+                    _ => {}
+                });
+                (Some(field), Some(sub))
+            } else {
+                (None, None)
+            };
+            PageDialog { kind, text, field, _sub: sub }
+        });
+        if let (Some(window), Some(field)) = (window, self.dialog.as_ref().and_then(|d| d.field.clone())) {
+            window.focus(&field.read(cx).focus);
+            reclaim_keyboard(window);
+        }
+        cx.notify();
+    }
+
+    /// The bar's OK or Cancel.
+    #[cfg(windows)]
+    fn answer_bar(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let value = self
+            .dialog
+            .as_ref()
+            .and_then(|d| d.field.as_ref())
+            .map(|f| f.read(cx).text().to_string());
+        win::answer(self.webview_ptr(), accept, value.as_deref());
+        self.dialog = None;
+        // The next one, if the page asked again meanwhile.
+        self.sync_dialog(None, cx);
+        cx.notify();
+    }
+
+    #[cfg(windows)]
+    fn render_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let d = self.dialog.as_ref()?;
+        let button = |id: &'static str, label: &'static str, primary: bool, accept: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(u(28.))
+                .px(u(12.))
+                .rounded(u(6.))
+                .cursor_pointer()
+                .when(primary, |b| b.bg(rgb(theme::text())).text_color(rgb(theme::pane())).hover(|s| s.opacity(0.88)))
+                .when(!primary, |b| b.text_color(rgb(theme::text_2())).hover(|s| s.bg(rgb(theme::row_hover()))))
+                .child(label)
+                .on_click(cx.listener(move |p, _, _, cx| p.answer_bar(accept, cx)))
+        };
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(10.))
+                .min_h(u(40.))
+                .px(u(14.))
+                .py(u(6.))
+                .border_t_1()
+                .border_color(rgba(theme::hairline()))
+                .bg(rgba(theme::tint()))
+                .text_size(u(theme::TEXT_UI))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(rgb(theme::text()))
+                        .child(d.text.clone()),
+                )
+                .children(d.field.clone().map(|f| div().w(u(220.)).flex_none().child(f)))
+                .when(d.kind != "alert", |bar| bar.child(button("dialog-cancel", "Cancel", false, false)))
+                .child(button("dialog-ok", "OK", true, true))
+                .into_any_element(),
+        )
+    }
+
+    /// On Linux the engine draws a page's dialogs itself, where an agent
     /// can't reach them yet.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub fn pending_dialog(&self) -> Option<(&'static str, String)> {
         None
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub fn answer_dialog(&self, _accept: bool, _values: &[String]) -> Result<Value, String> {
         Err("answering page dialogs is not supported on this platform yet".into())
     }
@@ -1350,6 +1524,8 @@ impl BrowserPane {
         };
         match msg {
             Msg::Log(_) => {}
+            #[cfg(windows)]
+            Msg::Dialog => self.sync_dialog(None, cx),
             Msg::Title(t) => {
                 history::set_title(&self.url, &t);
                 self.title = t.into();
@@ -1379,7 +1555,7 @@ impl BrowserPane {
                 }
             }
             Msg::Moved => {
-                if let Ok(u) = self.webview.url() {
+                if let Ok(u) = self.webview.url().map(editor_uri) {
                     if u != self.url.as_ref() && !is_blank(&u) {
                         self.set_url(&u, cx);
                         history::record(&u, "");
@@ -1477,7 +1653,7 @@ impl BrowserPane {
 
     pub fn navigate(&mut self, input: &str, cx: &mut Context<Self>) -> anyhow::Result<()> {
         let url = normalize_url(input);
-        self.webview.load_url(&url)?;
+        self.webview.load_url(&engine_uri(&url))?;
         self.set_url(&url, cx);
         self.loading = true;
         self.progress = 0.;
@@ -1553,9 +1729,15 @@ impl BrowserPane {
         unsafe { (wk.isLoading(), wk.estimatedProgress() as f32) }
     }
 
-    /// wry has no load progress off macOS: a page counts as loaded once
+    /// From WebView2's navigation events (see `win::attach`).
+    #[cfg(windows)]
+    fn load_state(&self) -> (bool, f32) {
+        win::load_state(self.webview_ptr())
+    }
+
+    /// wry has no load progress on Linux: a page counts as loaded once
     /// it has finished (the `Load` message clears `loading`).
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn load_state(&self) -> (bool, f32) {
         (false, 1.)
     }
@@ -1943,7 +2125,13 @@ impl BrowserPane {
                 Some(h) => h.set_hidden(!show),
                 // A WebKitGTK page hidden through GTK comes back a 1x1
                 // window, so on Linux it is parked off the window instead.
-                None if !cfg!(target_os = "macos") => self.place_native(),
+                None if cfg!(target_os = "linux") => self.place_native(),
+                // WebView2 hides cleanly, and stops painting while hidden;
+                // placed first, so it shows where the pane is now.
+                None if cfg!(windows) => {
+                    self.place_native();
+                    let _ = self.webview.set_visible(show);
+                }
                 None => {
                     let _ = self.webview.set_visible(show);
                 }
@@ -1967,8 +2155,10 @@ impl BrowserPane {
         }
         #[cfg(target_os = "macos")]
         let rx = { use wry::WebViewExtMacOS; snapshot(&self.webview.webview()) };
-        // No picture of the page off macOS: it hides with nothing in its place.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        let rx = win::snapshot(&self.webview);
+        // No picture of the page on Linux: it hides with nothing in its place.
+        #[cfg(target_os = "linux")]
         let rx = futures::channel::oneshot::channel::<Option<Vec<u8>>>().1;
         cx.spawn(async move |this, cx| {
             let shot = rx.await.ok().flatten();
@@ -2006,7 +2196,9 @@ impl BrowserPane {
                 // SAFETY: main thread, a live view.
                 unsafe { self.webview.webview().stopLoading() };
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(windows)]
+            win::stop(self.webview_ptr());
+            #[cfg(target_os = "linux")]
             let _ = self.webview.evaluate_script("window.stop()");
             self.loading = false;
         } else if !self.is_blank() {
@@ -2120,6 +2312,10 @@ impl BrowserPane {
         #[cfg(target_os = "linux")]
         if self.shown {
             crate::x11::round_page(&self.webview, (theme::CARD_RADIUS - 1.) as u32, self.is_editor());
+        }
+        #[cfg(windows)]
+        if self.shown {
+            win::round(&self.webview, f32::from(b.size.width), theme::CARD_RADIUS - 1., self.is_editor());
         }
     }
 
@@ -2636,6 +2832,10 @@ impl Render for BrowserPane {
         }
         let toolbar = self.render_toolbar(window, cx);
         let find = self.render_find(cx);
+        #[cfg(windows)]
+        let dialog = self.render_dialog(cx);
+        #[cfg(not(windows))]
+        let dialog: Option<AnyElement> = None;
         let body = if self.suggest.is_some() {
             self.render_suggest(cx).into_any_element()
         } else if self.is_blank() {
@@ -2721,6 +2921,7 @@ impl Render for BrowserPane {
             // header border sat right under ours, two edges in a row.
             .child(div().flex_none().bg(rgba(theme::alpha(theme::text(), 0x05))).child(toolbar))
             .children(offer)
+            .children(dialog)
             .children(find)
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
@@ -3167,6 +3368,8 @@ impl Drop for BrowserPane {
             self.webview.close_devtools();
         }
         popup::close_all(self.webview_ptr());
+        #[cfg(windows)]
+        win::forget(self.webview_ptr());
     }
 }
 
@@ -3210,6 +3413,31 @@ impl Host {
 
 #[cfg(not(target_os = "macos"))]
 fn add_page_dialogs(_webview: &wry::WebView) {}
+
+/// The address to hand the engine: on Windows the editor's
+/// `deckcode://localhost/` is served as `http://deckcode.localhost/`.
+fn engine_uri(url: &str) -> String {
+    let prefix = format!("{}://localhost/", crate::code::SCHEME);
+    match url.strip_prefix(&prefix) {
+        Some(rest) if cfg!(windows) => format!("http://{}.localhost/{rest}", crate::code::SCHEME),
+        _ => url.to_string(),
+    }
+}
+
+/// The editor's address as wry reports it on Windows, where a custom
+/// scheme is served as `http://deckcode.localhost/`, put back as
+/// `deckcode://localhost/`; any other address as it is.
+fn editor_uri(to: String) -> String {
+    if cfg!(windows) {
+        for http in ["http", "https"] {
+            let prefix = format!("{http}://{}.localhost/", crate::code::SCHEME);
+            if let Some(rest) = to.strip_prefix(&prefix) {
+                return format!("{}://localhost/{rest}", crate::code::SCHEME);
+            }
+        }
+    }
+    to
+}
 
 /// At least a point each way: X11 refuses to make a window of no size,
 /// and a page starts out at empty bounds until it is laid out.
@@ -3349,7 +3577,14 @@ pub fn reclaim_keyboard(window: &Window) {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// A page is a child window holding the focus once clicked; Deck's own
+/// window takes it back.
+#[cfg(windows)]
+pub fn reclaim_keyboard(window: &Window) {
+    win::reclaim_keyboard(window);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn reclaim_keyboard(_window: &Window) {}
 
 #[cfg(target_os = "macos")]

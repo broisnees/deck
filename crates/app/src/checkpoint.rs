@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 
 fn git(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String, String> {
     let mut cmd = Command::new("git");
+    crate::os::no_window(&mut cmd);
     cmd.args(args)
         .current_dir(dir)
         .stdin(Stdio::null())

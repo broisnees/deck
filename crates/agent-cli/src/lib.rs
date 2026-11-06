@@ -127,11 +127,12 @@ impl AgentAdapter for CliAdapter {
         let listing = self.refresh_models();
         // `--version` is the cheapest liveness check that does not hit the
         // network or consume credits.
-        let version = Command::new(self.spec.bin)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .await;
+        let (program, first) = agent_core::exec::launcher(self.spec.bin);
+        let mut probe = Command::new(program);
+        probe.args(first).arg("--version").stdin(Stdio::null());
+        #[cfg(windows)]
+        probe.creation_flags(agent_core::exec::NO_WINDOW);
+        let version = probe.output().await;
         if let (Some(rx), Ok(_)) = (listing, &version) {
             let _ = tokio::time::timeout(PROBE_MODELS_WAIT, rx).await;
         }
@@ -315,6 +316,8 @@ pub(crate) fn spawn_turn(
     // relaunches itself under a second node process; tools run in shells).
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    cmd.creation_flags(agent_core::exec::CREATION_FLAGS);
     let mut child = cmd.spawn().map_err(AgentError::Spawn)?;
     tracing::debug!(bin = spec.bin, ?args, "agent turn started");
 
@@ -444,6 +447,13 @@ pub(crate) fn kill_tree(child: &mut Child) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
+    }
+    // No groups to signal: `taskkill /T` finds the tree from the parent's
+    // pid, so the parent is left for it rather than killed here first.
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        agent_core::exec::kill_tree(pid);
+        return;
     }
     let _ = child.start_kill();
 }

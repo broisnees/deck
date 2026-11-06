@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg_attr(windows, allow(dead_code))]
 const ZSHENV: &str = r#"# Deck's shell integration. Your own ZDOTDIR comes back first, so your
 # .zprofile, .zshrc and the rest load from where they always do.
 if [[ -n "${DECK_ZDOTDIR+x}" ]]; then
@@ -26,6 +27,7 @@ if [[ -o interactive && -z "${DECK_NO_INTEGRATION-}" ]]; then
 fi
 "#;
 
+#[cfg_attr(windows, allow(dead_code))]
 const DECK_ZSH: &str = r##"# Marks each prompt and command for Deck (OSC 133, 633;E) and reports the
 # folder (OSC 7), so Deck can show every command as a block.
 [[ -n "${_deck_marks-}" ]] && return
@@ -161,12 +163,87 @@ precmd_functions=(_deck_precmd ${precmd_functions[@]:#_deck_precmd})
 preexec_functions=(${preexec_functions[@]:#_deck_preexec} _deck_preexec)
 "##;
 
+/// The same marks from PowerShell (5.1 and 7): a `prompt` wrapped around
+/// yours for OSC 133 A/B/D and OSC 7, and PSReadLine's Enter for 633;E,
+/// 133;C and "# ..." requests. Loaded with `-NoExit -Command . '<this>'`, so
+/// your profile has already run and set the prompt this wraps.
+const DECK_PS1: &str = r##"# Deck's shell integration for PowerShell. Marks each prompt and command
+# (OSC 133, 633;E) and reports the folder (OSC 7).
+if ($global:__DeckMarks) { return }
+$global:__DeckMarks = $true
+$global:__DeckRan = $false
+try {
+  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  $global:OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
+
+if ($env:DECK_RESTORE -and (Test-Path -LiteralPath $env:DECK_RESTORE)) {
+  [Console]::Write((Get-Content -Raw -LiteralPath $env:DECK_RESTORE))
+  Remove-Item -LiteralPath $env:DECK_RESTORE -ErrorAction SilentlyContinue
+}
+Remove-Item Env:DECK_RESTORE -ErrorAction SilentlyContinue
+
+$global:__DeckPrompt = $function:prompt
+function global:prompt {
+  $ok = $global:?
+  $code = $global:LASTEXITCODE
+  $e = [char]27; $a = [char]7
+  $out = ''
+  if ($global:__DeckRan) {
+    $status = if ($ok) { 0 } elseif ($code) { $code } else { 1 }
+    $out += "$e]133;D;$status$a"
+    $global:__DeckRan = $false
+  }
+  $loc = $executionContext.SessionState.Path.CurrentLocation
+  if ($loc.Provider.Name -eq 'FileSystem') {
+    $p = $loc.ProviderPath -replace '\\', '/'
+    if (-not $p.StartsWith('/')) { $p = '/' + $p }
+    $p = $p -replace '%', '%25' -replace ' ', '%20'
+    $out += "$e]7;file://$env:COMPUTERNAME$p$a"
+  }
+  $out += "$e]133;A$a"
+  $inner = if ($global:__DeckPrompt) { & $global:__DeckPrompt } else { "PS $loc> " }
+  $global:LASTEXITCODE = $code
+  "$out$inner$e]133;B$a"
+}
+
+if (Get-Module PSReadLine) {
+  Set-PSReadLineKeyHandler -Chord Enter -ScriptBlock {
+    $line = $null; $cursor = $null
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+    $e = [char]27; $a = [char]7
+    if ($line.StartsWith('# ') -and -not $env:DECK_NO_INTEGRATION) {
+      $ask = ($line.Substring(2) -replace "[$e$a]", '') -replace "`r?`n", ' '
+      [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($line)
+      [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+      [Console]::Write("$e]6973;ask;$ask$a")
+      return
+    }
+    if ($line.Trim()) {
+      $cmd = (($line -replace '\\', '\\') -replace "[$e$a`r]", '') -replace "`n", '\x0a'
+      if ($cmd.Length -gt 4000) { $cmd = $cmd.Substring(0, 4000) }
+      [Console]::Write("$e]633;E;$cmd$a$e]133;C$a")
+      $global:__DeckRan = $true
+    }
+    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+  }
+}
+"##;
+
+/// cmd.exe's share of the marks, through its `PROMPT`: the folder (OSC 7,
+/// as `C:\path`) and the prompt's start and end. cmd says nothing of a
+/// command's exit status, so a block ends without one.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CMD_PROMPT: &str = "$E]133;D$E\\$E]7;file:///$P$E\\$E]133;A$E\\$P$G$E]133;B$E\\";
+
 /// Where the integration's files live: beside Deck's other data.
+#[cfg_attr(windows, allow(dead_code))]
 fn dir() -> PathBuf {
     crate::control::socket_dir().join("shell").join("zsh")
 }
 
 /// Write the files if they are missing or from another version.
+#[cfg_attr(windows, allow(dead_code))]
 fn install() -> std::io::Result<PathBuf> {
     let dir = dir();
     std::fs::create_dir_all(&dir)?;
@@ -179,8 +256,75 @@ fn install() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Write the PowerShell script if it is missing or from another version.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn install_ps1() -> std::io::Result<PathBuf> {
+    let dir = crate::control::socket_dir().join("shell").join("powershell");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("deck.ps1");
+    // A BOM, so Windows PowerShell 5.1 reads the file as UTF-8.
+    let text = format!("\u{feff}{DECK_PS1}");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        std::fs::write(&path, text)?;
+    }
+    Ok(path)
+}
+
+/// On Windows: the integration's script for PowerShell (`term` passes it
+/// to the shell it picks), cmd's marked `PROMPT`, and `PATH` with Deck's
+/// own folder first so `deck` works inside the pane.
+#[cfg(windows)]
+pub fn env() -> HashMap<String, String> {
+    use std::sync::OnceLock;
+    static SCRIPT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let mut env = HashMap::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let mut dirs = vec![dir.to_path_buf()];
+            if let Some(path) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&path).filter(|d| d != dir));
+            }
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                env.insert("PATH".into(), joined.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // The shell to run, when chosen: `"shell"` in settings.json (`pwsh`,
+    // `powershell`, `cmd`, `wsl` or a path), else `DECK_SHELL` as set.
+    let chosen = std::fs::read(crate::settings::path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("shell")?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(windows_program));
+    if let Some(shell) = chosen {
+        env.insert("DECK_SHELL".into(), shell);
+    }
+    if std::env::var_os("DECK_NO_INTEGRATION").is_some() {
+        return env;
+    }
+    if let Some(script) = SCRIPT
+        .get_or_init(|| install_ps1().map_err(|e| tracing::warn!("shell integration: {e}")).ok())
+        .clone()
+    {
+        env.insert("DECK_PWSH_INTEGRATION".into(), script.display().to_string());
+    }
+    if std::env::var_os("PROMPT").is_none() {
+        env.insert("PROMPT".into(), CMD_PROMPT.into());
+    }
+    env
+}
+
+/// A shell setting as a program: the short names get `.exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_program(choice: &str) -> String {
+    match choice.to_ascii_lowercase().as_str() {
+        "pwsh" | "powershell" | "cmd" | "wsl" | "bash" => format!("{choice}.exe"),
+        _ => choice.to_string(),
+    }
+}
+
 /// The environment that loads the integration into a terminal's shell:
 /// nothing for a shell other than zsh, or when it cannot be installed.
+#[cfg(not(windows))]
 pub fn env() -> HashMap<String, String> {
     use std::sync::OnceLock;
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -404,7 +548,7 @@ fn skill_dirs(home: &Path) -> Vec<PathBuf> {
 /// highlighting. Gemini CLI's "ANSI" / "ANSI Light", OpenCode's "system". Only that one key of each file changes;
 /// agents not installed are left alone. Codex has no theme setting.
 pub fn match_agent_themes(dark: bool) {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(home) = agent_core::dirs::home_dir() else { return };
     let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
     if claude.is_dir() {
         set_json_key(&claude.join("settings.json"), &["theme"], "auto");
@@ -474,7 +618,7 @@ mod theme_tests {
 /// Put Deck's skill in every agent's skills folder (`on`), or take Deck's
 /// copies out again. A copy without the marker is the user's and is kept.
 pub fn install_skill(on: bool) {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = agent_core::dirs::home_dir() {
         place_skill(&skill_dirs(&home), on);
     }
 }
@@ -507,7 +651,16 @@ fn place_skill(dirs: &[PathBuf], on: bool) {
 /// most `limit` distinct commands. zsh writes non-ASCII "metafied" (0x83,
 /// then the byte xor 32) and ends a line that continues with `\`.
 pub fn zsh_history(limit: usize) -> Vec<(String, Option<i64>)> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    // Windows' shell is PowerShell: PSReadLine's history, one command a
+    // line (a trailing backtick continues it), without times.
+    #[cfg(windows)]
+    if let Some(file) = std::env::var_os("APPDATA").map(|d| {
+        PathBuf::from(d).join(r"Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt")
+    }) {
+        let Ok(raw) = std::fs::read(file) else { return Vec::new() };
+        return parse_psreadline_history(&String::from_utf8_lossy(&raw), limit);
+    }
+    let home = agent_core::dirs::home_dir().unwrap_or_default();
     let file = std::env::var_os("HISTFILE")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("DECK_ZDOTDIR").map(|d| PathBuf::from(d).join(".zsh_history")))
@@ -517,6 +670,32 @@ pub fn zsh_history(limit: usize) -> Vec<(String, Option<i64>)> {
         return Vec::new();
     };
     parse_zsh_history(&raw, limit)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_psreadline_history(text: &str, limit: usize) -> Vec<(String, Option<i64>)> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in text.lines() {
+        if let Some(cont) = line.strip_suffix('`') {
+            pending.push_str(cont);
+            pending.push('\n');
+            continue;
+        }
+        pending.push_str(line);
+        let entry = std::mem::take(&mut pending);
+        if !entry.trim().is_empty() {
+            entries.push(entry);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .rev()
+        .filter(|c| seen.insert(c.clone()))
+        .take(limit)
+        .map(|c| (c, None))
+        .collect()
 }
 
 fn parse_zsh_history(raw: &[u8], limit: usize) -> Vec<(String, Option<i64>)> {
@@ -594,6 +773,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&agents).unwrap(), "mine");
         assert!(!grok.exists() && !home.join(".grok/skills/deck").exists());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn psreadline_history_reads_newest_first() {
+        let h = parse_psreadline_history("ls\r\ngit status\r\nGet-Item `\r\n  x\r\nls\r\n", 10);
+        let cmds: Vec<&str> = h.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(cmds, ["ls", "Get-Item \n  x", "git status"]);
+    }
+
+    #[test]
+    fn powershell_script_marks_like_zsh() {
+        for mark in ["]133;A", "]133;B", "]133;C", "]133;D;", "]633;E;", "]7;file://", "]6973;ask;"] {
+            assert!(DECK_PS1.contains(mark), "{mark}");
+        }
+        assert!(CMD_PROMPT.contains("$E]7;file:///$P$E\\"));
     }
 
     #[test]

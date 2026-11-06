@@ -310,8 +310,7 @@ pub(crate) fn claude_dir(cwd: &Path) -> PathBuf {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    agent_core::dirs::home_dir()
         .unwrap_or_default()
         .join(".claude/projects")
         .join(slug)
@@ -358,7 +357,7 @@ pub fn session_arg(argv: &[String]) -> Option<String> {
 /// A `claude attach <id>` client has none of its own: it holds the
 /// background session whose id starts with the one it was given.
 pub fn claude_live_session(pid: u32, argv: &[String]) -> Option<String> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".claude/sessions");
+    let dir = agent_core::dirs::home_dir()?.join(".claude/sessions");
     let id_in = |path: &Path| -> Option<String> {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
         v.get("sessionId")?.as_str().map(str::to_string)

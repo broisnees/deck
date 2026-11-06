@@ -1,6 +1,6 @@
 //! Handing things to the desktop: open a URL or file in its default app,
 //! show a file in the file manager. `open` on macOS, `xdg-open` and the
-//! FileManager1 D-Bus call on Linux, `start` and Explorer on Windows.
+//! FileManager1 D-Bus call on Linux, the URL handler and Explorer on Windows.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,9 +12,9 @@ pub fn opener() -> Command {
     return Command::new("/usr/bin/open");
     #[cfg(target_os = "windows")]
     {
-        let mut c = Command::new("cmd");
-        // `start`'s first quoted argument is a window title.
-        c.args(["/C", "start", ""]);
+        // Not `cmd /C start`: cmd splits an unquoted URL at its `&`.
+        let mut c = Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
         return c;
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

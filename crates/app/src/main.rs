@@ -54,6 +54,7 @@ mod refine;
 mod remote;
 mod retry;
 mod review;
+mod secret;
 mod select;
 mod session;
 mod settings;
@@ -74,6 +75,8 @@ mod usage;
 mod usage_page;
 mod packages;
 mod workspace;
+#[cfg(windows)]
+mod win_console;
 #[cfg(target_os = "linux")]
 mod x11;
 
@@ -107,6 +110,12 @@ fn log_panics() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A `deck://` link Windows opened Deck with goes to the window.
+    #[cfg(windows)]
+    let args = handler::take_launch_url(args);
+    // No console window for the app started from the Start menu (see win_console.rs).
+    #[cfg(windows)]
+    win_console::detach_if_own_console(&args);
     // Started from inside an agent's session (a relaunch an agent ran, a
     // `deck daemon` it kicked off), Deck would pass that session's markers
     // to every terminal and job it starts. It drops them first. (Not for a
@@ -134,7 +143,7 @@ fn main() {
     let cwd = std::env::current_dir()
         .ok()
         .filter(|d| d.as_os_str() != "/")
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| agent_core::dirs::home_dir())
         .unwrap_or_else(|| PathBuf::from("/"));
 
     let app = Application::new().with_assets(icon::Assets);
@@ -260,12 +269,17 @@ pub(crate) fn adopt_shell_path() {
 
 /// `PATH` with each folder once, first place kept. Without it every deck
 /// started from a deck terminal added its own folder again.
+/// What separates the folders in `PATH`: `;` on Windows, where `:` is
+/// part of a drive letter.
+pub const PATH_SEP: &str = if cfg!(windows) { ";" } else { ":" };
+
 pub fn tidy_path(path: &str) -> String {
     let mut seen = std::collections::HashSet::new();
-    path.split(':')
-        .filter(|p| !p.is_empty() && seen.insert(*p))
+    path.split(PATH_SEP)
+        // Windows matches folders without regard to case.
+        .filter(|p| !p.is_empty() && seen.insert(if cfg!(windows) { p.to_lowercase() } else { p.to_string() }))
         .collect::<Vec<_>>()
-        .join(":")
+        .join(PATH_SEP)
 }
 
 /// The `PATH` line from the shell's output, skipping whatever its startup

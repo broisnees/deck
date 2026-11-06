@@ -105,3 +105,32 @@ pub fn detach(cmd: &mut Command) -> &mut Command {
     }
     cmd
 }
+
+/// No console window for a helper (git, curl, ssh) started from the
+/// windowed app on Windows; unchanged elsewhere.
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(agent_core::exec::NO_WINDOW);
+    }
+    cmd
+}
+
+/// A program that ships with the system, by its full path where Deck
+/// relies on that one (`/usr/bin/curl`), and on Windows from System32
+/// (`curl.exe` and `tar.exe` come with Windows 10 and later).
+pub fn system_tool(unix: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let name = Path::new(unix).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let sys = std::path::PathBuf::from(root).join("System32").join(format!("{name}.exe"));
+        if sys.is_file() {
+            return sys;
+        }
+        return agent_core::exec::resolve(&name);
+    }
+    #[cfg(not(windows))]
+    std::path::PathBuf::from(unix)
+}

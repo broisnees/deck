@@ -148,7 +148,7 @@ fn serve(stream: UnixStream, tx: mpsc::UnboundedSender<Incoming>) {
 ///
 /// Inside a deck pane the socket and token come from the environment. From
 /// anywhere else we find the newest running window and call without a token,
-/// which that window only accepts for `browser.open`.
+/// which that window only accepts for `browser.open` and `app.open_url`.
 pub fn call(method: &str, params: Value) -> Result<Value, String> {
     let (socket, token) = match std::env::var("DECK_SOCKET") {
         Ok(s) => (s, std::env::var("DECK_TOKEN").unwrap_or_default()),

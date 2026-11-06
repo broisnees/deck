@@ -281,7 +281,7 @@ fn get_usage(token: &str) -> Result<(u16, Vec<u8>), Failure> {
         return Err(Failure::Sign(EXPIRED.into()));
     }
     let unreachable = || Failure::Net("Couldn't reach Claude's usage service".into());
-    let mut child = Command::new("/usr/bin/curl")
+    let mut child = crate::os::no_window(&mut Command::new(crate::os::system_tool("/usr/bin/curl")))
         .args([
             "--silent",
             "--max-time",
@@ -682,9 +682,7 @@ fn claude_home() -> PathBuf {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
+    agent_core::dirs::home_dir()
 }
 
 /// The `*.jsonl` files in `dir` and when each was last written.
@@ -1847,7 +1845,7 @@ pub fn opencode_today() -> Option<AgentDay> {
          group by 1 order by 3 desc",
         local_midnight() * 1000
     );
-    let out = std::process::Command::new("/usr/bin/sqlite3")
+    let out = crate::os::no_window(&mut std::process::Command::new(sqlite3()))
         .args(["-readonly", "-separator", "\t"])
         .arg(&db)
         .arg(query)
@@ -2188,7 +2186,7 @@ impl Book {
 /// "Other" for replies whose folder wasn't recorded.
 fn name_projects(projects: &mut [ProjectUse]) {
     let last = |p: &str, n: usize| -> String {
-        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = p.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
             return if p.is_empty() { "Other".into() } else { "/".into() };
         }
@@ -2226,10 +2224,14 @@ pub fn report(days: u32) -> Report {
 /// only when a transcript names no `cwd`.
 fn decode_project_dir(name: &str) -> String {
     if name.starts_with('-') {
-        name.replace('-', "/")
-    } else {
-        name.to_string()
+        return name.replace('-', "/");
     }
+    // Windows: `C:\Users\me` is written `C--Users-me`.
+    let b = name.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && &b[1..3] == b"--" {
+        return format!("{}:\\{}", &name[..1], name[3..].replace('-', "\\"));
+    }
+    name.to_string()
 }
 
 fn claude_range(projects: &Path, from: i64, book: &mut Book) {
@@ -2353,14 +2355,28 @@ fn codex_log(text: &str, key: &str, from: i64, book: &mut Book) {
     }
 }
 
-/// OpenCode's database: `$XDG_DATA_HOME/opencode/opencode.db`.
+/// `sqlite3`: the system's on macOS and Linux, from `PATH` on Windows,
+/// which has none of its own.
+fn sqlite3() -> PathBuf {
+    if cfg!(windows) {
+        agent_core::exec::resolve("sqlite3")
+    } else {
+        PathBuf::from("/usr/bin/sqlite3")
+    }
+}
+
+/// OpenCode's database: `$XDG_DATA_HOME/opencode/opencode.db`, which on
+/// Windows is under `~\.local\share` too, or `%APPDATA%` for older builds.
 fn opencode_db() -> Option<PathBuf> {
-    let db = std::env::var_os("XDG_DATA_HOME")
+    let xdg = std::env::var_os("XDG_DATA_HOME")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
-        .or_else(|| home().map(|h| h.join(".local/share")))?
-        .join("opencode/opencode.db");
-    db.exists().then_some(db)
+        .or_else(|| home().map(|h| h.join(".local/share")));
+    let appdata = cfg!(windows).then(|| std::env::var_os("APPDATA").map(PathBuf::from)).flatten();
+    xdg.into_iter()
+        .chain(appdata)
+        .map(|d| d.join("opencode").join("opencode.db"))
+        .find(|db| db.exists())
 }
 
 /// OpenCode's replies since `from`, summed by quarter hour, conversation,
@@ -2382,7 +2398,7 @@ fn opencode_range(from: i64, book: &mut Book) {
         from * 1000,
         BUCKET * 1000
     );
-    let Ok(out) = std::process::Command::new("/usr/bin/sqlite3")
+    let Ok(out) = crate::os::no_window(&mut std::process::Command::new(sqlite3()))
         .args(["-readonly", "-separator", "\t"])
         .arg(&db)
         .arg(query)
@@ -2566,6 +2582,7 @@ mod range_tests {
         s.line(r#"{"type":"user","cwd":"/Users/me/deck/crates"}"#);
         assert_eq!(s.cwd.as_deref(), Some("/Users/me/deck"));
         assert_eq!(decode_project_dir("-Users-me-deck"), "/Users/me/deck");
+        assert_eq!(decode_project_dir("C--Users-me-deck"), r"C:\Users\me\deck");
     }
 
     #[test]

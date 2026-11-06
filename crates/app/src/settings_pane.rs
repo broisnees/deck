@@ -2601,8 +2601,8 @@ const FIXED_KEYS: &[(&str, &str)] = &[
 
 /// `/Users/me/x` → `~/x`.
 fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+    match agent_core::dirs::home_dir().map(|h| h.to_string_lossy().into_owned()) {
+        Some(home) if !home.is_empty() && path.starts_with(&home) => {
             format!("~{}", &path[home.len()..])
         }
         _ => path.to_string(),

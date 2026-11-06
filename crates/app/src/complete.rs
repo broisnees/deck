@@ -390,7 +390,7 @@ enum PathFilter {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    agent_core::dirs::home_dir()
 }
 
 /// Entries of the folder the word points into whose names start the way the
@@ -527,7 +527,7 @@ fn shell_defined() -> Vec<(String, &'static str)> {
             return v.clone();
         }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = agent_core::dirs::home_dir().unwrap_or_default();
     let mut out: Vec<(String, &'static str)> = Vec::new();
     for f in [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".bash_aliases", ".zsh_aliases", ".aliases"] {
         let Ok(text) = std::fs::read_to_string(home.join(f)) else { continue };

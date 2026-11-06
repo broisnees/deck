@@ -310,7 +310,7 @@ fn parse(osc: &str) -> Option<Mark> {
         // file://host/path, the path percent-encoded.
         let path = url.strip_prefix("file://")?;
         let path = &path[path.find('/')?..];
-        return Some(Mark::Signal(Signal::Cwd(percent_decode(path))));
+        return Some(Mark::Signal(Signal::Cwd(drive_path(percent_decode(path)))));
     }
     if let Some(rest) = osc.strip_prefix("9;") {
         if let Some(progress) = rest.strip_prefix("4;") {
@@ -365,6 +365,25 @@ fn unescape_633(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A Windows folder as OSC 7 carries it (`/C:/Users/me`, or `/C:\Users`
+/// from cmd's prompt) back to `C:\Users\me`. Any other path is unchanged.
+fn drive_path(path: String) -> String {
+    let b = path.as_bytes();
+    let drive = b.len() >= 3
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && b.get(3).is_none_or(|c| *c == b'/' || *c == b'\\');
+    if !drive {
+        return path;
+    }
+    let mut out = path[1..].replace('/', "\\");
+    if out.len() == 2 {
+        out.push('\\');
+    }
+    out
 }
 
 fn percent_decode(s: &str) -> String {
@@ -549,6 +568,22 @@ mod tests {
                 Signal::Line(None),
             ]
         );
+    }
+
+    #[test]
+    fn windows_folders_come_back_as_drive_paths() {
+        let cwd = |osc: &str| match parse(osc) {
+            Some(Mark::Signal(Signal::Cwd(p))) => p,
+            _ => panic!("no cwd in {osc:?}"),
+        };
+        assert_eq!(cwd("7;file:///C:/Users/me/my%20app"), r"C:\Users\me\my app");
+        assert_eq!(cwd("7;file://DESKTOP-1/C:/Users/me"), r"C:\Users\me");
+        assert_eq!(cwd(r"7;file://DESKTOP-1/D:\work\deck"), r"D:\work\deck");
+        assert_eq!(cwd("7;file://pc/c:"), r"c:\");
+        assert_eq!(cwd("7;file://pc/C:/"), r"C:\");
+        // Not a drive: left alone.
+        assert_eq!(cwd("7;file://mac/Users/me"), "/Users/me");
+        assert_eq!(cwd("7;file://mac/C:x"), "/C:x");
     }
 
     #[test]

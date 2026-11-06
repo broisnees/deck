@@ -18,7 +18,7 @@ use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, div, px, Animation, AnimationExt, rgb, rgba, AnyElement, AnyView, App, Context, ElementId, Entity,
-    FontWeight, KeyBinding, Menu, MenuItem, MouseButton, OsAction, SharedString, StyleRefinement,
+    FontWeight, KeyBinding, WindowControlArea, Menu, MenuItem, MouseButton, OsAction, SharedString, StyleRefinement,
     Subscription, Task, WeakEntity, Window,
 };
 use serde_json::{json, Value};
@@ -1390,10 +1390,13 @@ impl Workspace {
                 // quit, then starts fresh beneath it.
                 let key = self.pending_scroll.take().unwrap_or_else(|| new_token()[..16].to_string());
                 let saved = crate::session::scrollback_file(&key);
-                if cmd.is_none() && saved.exists() && env.contains_key("ZDOTDIR") && reattach.is_none() {
+                // Only shells with Deck's integration print it: zsh, PowerShell.
+                let restores = env.contains_key("ZDOTDIR") || env.contains_key("DECK_PWSH_INTEGRATION");
+                if cmd.is_none() && saved.exists() && restores && reattach.is_none() {
                     env.insert("DECK_RESTORE".into(), saved.display().to_string());
                 }
                 self.scroll_keys.insert(id, key);
+                let chosen_shell = env.get("DECK_SHELL").cloned();
                 let cwd = cwd.unwrap_or_else(|| self.cwd.clone());
                 seed = Some(cwd.clone());
                 // In the background service when it can be: the shell (and
@@ -1453,9 +1456,10 @@ impl Workspace {
                     .map(|a| a.name.to_string())
                     .or(cmd)
                     .or_else(|| {
-                        std::env::var("SHELL")
-                            .ok()
-                            .map(|s| s.rsplit('/').next().unwrap_or("shell").to_string())
+                        chosen_shell
+                            .clone()
+                            .or_else(|| std::env::var("SHELL").ok())
+                            .map(|s| shell_name(&s))
                     })
                     .unwrap_or_else(|| "shell".into());
                 let look = self.settings.term_look();
@@ -2363,7 +2367,7 @@ impl Workspace {
                 let path = std::env::var("PATH").unwrap_or_default();
                 env.insert(
                     "PATH".into(),
-                    crate::tidy_path(&format!("{}:{path}", dir.display())),
+                    crate::tidy_path(&format!("{}{}{path}", dir.display(), crate::PATH_SEP)),
                 );
             }
             env.insert("BROWSER".into(), exe.display().to_string());
@@ -4087,10 +4091,12 @@ impl Workspace {
 
     fn apply_places(&mut self, next: HashMap<PaneId, Place>, cx: &mut Context<Self>) {
         // Busy: something other than the shell is in front and printing.
-        let shell = std::env::var("SHELL")
-            .ok()
-            .and_then(|s| s.rsplit('/').next().map(str::to_string))
-            .unwrap_or_else(|| "zsh".into());
+        let shell = std::env::var("SHELL").ok().map(|s| shell_name(&s)).unwrap_or_else(|| "zsh".into());
+        // Windows sets no SHELL; Deck runs one of these there.
+        let is_shell = |f: &str| {
+            let f = shell_name(f);
+            f == shell || (cfg!(windows) && matches!(f.as_str(), "pwsh" | "powershell" | "cmd" | "wsl" | "bash"))
+        };
         let busy: std::collections::HashSet<PaneId> = self
             .panes
             .iter()
@@ -4105,7 +4111,7 @@ impl Workspace {
                             && next
                                 .get(id)
                                 .and_then(|pl| pl.front.as_deref())
-                                .is_some_and(|f| f != shell && !f.starts_with('-'))
+                                .is_some_and(|f| !is_shell(f) && !f.starts_with('-'))
                     }
                 },
                 _ => false,
@@ -7486,6 +7492,18 @@ impl Workspace {
                 };
                 return reply.send(r);
             }
+            // A `deck://` link Windows handed a second copy of Deck: the
+            // same as the system opening it here.
+            if req.method == "app.open_url" {
+                return reply.send(match str_param(p, "url").filter(|u| u.starts_with("deck://")) {
+                    Some(url) => {
+                        self.open_handled(url, window, cx);
+                        window.activate_window();
+                        Ok(json!({}))
+                    }
+                    None => Err("only deck:// links".into()),
+                });
+            }
             return reply.send(Err(
                 "unknown or expired token: run deck from a terminal inside a deck window".into(),
             ));
@@ -7592,6 +7610,13 @@ impl Workspace {
                 return self.rpc_eval(&q, caller, reply, cx);
             }
             "browser.open" => self.rpc_open(p, caller, window, cx),
+            "app.open_url" => match str_param(p, "url").filter(|u| u.starts_with("deck://")) {
+                Some(url) => {
+                    self.open_handled(url, window, cx);
+                    Ok(json!({}))
+                }
+                None => Err("only deck:// links".into()),
+            },
             "browser.eval" => return self.rpc_eval(p, caller, reply, cx),
             "browser.logs" => self.rpc_logs(p, caller, cx),
             "browser.shot" => self.rpc_browser_shot(p, caller, window, cx),
@@ -9190,6 +9215,7 @@ impl Workspace {
                     })
                     .gap(u(2.))
                     .child(self.new_chat_button("new-chat", cx))
+                    .child(self.new_terminal_button("new-terminal", cx))
                     .child(
                         icon_button("hide-sidebar", Icon::Sidebar).on_click(cx.listener(
                             |ws, _, _, cx| {
@@ -9197,7 +9223,8 @@ impl Workspace {
                                 cx.notify();
                             },
                         )),
-                    ),
+                    )
+                    .when(cfg!(windows), |d| d.child(drag_strip())),
             )
             .child(list)
             .children((!self.picked.is_empty()).then(|| self.render_pick_bar(cx)))
@@ -9988,6 +10015,17 @@ impl Workspace {
                 cx.notify();
             }
         }))
+    }
+
+    /// A terminal beside the + in the titlebar: a shell in the focused
+    /// pane's folder, as New Terminal opens.
+    fn new_terminal_button(&self, id: &'static str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        icon_button(id, Icon::Terminal)
+            .tooltip(|_, cx| Tip::view("New terminal", cx))
+            .on_click(cx.listener(|ws, _, window, cx| {
+                let what = ws.shell_here(cx);
+                let _ = ws.new_tab(what, None, window, cx);
+            }))
     }
 
     /// A thread: its title, then who is doing it and what it needs from you.
@@ -11357,6 +11395,72 @@ impl Workspace {
     }
 }
 
+/// A shell's program name from its path: `zsh` from `/bin/zsh`, `pwsh`
+/// from `C:\Program Files\PowerShell\7\pwsh.exe`.
+fn shell_name(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base).to_string()
+}
+
+/// How wide Windows' minimize, maximize and close buttons are together.
+const CAPTION_PX: f32 = 3. * 46.;
+
+/// Empty title strip that moves the window on Windows, where the system
+/// draws no title bar of its own above Deck's.
+fn drag_strip() -> impl IntoElement {
+    div()
+        .id("drag-strip")
+        .flex_1()
+        .h_full()
+        .window_control_area(WindowControlArea::Drag)
+}
+
+/// Minimize, maximize and close in the window's top right corner on
+/// Windows, at the system's sizes. The system handles their clicks (the
+/// areas answer its hit test), so snap layouts show over maximize.
+fn caption_buttons(window: &Window) -> Option<AnyElement> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let ink = rgb(theme::text_2());
+    let button = |id: &'static str, area: WindowControlArea, glyph: AnyElement, close: bool| {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(46.))
+            .h_full()
+            .window_control_area(area)
+            .hover(move |s| if close { s.bg(rgb(0xc42b1c)) } else { s.bg(rgb(theme::row_hover())) })
+            .child(glyph)
+    };
+    let minimize = div().w(px(10.)).h(px(1.)).bg(ink);
+    // Restore is two overlapping squares, the back one showing its top
+    // and right edges only.
+    let maximize = if window.is_maximized() {
+        div()
+            .relative()
+            .size(px(10.))
+            .child(div().absolute().top_0().left(px(2.)).size(px(8.)).border_t_1().border_r_1().border_color(ink))
+            .child(div().absolute().top(px(2.)).left_0().size(px(8.)).border_1().border_color(ink))
+    } else {
+        div().size(px(10.)).border_1().border_color(ink)
+    };
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .flex()
+            .h(px(theme::TITLEBAR_PX))
+            .child(button("caption-min", WindowControlArea::Min, minimize.into_any_element(), false))
+            .child(button("caption-max", WindowControlArea::Max, maximize.into_any_element(), false))
+            .child(button("caption-close", WindowControlArea::Close, icon(Icon::Close, 14., theme::text_2()).into_any_element(), true))
+            .into_any_element(),
+    )
+}
+
 pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -12000,7 +12104,7 @@ fn is_shell(name: &str) -> bool {
 }
 
 fn place_of(cwd: &std::path::Path) -> Place {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = agent_core::dirs::home_dir();
     if home.as_deref() == Some(cwd) {
         return Place {
             cwd: cwd.to_path_buf(),
@@ -12083,11 +12187,11 @@ impl Render for Workspace {
         }
         if self.locked {
             window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
-            return self.lock_screen(cx);
+            return self.lock_screen(window, cx);
         }
         if screen {
             window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
-            return self.sign_in_screen(cx);
+            return self.sign_in_screen(window, cx);
         }
         let (sidebar, inspector) = self.islands(cx);
         window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
@@ -12178,7 +12282,9 @@ impl Render for Workspace {
                 }
             })
             .when(!sidebar_shown, |d| {
-                d.child(self.new_chat_button("new-chat-bar", cx)).child(
+                d.child(self.new_chat_button("new-chat-bar", cx))
+                    .child(self.new_terminal_button("new-terminal-bar", cx))
+                    .child(
                     icon_button("show-sidebar", Icon::Sidebar)
                         .mr(u(6.))
                         .on_click(cx.listener(|ws, _, w, cx| {
@@ -12195,9 +12301,12 @@ impl Render for Workspace {
             .child(
                 // project / title: where you are, then what.
                 div()
+                    .id("title")
                     .flex()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
+                    .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag))
                     .items_center()
                     .gap(u(6.))
                     .text_size(u(13.))
@@ -12251,7 +12360,8 @@ impl Render for Workspace {
                     .on_click(cx.listener(|ws, _, w, cx| ws.toggle_inspector(w, cx))),
             )
             .children(self.update_pill(cx))
-            .child(self.avatar_button(cx));
+            .child(self.avatar_button(cx))
+            .when(cfg!(windows) && !inspector_shown, |d| d.child(div().flex_none().w(px(CAPTION_PX))));
 
         let main = div()
             .flex()
@@ -12572,6 +12682,7 @@ impl Render for Workspace {
             // double-click for the usual width.
             .child(body)
             .children(bar)
+            .children(caption_buttons(window))
             .children(self.render_drop_hint())
             .children(self.menu.as_ref().map(crate::menu::Open::render))
             // The palette floats over everything, a little above centre,
@@ -12663,10 +12774,16 @@ fn appkit_appearance(theme: crate::theme::Theme) {
     app.setAppearance(appearance.as_deref());
 }
 
-/// The Dock icon's badge: how many panes want you, or none. Off macOS
-/// there is no badge yet.
-#[cfg(not(target_os = "macos"))]
+/// The Dock icon's badge: how many panes want you, or none. Linux has no
+/// badge yet.
+#[cfg(not(any(target_os = "macos", windows)))]
 fn set_badge(_n: usize) {}
+
+/// The taskbar button's overlay: how many panes want you, or none.
+#[cfg(windows)]
+fn set_badge(n: usize) {
+    crate::notify::badge(n);
+}
 
 /// The Dock icon's badge: how many panes want you, or none.
 #[cfg(target_os = "macos")]
@@ -13212,7 +13329,7 @@ impl Workspace {
         .detach();
     }
 
-    fn sign_in_screen(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn sign_in_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let account = crate::account::current();
         let note = self.account_note.clone();
         let mut col = div()
@@ -13337,26 +13454,31 @@ impl Workspace {
                 .text_color(rgb(theme::DANGER))
                 .child(n)
         }));
-        self.screen(col)
+        self.screen(col, window)
     }
 
     /// A full window with `content` in the middle, under a strip that still
     /// moves the window.
-    fn screen(&self, content: gpui::Div) -> AnyElement {
+    fn screen(&self, content: gpui::Div, window: &Window) -> AnyElement {
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(theme::pane()))
             .font_family(theme::ui())
-            .child(div().flex_none().h(px(theme::TITLEBAR_PX)).on_mouse_down(
-                MouseButton::Left,
-                |ev, window, _| {
-                    if ev.click_count == 2 {
-                        window.titlebar_double_click();
-                    }
-                },
-            ))
+            .child(
+                div()
+                    .id("screen-title")
+                    .flex_none()
+                    .h(px(theme::TITLEBAR_PX))
+                    .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag))
+                    .on_mouse_down(MouseButton::Left, |ev, window, _| {
+                        if ev.click_count == 2 {
+                            window.titlebar_double_click();
+                        }
+                    }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -13366,6 +13488,7 @@ impl Workspace {
                     .pb(u(60.))
                     .child(content),
             )
+            .children(caption_buttons(window))
             .into_any_element()
     }
 
@@ -13389,7 +13512,7 @@ impl Workspace {
         .detach();
     }
 
-    fn lock_screen(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn lock_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let col = div()
             .flex()
             .flex_col()
@@ -13430,7 +13553,7 @@ impl Workspace {
                     .text_color(rgb(theme::dim()))
                     .child("With Touch ID or your Mac's password"),
             );
-        self.screen(col)
+        self.screen(col, window)
     }
 
     // -- the avatar menu --------------------------------------------------------

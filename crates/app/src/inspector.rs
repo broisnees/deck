@@ -131,7 +131,7 @@ fn empty(text: &'static str) -> gpui::Div {
 /// `/Users/me/deck` → `~/deck`.
 fn tilde(path: &std::path::Path) -> String {
     let shown = path.display().to_string();
-    match std::env::var("HOME") {
+    match agent_core::dirs::home_dir().map(|h| h.display().to_string()).ok_or(()) {
         Ok(home) if shown == home => "~".into(),
         Ok(home) => shown
             .strip_prefix(&format!("{home}/"))
@@ -213,6 +213,17 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
         .pr(u(theme::GUTTER + 4.))
         .bg(rgb(theme::sidebar()))
         .text_color(rgb(theme::text()))
+        // On Windows the window's caption buttons sit above the inspector,
+        // in a strip of their own that moves the window.
+        .when(cfg!(windows), |d| {
+            d.child(
+                div()
+                    .id("inspector-title")
+                    .flex_none()
+                    .h(px(theme::TITLEBAR_PX))
+                    .window_control_area(gpui::WindowControlArea::Drag),
+            )
+        })
         // Same strip height as the title bar, so the two tops line up.
         .child(
             div()

@@ -88,7 +88,7 @@ impl GhosttyTerminal {
         let options = tty::Options {
             shell: match spawn.program {
                 Some(program) => Some(tty::Shell::new(program, spawn.args)),
-                None => login_shell(),
+                None => login_shell(&env),
             },
             working_directory: spawn.cwd,
             drain_on_exit: true,

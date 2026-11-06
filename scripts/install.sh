@@ -8,6 +8,11 @@
 # a failed build never leaves a half-installed app behind.
 set -eu
 
+if [ "$(uname -s)" != Darwin ]; then
+    echo "scripts/install.sh builds the macOS app; for Windows run scripts/build-windows.sh" >&2
+    exit 1
+fi
+
 cd "$(dirname "$0")/.."
 APP="${DECK_APP:-/Applications/Deck.app}"
 BIN="${DECK_BIN:-$HOME/.local/bin}"

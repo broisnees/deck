@@ -243,7 +243,7 @@ struct Mention {
 /// `~/.claude/commands`, the project's `.claude/commands` and the skills
 /// folders, each described by its file's `description:`.
 fn commands_for(agent: &str, cwd: &std::path::Path, sigil: char) -> Vec<(String, String, String)> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = agent_core::dirs::home_dir().unwrap_or_default();
     let describe = |path: &std::path::Path| -> String {
         std::fs::read_to_string(path)
             .ok()
@@ -5865,7 +5865,7 @@ fn input_diff(i: &serde_json::Value) -> Option<String> {
 fn relative_to(title: &str, cwd: &std::path::Path) -> String {
     let root = cwd.display().to_string();
     let short = title.replace(&format!("{root}/"), "");
-    match std::env::var("HOME") {
+    match agent_core::dirs::home_dir().map(|h| h.display().to_string()).ok_or(()) {
         Ok(home) if short.starts_with(&home) => format!("~{}", &short[home.len()..]),
         _ => short,
     }
@@ -6046,7 +6046,7 @@ fn strip_cd<'a>(cmd: &'a str, cwd: &std::path::Path) -> &'a str {
         return cmd;
     };
     let dir = dir.trim().trim_matches(|c| c == '"' || c == '\'');
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = agent_core::dirs::home_dir().map(|h| h.display().to_string()).ok_or(()).unwrap_or_default();
     let dir = match dir.strip_prefix('~') {
         Some(tail) => format!("{home}{tail}"),
         None => dir.to_string(),
@@ -6439,7 +6439,7 @@ fn tidy_place(p: &std::path::Path) -> String {
 
 pub fn short_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
-    match std::env::var("HOME") {
+    match agent_core::dirs::home_dir().map(|h| h.display().to_string()).ok_or(()) {
         Ok(home) if s.starts_with(&home) => format!("~{}", &s[home.len()..]),
         _ => s,
     }

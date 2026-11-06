@@ -147,6 +147,7 @@ dependencies = [
  "agent-core",
  "anyhow",
  "block2",
+ "embed-resource",
  "futures",
  "gdkx11",
  "gpui",
@@ -172,6 +173,10 @@ dependencies = [
  "two-face",
  "uds_windows",
  "ureq",
+ "webview2-com",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "windows-future 0.3.2",
  "wry",
  "x11-dl",
 ]

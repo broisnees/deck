@@ -8,6 +8,10 @@ license.workspace = true
 name = "deck"
 path = "src/main.rs"
 
+# deck.exe's icon, version block and (cross builds) manifest; see build.rs.
+[build-dependencies]
+embed-resource = "3"
+
 [features]
 default = ["ghostty"]
 # The Ghostty terminal engine (Settings → Terminal → Engine). Building it
@@ -51,6 +55,50 @@ gdkx11 = "0.18"
 # The control socket: AF_UNIX on Windows 10 and later.
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1"
+# Win32 and WinRT, the version wry and webview2-com build: ConPTY for the
+# background service, toasts, tray, hot keys, Credential Manager, DPAPI,
+# the process inspector, window pictures.
+webview2-com = "0.39"
+windows-core = "0.62"
+windows-future = "0.3"
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "Security_Credentials_UI",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # HTTP for the browser chrome and accounts; macOS uses NSURLSession.
 [target.'cfg(not(target_os = "macos"))'.dependencies]

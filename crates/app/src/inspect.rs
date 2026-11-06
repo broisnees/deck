@@ -188,11 +188,89 @@ fn is_version(name: &str) -> bool {
     name.contains('.') && name.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
-// The kernel half: libproc on macOS, /proc on Linux.
+/// A Windows command line split into arguments as the MSVC runtime (and
+/// `CommandLineToArgvW`) splits it: the program up to its closing quote or
+/// the first space, then `\` escapes only before a `"`, and `""` inside
+/// quotes for a literal quote.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn split_windows_args(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    // The program: no escapes at all.
+    let mut prog = String::new();
+    if chars.peek() == Some(&'"') {
+        chars.next();
+        for c in chars.by_ref() {
+            if c == '"' {
+                break;
+            }
+            prog.push(c);
+        }
+    }
+    while let Some(&c) = chars.peek() {
+        if c == ' ' || c == '\t' {
+            break;
+        }
+        prog.push(c);
+        chars.next();
+    }
+    out.push(prog);
+    loop {
+        while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut arg = String::new();
+        let mut quoted = false;
+        while let Some(&c) = chars.peek() {
+            match c {
+                '\\' => {
+                    let mut n = 0;
+                    while chars.peek() == Some(&'\\') {
+                        chars.next();
+                        n += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        arg.extend(std::iter::repeat_n('\\', n / 2));
+                        if n % 2 == 1 {
+                            arg.push('"');
+                            chars.next();
+                        }
+                    } else {
+                        arg.extend(std::iter::repeat_n('\\', n));
+                    }
+                }
+                '"' => {
+                    chars.next();
+                    if quoted && chars.peek() == Some(&'"') {
+                        arg.push('"');
+                        chars.next();
+                    } else {
+                        quoted = !quoted;
+                    }
+                }
+                ' ' | '\t' if !quoted => break,
+                _ => {
+                    arg.push(c);
+                    chars.next();
+                }
+            }
+        }
+        out.push(arg);
+    }
+    out
+}
+
+// The kernel half: libproc on macOS, /proc on Linux, Win32 on Windows.
 #[cfg(target_os = "macos")]
 #[path = "inspect/darwin.rs"]
 mod kernel;
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[path = "inspect/windows.rs"]
+mod kernel;
+#[cfg(not(any(target_os = "macos", windows)))]
 #[path = "inspect/procfs.rs"]
 mod kernel;
 
@@ -215,7 +293,7 @@ pub fn project_root(dir: &Path) -> PathBuf {
 /// Branch, ahead/behind and changed files. `None` outside a repository or
 /// without git.
 pub fn git(dir: &Path) -> Option<GitInfo> {
-    let out = Command::new("git")
+    let out = crate::os::no_window(&mut Command::new("git"))
         .arg("-C")
         .arg(dir)
         .args(["status", "--porcelain=v2", "--branch", "-z"])
@@ -229,7 +307,7 @@ pub fn git(dir: &Path) -> Option<GitInfo> {
     }
     let mut info = parse_git(&String::from_utf8_lossy(&out.stdout));
     let git = |args: &[&str]| {
-        Command::new("git")
+        crate::os::no_window(&mut Command::new("git"))
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -439,6 +517,17 @@ mod tests {
             cpu: 0.,
             rss: 0,
         }
+    }
+
+    #[test]
+    fn windows_command_lines_split_like_msvc() {
+        let split = |l: &str| split_windows_args(l);
+        assert_eq!(split(r#""C:\Program Files\nodejs\node.exe" cli.js --x"#), [r"C:\Program Files\nodejs\node.exe", "cli.js", "--x"]);
+        assert_eq!(split(r#"C:\a\b.exe "two words" plain"#), [r"C:\a\b.exe", "two words", "plain"]);
+        assert_eq!(split(r#"p a\\b "c\\" "d\"e" f\\\"g"#), ["p", r"a\\b", r"c\", r#"d"e"#, r#"f\"g"#]);
+        assert_eq!(split(r#"p "say ""hi""" x"#), ["p", r#"say "hi""#, "x"]);
+        assert_eq!(split("p  \t "), ["p"]);
+        assert_eq!(split(r#"p """#), ["p", ""]);
     }
 
     #[test]

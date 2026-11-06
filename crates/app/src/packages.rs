@@ -1512,14 +1512,13 @@ fn used_by(graph: &Graph, roots: &[&str], target: &str) -> Vec<String> {
 /// A tool on the PATH, or where the usual installers put one; the app may
 /// have started with a short PATH.
 fn find_tool(name: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .chain([format!("{home}/.cargo/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()].map(PathBuf::from))
-        .map(|d| d.join(name))
+    if let Some(p) = agent_core::exec::which(name) {
+        return Some(p);
+    }
+    let home = agent_core::dirs::home_dir().unwrap_or_default();
+    [home.join(".cargo").join("bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()]
+        .into_iter()
+        .map(|d| d.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
         .find(|p| p.is_file())
 }
 
@@ -1527,11 +1526,15 @@ fn find_tool(name: &str) -> Option<PathBuf> {
 /// folder goes first on PATH, so `npm` finds the `node` beside it.
 fn json_of(bin: &Path, args: &[&str], root: &Path) -> Option<Value> {
     use std::process::{Command, Stdio};
-    let mut path = bin.parent().map(|p| p.display().to_string()).unwrap_or_default();
-    if let Ok(p) = std::env::var("PATH") {
-        path = format!("{path}:{p}");
+    let mut dirs: Vec<PathBuf> = bin.parent().map(Path::to_path_buf).into_iter().collect();
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
     }
-    let out = Command::new(bin)
+    let path = std::env::join_paths(dirs).unwrap_or_default();
+    // `npm` is `npm.cmd` on Windows: through what it runs, as for agents.
+    let (program, first) = agent_core::exec::launcher(&bin.to_string_lossy());
+    let out = crate::os::no_window(&mut Command::new(program))
+        .args(first)
         .args(args)
         .current_dir(root)
         .env("PATH", path)

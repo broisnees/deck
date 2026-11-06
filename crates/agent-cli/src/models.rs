@@ -84,7 +84,12 @@ fn leak(listed: Vec<Listed>) -> &'static [ModelSpec] {
 /// Run a CLI's list command and read its answer. Blocks, so it runs on a
 /// thread of its own.
 pub(crate) fn read(bin: &str, list: &ListModels) -> Option<Vec<Listed>> {
-    let child = std::process::Command::new(bin)
+    let (program, first) = agent_core::exec::launcher(bin);
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(first);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, agent_core::exec::CREATION_FLAGS);
+    let child = cmd
         .args(list.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -103,6 +108,9 @@ pub(crate) fn read(bin: &str, list: &ListModels) -> Option<Vec<Listed>> {
         Ok(_) => None,
         Err(_) => {
             tracing::debug!(bin, "model list timed out");
+            #[cfg(windows)]
+            agent_core::exec::kill_tree(pid);
+            #[cfg(unix)]
             let _ = std::process::Command::new("kill")
                 .arg(pid.to_string())
                 .stdin(Stdio::null())
@@ -167,9 +175,11 @@ pub(crate) async fn codex_default(bin: &str) -> Option<String> {
     let configured = codex_config()
         .as_deref()
         .and_then(|text| top_level(text, "model"))?;
+    let (program, first) = agent_core::exec::launcher(bin);
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new(bin)
+        tokio::process::Command::new(program)
+            .args(first)
             .args(["debug", "models"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -218,7 +228,7 @@ fn codex_replacement(catalog: &str, configured: &str) -> Option<String> {
 fn codex_config() -> Option<String> {
     let home = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".codex")))?;
+        .or_else(|| agent_core::dirs::home_dir().map(|h| h.join(".codex")))?;
     std::fs::read_to_string(home.join("config.toml")).ok()
 }
 

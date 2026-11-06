@@ -410,7 +410,7 @@ pub fn install(on: bool) {
     if on {
         install_mcp();
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(home) = agent_core::dirs::home_dir() else { return };
     let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
     if claude.is_dir() {
         if let Err(e) = claude_hook(&claude.join("settings.json"), on) {
@@ -425,14 +425,19 @@ pub fn install(on: bool) {
     }
 }
 
+/// The `deck` linked into `~/.local/bin` (`deck.exe` on Windows), when
+/// there is one.
+fn installed_deck() -> Option<PathBuf> {
+    agent_core::dirs::home_dir()
+        .map(|h| h.join(".local").join("bin").join(format!("deck{}", std::env::consts::EXE_SUFFIX)))
+        .filter(|p| p.exists())
+}
+
 /// Register `deck mcp` (Deck's commands as MCP tools) with each agent
 /// CLI, through its own `mcp add`, once: a marker under deck's data folder
 /// remembers which have it, so no agent is asked twice.
 pub fn install_mcp() {
-    let bin = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".local/bin/deck"))
-        .filter(|p| p.exists())
-        .or_else(|| std::env::current_exe().ok());
+    let bin = installed_deck().or_else(|| std::env::current_exe().ok());
     let Some(bin) = bin else { return };
     let bin = bin.to_string_lossy().into_owned();
     let dir = crate::control::socket_dir().join("mcp-registered");
@@ -447,8 +452,12 @@ pub fn install_mcp() {
         if mark.exists() {
             continue;
         }
-        let Some(exe) = term::which(agent) else { continue };
-        let ok = std::process::Command::new(&exe)
+        if term::which(agent).is_none() {
+            continue;
+        }
+        let (program, first) = agent_core::exec::launcher(agent);
+        let ok = crate::os::no_window(&mut std::process::Command::new(program))
+            .args(first)
             .args(&args)
             .stdin(std::process::Stdio::null())
             .output()
@@ -485,10 +494,7 @@ fn claude_hook(path: &Path, on: bool) -> Result<(), String> {
     if on {
         // The full path: Claude Code's hooks run without a login shell's PATH.
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let bin = std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".local/bin/deck"))
-            .filter(|p| p.exists())
-            .unwrap_or(exe);
+        let bin = installed_deck().unwrap_or(exe);
         let cmd = format!("{} hook session-start", shell_word(&bin.to_string_lossy()));
         list.push(json!({ "hooks": [{ "type": "command", "command": cmd, "timeout": 5 }] }));
     } else {

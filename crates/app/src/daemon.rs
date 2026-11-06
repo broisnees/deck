@@ -15,17 +15,19 @@
 //! folder), answered with one JSON line; `attach` then turns the connection
 //! into the job's stream. Frames from an attached client: `0, len (u32 BE),
 //! bytes` for input, `1, rows (u16 BE), cols (u16 BE)` for a resize.
+//!
+//! On Windows the same service runs each job under a ConPTY pseudo console
+//! in a job object (see `daemon/win.rs`), shows a tray icon instead of the
+//! menu bar one, and starts at login from the user's `Run` key.
 
-// Off Unix only the client half runs (see the end of this file).
-#![cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables, unreachable_code))]
+#[cfg(windows)]
+mod win;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(unix)]
-use crate::os::UnixListener;
-use crate::os::UnixStream;
+use crate::os::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -193,11 +195,14 @@ pub fn inherited_agent_marker(k: &str) -> bool {
 
 /// Make sure the LaunchAgent is installed and the daemon running: through
 /// launchd when it can be, else started directly, detached. Off macOS it
-/// is always started directly; a systemd user unit is still to come.
+/// is always started directly; a systemd user unit is still to come. On
+/// Windows the `Run` key starts it at login.
 pub fn ensure_running() -> Result<(), String> {
     let exe = service_exe()?;
     #[cfg(target_os = "macos")]
     let rewrote = install_agent(&exe).unwrap_or(false);
+    #[cfg(windows)]
+    win::install_autostart(&exe);
     if ask(&json!({ "op": "ping" })).is_ok() {
         return Ok(());
     }
@@ -207,8 +212,8 @@ pub fn ensure_running() -> Result<(), String> {
     }
     // No launchd (Linux, a test, a sandbox), or it would not run it: run it
     // ourselves, in its own session.
-    #[cfg(not(unix))]
-    return Err("the background service is not on this platform yet".into());
+    #[cfg(windows)]
+    win::spawn_service(&exe)?;
     #[cfg(unix)]
     {
         let mut c = std::process::Command::new(&exe);
@@ -437,7 +442,11 @@ pub fn cli(args: &[String]) -> i32 {
         "show" => {
             let Some(name) = name() else { return fail("show needs --name NAME".into()) };
             let url = format!("deck://job/{}", crate::browser::encode_query(&name));
-            match std::process::Command::new("/usr/bin/open").arg(url).status() {
+            #[cfg(windows)]
+            let mut opener = crate::desktop::opener();
+            #[cfg(not(windows))]
+            let mut opener = std::process::Command::new("/usr/bin/open");
+            match opener.arg(url).status() {
                 Ok(s) if s.success() => out(json!({ "shown": name })),
                 _ => fail("could not open Deck".into()),
             }
@@ -565,9 +574,12 @@ fn wait(name: &str, want: Option<String>, exit: bool, timeout: Duration) -> i32 
 
 /// `deck job attach NAME`: this terminal becomes the job's, until the
 /// connection closes. Keys go to the job raw; its output comes back.
-#[cfg(unix)]
 fn attach(name: &str) -> i32 {
-    let (rows, cols) = winsize(0).unwrap_or((40, 120));
+    #[cfg(unix)]
+    let size = || winsize(0);
+    #[cfg(windows)]
+    let size = win::console_size;
+    let (rows, cols) = size().unwrap_or((40, 120));
     let mut s = match UnixStream::connect(socket()) {
         Ok(s) => s,
         Err(e) => {
@@ -591,20 +603,32 @@ fn attach(name: &str) -> i32 {
             return 1;
         }
     }
+    #[cfg(unix)]
     let saved = raw_mode(0);
+    // Restored when dropped, at the end of this function.
+    #[cfg(windows)]
+    let _saved = win::Console::raw();
     let mut input = match s.try_clone() {
         Ok(c) => c,
         Err(_) => return 1,
     };
     std::thread::spawn(move || {
+        #[cfg(unix)]
         let mut buf = [0u8; 4096];
-        let mut last = winsize(0);
+        let mut last = size();
+        #[cfg(unix)]
         let mut stdin = std::io::stdin();
+        #[cfg(windows)]
+        let mut keys = win::Keys::new();
         loop {
-            // Poll for keys a little at a time so a resize is noticed too.
+            // Wait for keys a little at a time so a resize is noticed too.
+            #[cfg(unix)]
             let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+            #[cfg(unix)]
             let ready = unsafe { libc::poll(&mut pfd, 1, 250) };
-            let now = winsize(0);
+            #[cfg(windows)]
+            let typed = keys.next(250);
+            let now = size();
             if now != last {
                 last = now;
                 if let Some((r, c)) = now {
@@ -616,23 +640,32 @@ fn attach(name: &str) -> i32 {
                     }
                 }
             }
-            if ready <= 0 {
+            #[cfg(unix)]
+            let typed: Option<&[u8]> = {
+                if ready <= 0 {
+                    continue;
+                }
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => None,
+                    Ok(n) => Some(&buf[..n]),
+                }
+            };
+            let Some(typed) = typed else { break };
+            if typed.is_empty() {
                 continue;
             }
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut f = vec![0u8];
-                    f.extend_from_slice(&(n as u32).to_be_bytes());
-                    f.extend_from_slice(&buf[..n]);
-                    if input.write_all(&f).is_err() {
-                        break;
-                    }
-                }
+            let mut f = vec![0u8];
+            f.extend_from_slice(&(typed.len() as u32).to_be_bytes());
+            f.extend_from_slice(&typed[..]);
+            if input.write_all(&f).is_err() {
+                break;
             }
         }
     });
+    #[cfg(unix)]
     let mut out = std::io::stdout();
+    #[cfg(windows)]
+    let mut out = win::Output::default();
     let mut buf = [0u8; 16384];
     loop {
         match s.read(&mut buf) {
@@ -645,6 +678,7 @@ fn attach(name: &str) -> i32 {
             }
         }
     }
+    #[cfg(unix)]
     if let Some(t) = saved {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
     }
@@ -678,40 +712,42 @@ fn raw_mode(fd: i32) -> Option<libc::termios> {
 // ---------------------------------------------------------------------------
 // The daemon
 
-#[cfg(unix)]
 struct Job {
     info: JobInfo,
     env: HashMap<String, String>,
-    master: i32,
+    term: Arc<Term>,
     ring: Vec<u8>,
     clients: Vec<UnixStream>,
     size: (u16, u16),
 }
 
-#[cfg(unix)]
 type Jobs = Arc<Mutex<HashMap<String, Job>>>;
 
-#[cfg(unix)]
 static JOBS: LazyLock<Jobs> = LazyLock::new(Default::default);
 /// Jobs being stopped on purpose, so their exit is not told as a failure.
-#[cfg(unix)]
 static STOPPING: LazyLock<Mutex<std::collections::HashSet<String>>> = LazyLock::new(Default::default);
 
 /// `deck daemon`: serve jobs on the socket and show them in the menu bar.
 /// Returns only when told to quit.
-#[cfg(unix)]
 pub fn serve() -> i32 {
     // Started from inside Deck.app (`deck daemon` typed in a shell, whose
     // PATH finds the bundle's binary), macOS registers the service as a
     // second running Deck: an icon in ⌘-Tab, and the `deck://` links its
     // menu opens go to it instead of the window. Run as the copy outside the
     // bundle instead, as launchd does.
+    #[cfg(unix)]
     if std::env::current_exe().is_ok_and(|me| me.to_string_lossy().contains(".app/Contents/MacOS/")) {
         if let Ok(exe) = service_exe() {
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(&exe).arg("daemon").exec();
             eprintln!("deckd: could not run {}: {err}", exe.display());
         }
+    }
+    // Started at login from the Run key, it has a console window of its
+    // own: run again without one.
+    #[cfg(windows)]
+    if win::leave_console_window() {
+        return 0;
     }
     let path = socket();
     if ask(&json!({ "op": "ping" })).is_ok() {
@@ -728,8 +764,7 @@ pub fn serve() -> i32 {
             return 1;
         }
     };
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let _ = crate::os::private(&path);
     // Jobs that were running when the daemon last stopped (a restart of the
     // Mac, a crash) start again.
     for s in load_saved().into_iter().filter(|s| s.running) {
@@ -746,12 +781,10 @@ pub fn serve() -> i32 {
     0
 }
 
-#[cfg(unix)]
 fn load_saved() -> Vec<Saved> {
     std::fs::read(state_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-#[cfg(unix)]
 fn save_state() {
     let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
     let saved: Vec<Saved> = jobs
@@ -775,7 +808,6 @@ fn save_state() {
 }
 
 /// Every job, newest first, for the menu and `list`.
-#[cfg(unix)]
 pub fn snapshot() -> Vec<JobInfo> {
     let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<JobInfo> = jobs.values().map(|j| j.info.clone()).collect();
@@ -783,7 +815,6 @@ pub fn snapshot() -> Vec<JobInfo> {
     out
 }
 
-#[cfg(unix)]
 fn handle(mut conn: UnixStream) {
     let mut reader = match conn.try_clone() {
         Ok(c) => BufReader::new(c),
@@ -853,58 +884,125 @@ fn handle(mut conn: UnixStream) {
     let _ = conn.write_all(format!("{v}\n").as_bytes());
 }
 
-#[cfg(unix)]
 fn agent_of(cmd: &str) -> Option<String> {
     let first = cmd.split_whitespace().find(|w| !w.contains('='))?;
-    let prog = first.rsplit('/').next()?;
+    let prog = first.rsplit(['/', '\\']).next()?;
+    let prog = prog.strip_suffix(".exe").unwrap_or(prog);
     crate::workspace::AGENTS.iter().find(|a| a.cmd == prog).map(|a| a.cmd.to_string())
 }
 
-/// Start `cmd` in a PTY under the user's shell, in `cwd`, with `env`.
+/// A job's PTY and process: a pseudo terminal from forkpty and the shell's
+/// process group on Unix, a ConPTY pseudo console and a job object on
+/// Windows (`win::Term`). Everything above it is the same on both.
 #[cfg(unix)]
+struct Term {
+    pid: i32,
+    master: i32,
+}
+
+#[cfg(windows)]
+use win::Term;
+
+#[cfg(unix)]
+impl Term {
+    /// Start `cmd` in a new PTY under the user's shell, in `cwd`, with
+    /// exactly `vars` as its environment.
+    fn spawn(cmd: &str, cwd: &Path, vars: &HashMap<String, String>, rows: u16, cols: u16) -> Result<Term, String> {
+        let shell = vars
+            .get("SHELL")
+            .cloned()
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/zsh".into());
+        let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        let mut master: libc::c_int = -1;
+        // Everything the child needs, made before the fork.
+        let c = |s: &str| std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default();
+        let prog = c(&shell);
+        let args = [c(&shell), c("-c"), c(cmd)];
+        let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let envs: Vec<std::ffi::CString> = vars.iter().map(|(k, v)| c(&format!("{k}={v}"))).collect();
+        let mut envp: Vec<*const libc::c_char> = envs.iter().map(|e| e.as_ptr()).collect();
+        envp.push(std::ptr::null());
+        let dir = c(&cwd.to_string_lossy());
+        // SAFETY: forkpty, then in the child only async-signal-safe calls
+        // (chdir, execve, _exit) on memory prepared above.
+        let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if pid == 0 {
+            unsafe {
+                libc::chdir(dir.as_ptr());
+                libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        Ok(Term { pid, master })
+    }
+
+    /// Output, blocking; 0 at its end.
+    fn read(&self, buf: &mut [u8]) -> usize {
+        let n = unsafe { libc::read(self.master, buf.as_mut_ptr().cast(), buf.len()) };
+        n.max(0) as usize
+    }
+
+    fn write(&self, data: &[u8]) {
+        unsafe { libc::write(self.master, data.as_ptr().cast(), data.len()) };
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ, &ws) };
+    }
+
+    /// Wait for the shell to end; its exit code (128 + the signal that
+    /// killed it).
+    fn wait(&self) -> i32 {
+        let mut status = 0;
+        unsafe { libc::waitpid(self.pid, &mut status, 0) };
+        if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
+    }
+
+    fn alive(&self) -> bool {
+        unsafe { libc::kill(self.pid, 0) == 0 }
+    }
+
+    /// Ask the process group to end.
+    fn interrupt(&self) {
+        unsafe {
+            libc::kill(-self.pid, libc::SIGTERM);
+            libc::kill(self.pid, libc::SIGTERM);
+        }
+    }
+
+    fn kill(&self) {
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+    }
+
+    fn close(&self) {
+        unsafe { libc::close(self.master) };
+    }
+}
+
+/// Start `cmd` in a PTY under the user's shell, in `cwd`, with `env`.
 fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, tab: bool) -> Result<JobInfo, String> {
-    let shell = env
-        .get("SHELL")
-        .cloned()
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/zsh".into());
     let (rows, cols) = (40u16, 120u16);
-    let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-    let mut master: libc::c_int = -1;
-    // Everything the child needs, made before the fork.
-    let c = |s: &str| std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default();
-    let prog = c(&shell);
-    let args = [c(&shell), c("-c"), c(cmd)];
-    let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
-    argv.push(std::ptr::null());
     let mut vars: HashMap<String, String> = env;
     vars.insert("TERM".into(), "xterm-256color".into());
     vars.insert("COLORTERM".into(), "truecolor".into());
     vars.insert("DECK_JOB".into(), name.into());
-    let envs: Vec<std::ffi::CString> = vars.iter().map(|(k, v)| c(&format!("{k}={v}"))).collect();
-    let mut envp: Vec<*const libc::c_char> = envs.iter().map(|e| e.as_ptr()).collect();
-    envp.push(std::ptr::null());
-    let dir = c(&cwd.to_string_lossy());
-    // SAFETY: forkpty, then in the child only async-signal-safe calls
-    // (chdir, execve, _exit) on memory prepared above.
-    let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) };
-    if pid < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    if pid == 0 {
-        unsafe {
-            libc::chdir(dir.as_ptr());
-            libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr());
-            libc::_exit(127);
-        }
-    }
+    let term = Arc::new(Term::spawn(cmd, cwd, &vars, rows, cols)?);
     let info = JobInfo {
         name: name.to_string(),
         cmd: cmd.to_string(),
         cwd: cwd.to_path_buf(),
         running: true,
         exit: None,
-        pid,
+        pid: term.pid,
         started: crate::local::now(),
         agent: agent_of(cmd),
         tab,
@@ -918,28 +1016,31 @@ fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, ta
         Job {
             info: info.clone(),
             env: vars,
-            master,
+            term: term.clone(),
             ring: Vec::new(),
             clients: Vec::new(),
             size: (rows, cols),
         },
     );
     save_state();
+    // This run of the job, as against a later one under the same name.
+    let ours = |j: &&mut Job, t: &Arc<Term>| Arc::ptr_eq(&j.term, t);
     // Output: to the ring, the log and every attached client.
     let key = name.to_string();
+    let t = term.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 16384];
         loop {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
+            let n = t.read(&mut buf);
+            if n == 0 {
                 break;
             }
-            let chunk = &buf[..n as usize];
+            let chunk = &buf[..n];
             if let Some(l) = log.as_mut() {
                 let _ = l.write_all(chunk);
             }
             let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(job) = jobs.get_mut(&key).filter(|j| j.info.pid == pid) else { break };
+            let Some(job) = jobs.get_mut(&key).filter(|j| ours(j, &t)) else { break };
             job.ring.extend_from_slice(chunk);
             if job.ring.len() > RING {
                 let cut = job.ring.len() - RING;
@@ -952,13 +1053,11 @@ fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, ta
     // Its end: the exit code, said to the clients, kept for `list`.
     let key = name.to_string();
     std::thread::spawn(move || {
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
+        let code = term.wait();
         let note = format!("\r\n\x1b[2m[deck: exited {code}]\x1b[0m\r\n");
         {
             let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(job) = jobs.get_mut(&key).filter(|j| j.info.pid == pid) {
+            if let Some(job) = jobs.get_mut(&key).filter(|j| ours(j, &term)) {
                 job.info.running = false;
                 job.info.exit = Some(code);
                 job.ring.extend_from_slice(note.as_bytes());
@@ -970,13 +1069,18 @@ fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, ta
         }
         // A tab's shell that ended (`exit`): the tab closes, so the session
         // goes, and the attached pane's connection with it.
-        let tab = JOBS.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|j| j.info.tab && j.info.pid == pid);
+        let tab = JOBS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+            .is_some_and(|j| j.info.tab && ours(&j, &term));
         if tab {
-            if let Some(mut job) = JOBS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key) {
+            let job = JOBS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            if let Some(mut job) = job {
                 for c in &mut job.clients {
                     let _ = c.shutdown(std::net::Shutdown::Both);
                 }
-                unsafe { libc::close(job.master) };
+                job.term.close();
             }
             let _ = std::fs::remove_file(log_file(&key));
         }
@@ -988,32 +1092,25 @@ fn spawn_job(name: &str, cmd: &str, cwd: &Path, env: HashMap<String, String>, ta
     Ok(info)
 }
 
-/// Stop a job's process group: TERM, then KILL if it lingers. With
-/// `forget`, it leaves the list and its clients are let go.
-#[cfg(unix)]
+/// Stop a job's process group: TERM (Ctrl-C on Windows), then KILL if it
+/// lingers. With `forget`, it leaves the list and its clients are let go.
 fn kill_job(name: &str, forget: bool) -> bool {
-    let (pid, running, master) = {
+    let (term, running) = {
         let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
         match jobs.get(name) {
-            Some(j) => (j.info.pid, j.info.running, j.master),
+            Some(j) => (j.term.clone(), j.info.running),
             None => return false,
         }
     };
     if running {
         STOPPING.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
-        unsafe {
-            libc::kill(-pid, libc::SIGTERM);
-            libc::kill(pid, libc::SIGTERM);
-        }
+        term.interrupt();
         let until = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < until && unsafe { libc::kill(pid, 0) } == 0 {
+        while Instant::now() < until && term.alive() {
             std::thread::sleep(Duration::from_millis(100));
         }
-        unsafe {
-            if libc::kill(pid, 0) == 0 {
-                libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
-            }
+        if term.alive() {
+            term.kill();
         }
     }
     if forget {
@@ -1022,14 +1119,13 @@ fn kill_job(name: &str, forget: bool) -> bool {
             for c in &mut job.clients {
                 let _ = c.shutdown(std::net::Shutdown::Both);
             }
-            unsafe { libc::close(master) };
+            term.close();
         }
         save_state();
     }
     true
 }
 
-#[cfg(unix)]
 fn restart_job(name: &str) -> Result<JobInfo, String> {
     let (cmd, cwd, env, clients, tab) = {
         let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1042,12 +1138,11 @@ fn restart_job(name: &str) -> Result<JobInfo, String> {
     if let Some(j) = JOBS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(name) {
         j.clients = clients;
         let size = j.size;
-        resize(j.master, size.0, size.1);
+        j.term.resize(size.0, size.1);
     }
     Ok(info)
 }
 
-#[cfg(unix)]
 fn quit_all() -> ! {
     let names: Vec<String> = JOBS.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
     for n in &names {
@@ -1062,39 +1157,31 @@ fn quit_all() -> ! {
     }
     save_state();
     let _ = std::fs::remove_file(socket());
+    #[cfg(windows)]
+    crate::daemon_menu::remove_icon();
     std::process::exit(0);
 }
 
-/// The menu bar icon's actions, which only macOS has yet.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[cfg(unix)]
+/// The menu bar (tray) icon's actions; Linux has no icon yet.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn quit() -> ! {
     quit_all()
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn stop_named(name: &str) {
     kill_job(name, true);
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn restart_named(name: &str) {
     let _ = restart_job(name);
 }
 
-#[cfg(unix)]
-fn resize(master: i32, rows: u16, cols: u16) {
-    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-    unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
-}
-
 /// A client takes over the connection: what the job printed so far, then
 /// everything it prints; its keys and size go to the job.
-#[cfg(unix)]
 fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: &str, rows: u16, cols: u16) {
-    let master = {
+    let term = {
         let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(job) = jobs.get_mut(name) else {
             let _ = conn.write_all(format!("{}\n", json!({ "error": format!("no job {name:?}") })).as_bytes());
@@ -1109,20 +1196,22 @@ fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: 
             job.clients.push(c);
         }
         job.size = (rows, cols);
-        job.master
+        job.term.clone()
     };
     // One size off, then the right one: a full-screen program redraws even
     // when the size did not change.
-    resize(master, rows, cols.saturating_sub(1).max(1));
+    term.resize(rows, cols.saturating_sub(1).max(1));
     std::thread::sleep(Duration::from_millis(30));
-    resize(master, rows, cols);
+    term.resize(rows, cols);
+    drop(term);
     let mut kind = [0u8; 1];
     loop {
         if reader.read_exact(&mut kind).is_err() {
             break;
         }
-        let master = match JOBS.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
-            Some(j) => j.master,
+        // The job's current run: a restart swaps it under the client.
+        let term = match JOBS.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+            Some(j) => j.term.clone(),
             None => break,
         };
         match kind[0] {
@@ -1135,7 +1224,7 @@ fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: 
                 if reader.read_exact(&mut data).is_err() {
                     break;
                 }
-                unsafe { libc::write(master, data.as_ptr().cast(), data.len()) };
+                term.write(&data);
             }
             1 => {
                 let mut sz = [0u8; 4];
@@ -1146,7 +1235,7 @@ fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: 
                 if let Some(j) = JOBS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(name) {
                     j.size = (r, c);
                 }
-                resize(master, r, c);
+                term.resize(r, c);
             }
             _ => break,
         }
@@ -1154,45 +1243,6 @@ fn attach_client(mut conn: UnixStream, mut reader: BufReader<UnixStream>, name: 
 }
 
 /// The last `lines` lines of a job's output, as plain text.
-// -- the service off Unix ---------------------------------------------------
-//
-// It runs jobs in PTYs of its own (forkpty) and signals their process
-// groups; Windows needs ConPTY and job objects for that, still to come.
-
-#[cfg(not(unix))]
-const ELSEWHERE: &str = "the background service is not on this platform yet";
-
-#[cfg(not(unix))]
-fn attach(_name: &str) -> i32 {
-    eprintln!("deck: {ELSEWHERE}");
-    1
-}
-
-#[cfg(not(unix))]
-pub fn serve() -> i32 {
-    eprintln!("deck: {ELSEWHERE}");
-    1
-}
-
-#[cfg(not(unix))]
-pub fn snapshot() -> Vec<JobInfo> {
-    Vec::new()
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)]
-pub fn quit() -> ! {
-    std::process::exit(0)
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)]
-pub fn stop_named(_name: &str) {}
-
-#[cfg(not(unix))]
-#[allow(dead_code)]
-pub fn restart_named(_name: &str) {}
-
 pub fn tail_text(name: &str, lines: usize) -> String {
     tail_log(name, lines)
 }
@@ -1302,6 +1352,7 @@ mod tests {
     }
 
     /// A real job in a real daemon, on a socket of its own.
+    #[cfg(unix)]
     #[test]
     fn jobs_run_log_and_end() {
         let dir = std::env::temp_dir().join(format!("deckd-test-{}", std::process::id()));

@@ -12,7 +12,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSDictionary, NSString};
 use std::path::PathBuf;
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub enum Pasted {
     Files(Vec<PathBuf>),
     /// Encoded image bytes and the extension they should be saved with.
@@ -37,10 +37,111 @@ pub fn read_for_terminal() -> Option<Pasted> {
     })
 }
 
-/// Off macOS only text is read yet; gpui's clipboard pastes it.
-#[cfg(not(target_os = "macos"))]
+/// On Linux only text is read yet; gpui's clipboard pastes it.
+#[cfg(not(any(target_os = "macos", windows)))]
 fn read_with(_text_wins: impl Fn(&str) -> bool) -> Option<Pasted> {
     None
+}
+
+/// The Windows clipboard, as the Mac's: files copied in Explorer
+/// (CF_HDROP), then text when it wins, then an image: "PNG" as browsers and
+/// the Snipping Tool put it, or the bitmap (CF_DIB) made a PNG.
+#[cfg(windows)]
+fn read_with(text_wins: impl Fn(&str) -> bool) -> Option<Pasted> {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    /// A global memory block's bytes.
+    unsafe fn bytes(h: HANDLE) -> Option<Vec<u8>> {
+        let g = HGLOBAL(h.0);
+        let p = unsafe { GlobalLock(g) } as *const u8;
+        if p.is_null() {
+            return None;
+        }
+        let out = unsafe { std::slice::from_raw_parts(p, GlobalSize(g)) }.to_vec();
+        let _ = unsafe { GlobalUnlock(g) };
+        Some(out)
+    }
+
+    // Another app may hold the clipboard for a moment.
+    // SAFETY: opened here and closed before returning.
+    let opened = (0..5).any(|i| {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { OpenClipboard(None) }.is_ok()
+    });
+    if !opened {
+        return None;
+    }
+    // SAFETY: the clipboard is open; every handle is the clipboard's, read
+    // under a lock and never kept.
+    let out = (|| unsafe {
+        if let Ok(h) = GetClipboardData(CF_HDROP.0 as u32) {
+            let drop = HDROP(h.0);
+            let n = DragQueryFileW(drop, u32::MAX, None);
+            let files: Vec<PathBuf> = (0..n)
+                .filter_map(|i| {
+                    let len = DragQueryFileW(drop, i, None) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    let got = DragQueryFileW(drop, i, Some(&mut buf)) as usize;
+                    (got > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..got])))
+                })
+                .collect();
+            if !files.is_empty() {
+                return Some(Pasted::Files(files));
+            }
+        }
+        let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|h| bytes(h)).map(|b| {
+            let wide: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|c| *c != 0).collect();
+            String::from_utf16_lossy(&wide)
+        });
+        if text.as_deref().is_some_and(&text_wins) {
+            return None;
+        }
+        let png = RegisterClipboardFormatW(w!("PNG"));
+        if png != 0 {
+            if let Some(b) = GetClipboardData(png).ok().and_then(|h| bytes(h)).filter(|b| !b.is_empty()) {
+                return Some(Pasted::Image(b, "png"));
+            }
+        }
+        let dib = GetClipboardData(CF_DIB.0 as u32).ok().and_then(|h| bytes(h))?;
+        Some(Pasted::Image(dib_to_png(&dib)?, "png"))
+    })();
+    // SAFETY: opened above.
+    let _ = unsafe { CloseClipboard() };
+    out
+}
+
+/// A clipboard bitmap (a BITMAPINFO and its pixels) as PNG: the file
+/// header a .bmp would start with, then the image crate's decoder.
+#[cfg(windows)]
+fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
+    let u32_at = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(dib.get(o..o + 4)?.try_into().ok()?)) };
+    let header = u32_at(0)?;
+    let bits = u16::from_le_bytes(dib.get(14..16)?.try_into().ok()?) as u32;
+    let compression = u32_at(16)?;
+    let used = u32_at(32)?;
+    // BI_BITFIELDS after a plain BITMAPINFOHEADER: three masks follow it.
+    let masks = if header == 40 && compression == 3 { 12 } else { 0 };
+    let palette = if used > 0 { used } else if bits <= 8 { 1 << bits } else { 0 };
+    let offset = 14 + header + masks + palette * 4;
+    let mut bmp = Vec::with_capacity(14 + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&offset.to_le_bytes());
+    bmp.extend_from_slice(dib);
+    let image = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp).ok()?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner())
 }
 
 #[cfg(target_os = "macos")]
