@@ -85,7 +85,8 @@ jobs:
       # No Zig: the Ghostty engine is Unix only, Windows runs Alacritty.
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace
-      - run: cargo test --release --workspace
+      # Every failing test binary, not just the first.
+      - run: cargo test --release --workspace --no-fail-fast
       # deck.exe with arguments is the CLI; `--help` needs no window, no
       # running Deck and no network.
       - name: Smoke test
