@@ -16,7 +16,7 @@ embed-resource = "3"
 default = ["ghostty"]
 # The Ghostty terminal engine (Settings → Terminal → Engine). Building it
 # needs Zig 0.17 on PATH; without it, `--no-default-features` builds
-# Alacritty only.
+# Alacritty only. Unix only: on Windows the feature is a no-op.
 ghostty = ["term/ghostty"]
 
 [dependencies]

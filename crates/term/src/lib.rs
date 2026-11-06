@@ -28,7 +28,7 @@
 //! own theme instead of shipping a second one.
 
 mod tap;
-#[cfg(feature = "ghostty")]
+#[cfg(all(feature = "ghostty", unix))]
 mod ghostty;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
@@ -1955,7 +1955,7 @@ impl Engine {
     pub fn available(self) -> bool {
         match self {
             Engine::Alacritty => true,
-            Engine::Ghostty => cfg!(feature = "ghostty"),
+            Engine::Ghostty => cfg!(all(feature = "ghostty", unix)),
         }
     }
 }
@@ -2008,7 +2008,7 @@ impl Terminal {
     /// Start `spawn` on its engine. One not in this build falls back to
     /// Alacritty rather than failing: the pane still opens.
     pub fn spawn(spawn: Spawn, columns: u16, rows: u16) -> anyhow::Result<Terminal> {
-        #[cfg(feature = "ghostty")]
+        #[cfg(all(feature = "ghostty", unix))]
         if spawn.engine == Engine::Ghostty {
             return Ok(Terminal {
                 backend: Box::new(ghostty::GhosttyTerminal::spawn(spawn, columns, rows)?),

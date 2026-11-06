@@ -129,7 +129,7 @@ cargo install cargo-xwin   # plus llvm (llvm-rc, lld), NSIS 3 (makensis) and zip
 scripts/build-windows.sh   # dist/Deck-<version>-setup.exe and dist/Deck-<version>-windows-x64.zip
 ```
 
-The cross build leaves out the Ghostty engine: Ghostty's Zig build can't target MSVC from Linux, so that `deck.exe` runs Alacritty only. A native build keeps it: install Visual Studio Build Tools (MSVC and the Windows SDK), Rust 1.96.1 and Zig 0.17 on `PATH`, then `cargo build --release`. CI does exactly that and builds the installer (`.github/workflows/ci.yml`).
+On Windows `deck.exe` runs the Alacritty engine; Ghostty's backend drives a Unix PTY, so it stays on macOS and Linux. To build natively, install Visual Studio Build Tools (MSVC and the Windows SDK) and Rust 1.96.1, then `cargo build --release`; no Zig needed. CI does exactly that and builds the installer (`.github/workflows/ci.yml`).
 
 ## Keyboard shortcuts
 

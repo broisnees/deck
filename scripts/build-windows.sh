@@ -5,10 +5,8 @@
 #     scripts/build-windows.sh
 #
 # Needs cargo-xwin (cargo install cargo-xwin), llvm (llvm-rc for the icon
-# and version resource, lld), makensis (NSIS 3) and zip. The cross build
-# leaves out Ghostty: its Zig build can't target MSVC from Linux, so this
-# deck.exe runs the Alacritty engine only. A native build on Windows with
-# MSVC and Zig 0.17 keeps it.
+# and version resource, lld), makensis (NSIS 3) and zip. No Zig: the
+# Ghostty engine is Unix only, so deck.exe runs the Alacritty engine.
 #
 # DECK_TOOLCHAIN picks the rustup toolchain (default 1.96.1).
 # DECK_PROFILE=dev packages a debug build instead of a release one.
@@ -39,8 +37,8 @@ for tool in cargo-xwin makensis zip llvm-rc; do
     command -v "$tool" >/dev/null || die "$tool not found (see the top of this script)"
 done
 
-say "building deck.exe $VERSION ($TARGET, $PROFILE, no Ghostty)"
-cargo "+$TOOLCHAIN" xwin build --profile "$PROFILE" --target "$TARGET" --no-default-features -p app
+say "building deck.exe $VERSION ($TARGET, $PROFILE)"
+cargo "+$TOOLCHAIN" xwin build --profile "$PROFILE" --target "$TARGET" -p app
 
 say "staging $STAGE"
 rm -rf "$STAGE"

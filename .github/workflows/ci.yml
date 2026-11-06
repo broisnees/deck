@@ -73,26 +73,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # Native MSVC build, so Ghostty (Zig) stays in.
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      # No Zig: the Ghostty engine is Unix only, Windows runs Alacritty.
       - uses: Swatinem/rust-cache@v2
-      # ghostty-vt-sys downloads its pinned source through native-tls, and
-      # Windows' TLS stack rejects that server's chain. curl fetches the same
-      # tarball, checked against the crate's own GHOSTTY.lock.
-      - name: Ghostty source
-        run: |
-          cargo fetch
-          lock="$(ls "$HOME"/.cargo/registry/src/*/ghostty-vt-sys-*/GHOSTTY.lock | head -1)"
-          val() { sed -n "s/^$1 = //p" "$lock"; }
-          # Unix-style, so tar doesn't take `D:` for a remote host.
-          tmp="$(cygpath -u "$RUNNER_TEMP")"
-          curl -fsSL -o "$tmp/ghostty.tar.gz" "$(val url)"
-          echo "$(val sha256)  $tmp/ghostty.tar.gz" > "$tmp/ghostty.sha256"
-          sha256sum -c "$tmp/ghostty.sha256"
-          tar xzf "$tmp/ghostty.tar.gz" -C "$tmp"
-          echo "GHOSTTY_SOURCE_DIR=$(cygpath -w "$tmp/$(val root)")" >> "$GITHUB_ENV"
       - run: cargo build --release --workspace
       - run: cargo test --release --workspace
       # deck.exe with arguments is the CLI; `--help` needs no window, no
