@@ -756,7 +756,9 @@ mod tests {
         assert_eq!(s.native_session_id().as_deref(), Some("cfd4f06c"));
     }
 
+    // The fakes below are shell scripts, so their tests run on Unix only.
     /// A fake CLI: a shell script standing in for the binary.
+    #[cfg(unix)]
     static SH: CliSpec = CliSpec {
         id: "sh",
         display_name: "Shell",
@@ -776,10 +778,12 @@ mod tests {
         setup: None,
     };
 
+    #[cfg(unix)]
     async fn turn_of(script: &str) -> Vec<AgentEvent> {
         turn_on(&SH, script).await
     }
 
+    #[cfg(unix)]
     async fn turn_on(spec: &'static CliSpec, script: &str) -> Vec<AgentEvent> {
         let mut c = ctx();
         c.system_prompt = Arc::from("");
@@ -801,6 +805,7 @@ mod tests {
 
     /// A fake CLI that cannot find the session it is asked to resume, as
     /// gemini says when its session is gone. The flag and id land in `$@`.
+    #[cfg(unix)]
     static GONE: CliSpec = CliSpec {
         id: "gone",
         display_name: "Fake",
@@ -824,6 +829,7 @@ mod tests {
         setup: None,
     };
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_saved_session_that_cannot_be_resumed_is_reported_dead() {
         // Fatal, not a failed turn: the app then replays the thread into a
@@ -851,6 +857,7 @@ mod tests {
         assert_eq!(s.native_session_id(), None, "the dead id is forgotten");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_cli_that_fails_on_stderr_alone_ends_the_turn_with_its_words() {
         let ev = turn_of("echo 'Not signed in.' >&2; exit 1").await;
@@ -872,6 +879,7 @@ mod tests {
 
     /// A fake vibe: a shell standing in for it, with the spec's own
     /// environment.
+    #[cfg(unix)]
     static FAKE_VIBE: CliSpec = CliSpec {
         id: "fake-vibe",
         display_name: "Vibe",
@@ -891,6 +899,7 @@ mod tests {
         setup: None,
     };
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_spec_environment_reaches_the_cli() {
         let ev = turn_on(&FAKE_VIBE, "echo $DECK_SPEC_ENV").await;
@@ -901,6 +910,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_vibe_that_gave_up_on_a_429_fails_the_turn_with_why() {
         // What vibe 2.26.1 printed once its retries were spent.
@@ -923,6 +933,7 @@ exit 1"#;
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn output_streams_and_a_clean_exit_ends_the_turn() {
         let ev = turn_of("echo one; echo two").await;
@@ -942,6 +953,7 @@ exit 1"#;
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_background_child_holding_stdout_does_not_hang_the_turn() {
         let started = std::time::Instant::now();
@@ -953,6 +965,7 @@ exit 1"#;
         assert!(started.elapsed() < Duration::from_secs(8));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn interrupt_kills_the_process_and_ends_as_interrupted() {
         let mut c = ctx();

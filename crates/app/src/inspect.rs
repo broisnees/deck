@@ -564,6 +564,7 @@ mod tests {
         assert_eq!(c[0].0.cpu, 0.);
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_busy_child_shows_cpu_and_rss() {
         let mut child = Command::new("/bin/sh")
